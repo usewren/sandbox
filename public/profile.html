@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wren — Profile</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f5f5f5;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      color: #111;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 400px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.75rem;
+    }
+
+    h1 { font-size: 1.25rem; font-weight: 600; }
+
+    button {
+      background: none;
+      border: 1px solid #e0e0e0;
+      border-radius: 5px;
+      padding: 0.35rem 0.75rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      color: #444;
+    }
+
+    button:hover { background: #f5f5f5; }
+
+    .avatar {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      background: #111;
+      color: #fff;
+      font-size: 1.4rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 1rem;
+    }
+
+    .name {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+
+    .email {
+      font-size: 0.9rem;
+      color: #666;
+      margin-bottom: 1.5rem;
+    }
+
+    .fields {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      border-top: 1px solid #e0e0e0;
+      padding-top: 1.25rem;
+    }
+
+    .field {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.875rem;
+    }
+
+    .field-label { color: #888; }
+
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 99px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: #f0f0f0;
+      color: #444;
+    }
+
+    .badge.admin { background: #111; color: #fff; }
+    .badge.editor { background: #e8f4e8; color: #2a6b2a; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <header>
+      <h1>Wren</h1>
+      <button id="signout">Sign out</button>
+    </header>
+
+    <div id="content" style="display:none">
+      <div class="avatar" id="avatar"></div>
+      <div class="name" id="name"></div>
+      <div class="email" id="email"></div>
+
+      <div class="fields">
+        <div class="field">
+          <span class="field-label">Role</span>
+          <span class="badge" id="role"></span>
+        </div>
+        <div class="field">
+          <span class="field-label">Organisation</span>
+          <span id="org"></span>
+        </div>
+        <div class="field">
+          <span class="field-label">Email verified</span>
+          <span id="verified"></span>
+        </div>
+        <div class="field">
+          <span class="field-label">Member since</span>
+          <span id="since"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function load() {
+      const res = await fetch("/profile", {
+        headers: { "Accept": "application/json" },
+        credentials: "include",
+      });
+
+      if (res.status === 401) {
+        window.location.href = "/login?redirect=/profile";
+        return;
+      }
+
+      const { user } = await res.json();
+
+      document.getElementById("avatar").textContent = user.name?.charAt(0).toUpperCase() ?? "?";
+      document.getElementById("name").textContent = user.name;
+      document.getElementById("email").textContent = user.email;
+
+      const role = document.getElementById("role");
+      role.textContent = user.role ?? "viewer";
+      if (user.role === "admin") role.classList.add("admin");
+      else if (user.role === "editor") role.classList.add("editor");
+
+      document.getElementById("org").textContent = user.orgId ?? "—";
+      document.getElementById("verified").textContent = user.emailVerified ? "Yes" : "No";
+      document.getElementById("since").textContent = new Date(user.createdAt).toLocaleDateString();
+
+      document.getElementById("content").style.display = "";
+    }
+
+    document.getElementById("signout").addEventListener("click", async () => {
+      await fetch("/api/auth/sign-out", { method: "POST", credentials: "include" });
+      window.location.href = "/login";
+    });
+
+    load();
+  </script>
+</body>
+</html>

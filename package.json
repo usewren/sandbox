@@ -1,0 +1,17 @@
+{
+  "name": "sandbox",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "auth": "../auth",
+    "postgres": "^3.4.8",
+    "yaml": "^2.8.3"
+  }
+}

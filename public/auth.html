@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wren — Sign in</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f5f5f5;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      color: #111;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 360px;
+    }
+
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 1.5rem;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .tab {
+      background: none;
+      border: none;
+      padding: 0.5rem 0;
+      font-size: 0.9rem;
+      cursor: pointer;
+      color: #666;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+
+    .tab.active {
+      color: #111;
+      border-bottom-color: #111;
+      font-weight: 500;
+    }
+
+    .form { display: none; flex-direction: column; gap: 1rem; }
+    .form.active { display: flex; }
+
+    label {
+      font-size: 0.85rem;
+      color: #444;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    input {
+      padding: 0.5rem 0.75rem;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      font-size: 0.95rem;
+      width: 100%;
+    }
+
+    input:focus {
+      outline: none;
+      border-color: #111;
+    }
+
+    button[type=submit] {
+      padding: 0.6rem;
+      background: #111;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      margin-top: 0.25rem;
+    }
+
+    button[type=submit]:hover { background: #333; }
+    button[type=submit]:disabled { background: #999; cursor: not-allowed; }
+
+    .error {
+      font-size: 0.85rem;
+      color: #c00;
+      display: none;
+    }
+
+    .error.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Wren</h1>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login">Sign in</button>
+      <button class="tab" data-tab="register">Register</button>
+    </div>
+
+    <form id="login" class="form active" novalidate>
+      <label>
+        Email
+        <input type="email" name="email" autocomplete="email" required />
+      </label>
+      <label>
+        Password
+        <input type="password" name="password" autocomplete="current-password" required />
+      </label>
+      <p class="error" id="login-error"></p>
+      <button type="submit">Sign in</button>
+    </form>
+
+    <form id="register" class="form" novalidate>
+      <label>
+        Name
+        <input type="text" name="name" autocomplete="name" required />
+      </label>
+      <label>
+        Email
+        <input type="email" name="email" autocomplete="email" required />
+      </label>
+      <label>
+        Password
+        <input type="password" name="password" autocomplete="new-password" required />
+      </label>
+      <p class="error" id="register-error"></p>
+      <button type="submit">Create account</button>
+    </form>
+  </div>
+
+  <script>
+    // Tab switching
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab, .form").forEach(el => el.classList.remove("active"));
+        tab.classList.add("active");
+        document.getElementById(tab.dataset.tab).classList.add("active");
+      });
+    });
+
+    async function post(url, body) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        credentials: "include",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message ?? "Something went wrong");
+      return data;
+    }
+
+    document.getElementById("login").addEventListener("submit", async e => {
+      e.preventDefault();
+      const form = e.target;
+      const error = document.getElementById("login-error");
+      const btn = form.querySelector("button");
+      error.classList.remove("visible");
+      btn.disabled = true;
+      try {
+        await post("/api/auth/sign-in/email", {
+          email: form.email.value,
+          password: form.password.value,
+        });
+        const params = new URLSearchParams(window.location.search);
+        window.location.href = params.get("redirect") ?? "/profile";
+      } catch (err) {
+        error.textContent = err.message;
+        error.classList.add("visible");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("register").addEventListener("submit", async e => {
+      e.preventDefault();
+      const form = e.target;
+      const error = document.getElementById("register-error");
+      const btn = form.querySelector("button");
+      error.classList.remove("visible");
+      btn.disabled = true;
+      try {
+        await post("/api/auth/sign-up/email", {
+          name: form.name.value,
+          email: form.email.value,
+          password: form.password.value,
+        });
+        const params = new URLSearchParams(window.location.search);
+        window.location.href = params.get("redirect") ?? "/profile";
+      } catch (err) {
+        error.textContent = err.message;
+        error.classList.add("visible");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
