@@ -55,6 +55,20 @@ async function ensureTenant(orgId: string): Promise<string> {
   return sanitizeSchemaName(orgId);
 }
 
+// Returns the org_id (owner userId) this user belongs to.
+// Members inherit the owner's tenant schema.
+async function resolveUserOrgId(userId: string): Promise<string> {
+  const rows = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.org_members WHERE user_id = ${userId} LIMIT 1
+  `;
+  return rows.length ? rows[0].org_id : userId;
+}
+
+async function resolveUserOrg(userId: string): Promise<string> {
+  const orgId = await resolveUserOrgId(userId);
+  return ensureTenant(orgId);
+}
+
 async function withTenant<T>(schemaName: string, fn: (tx: Sql) => Promise<T>): Promise<T> {
   return sql.begin(async tx => {
     await tx.unsafe(`SET LOCAL search_path TO ${schemaName}, common, public`);
@@ -99,6 +113,12 @@ function generateApiKey(): string {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
   return "wren_" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function generateInviteToken(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return "inv_" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function checkApiKey(req: Request): Promise<{ userId: string; name: string; email: string } | null> {
@@ -261,7 +281,23 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    const schemaName = await ensureTenant(user.userId);
+    // Invite management routes — /api/invites[/:inviteId | /accept]
+    if (collection === "api" && id === "invites") {
+      if (req.method === "GET"    && !sub)              return handleListInvites(user.userId);
+      if (req.method === "POST"   && !sub)              return handleCreateInvite(req, user.userId);
+      if (req.method === "POST"   && sub === "accept")  return handleAcceptInvite(req, user.userId);
+      if (req.method === "DELETE" && sub)               return handleRevokeInvite(sub, user.userId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Member management routes — /api/members[/:memberId]
+    if (collection === "api" && id === "members") {
+      if (req.method === "GET"    && !sub) return handleListMembers(user.userId);
+      if (req.method === "DELETE" && sub)  return handleRemoveMember(sub, user.userId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    const schemaName = await resolveUserOrg(user.userId);
 
     // Route: GET /collections — list distinct collection names
     if (req.method === "GET" && collection === "collections" && !id) {
@@ -1070,6 +1106,136 @@ async function handleRevokeApiKey(keyId: string, userId: string): Promise<Respon
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ id: keyId, revoked: true });
+}
+
+// -------------------------------------------------------
+// Invite handlers
+// -------------------------------------------------------
+
+async function handleListInvites(userId: string): Promise<Response> {
+  const invites = await sql<{
+    id: string; email: string; role: string;
+    created_at: Date; expires_at: Date;
+    accepted_at: Date | null; revoked_at: Date | null;
+  }[]>`
+    SELECT id, email, role, created_at, expires_at, accepted_at, revoked_at
+    FROM common.invites
+    WHERE org_id = ${userId}
+    ORDER BY created_at DESC
+  `;
+  return Response.json({
+    invites: invites.map(i => ({
+      id: i.id,
+      email: i.email,
+      role: i.role,
+      createdAt: i.created_at,
+      expiresAt: i.expires_at,
+      acceptedAt: i.accepted_at,
+      revokedAt: i.revoked_at,
+    })),
+  });
+}
+
+async function handleCreateInvite(req: Request, userId: string): Promise<Response> {
+  const body = await req.json() as { email?: string; role?: string };
+  const email = body.email?.trim().toLowerCase();
+  const role = body.role ?? "member";
+  if (!email) return Response.json({ error: "email is required" }, { status: 400 });
+
+  const rawToken = generateInviteToken();
+  const tokenHash = await sha256hex(rawToken);
+  const tokenPrefix = rawToken.slice(0, 8);
+
+  const [invite] = await sql<{ id: string; created_at: Date; expires_at: Date }[]>`
+    INSERT INTO common.invites (org_id, email, token_hash, token_prefix, role, invited_by)
+    VALUES (${userId}, ${email}, ${tokenHash}, ${tokenPrefix}, ${role}, ${userId})
+    RETURNING id, created_at, expires_at
+  `;
+  return Response.json({
+    id: invite.id,
+    email,
+    role,
+    token: rawToken, // returned once only — never stored in plaintext
+    createdAt: invite.created_at,
+    expiresAt: invite.expires_at,
+    acceptedAt: null,
+    revokedAt: null,
+  }, { status: 201 });
+}
+
+async function handleRevokeInvite(inviteId: string, userId: string): Promise<Response> {
+  const rows = await sql<{ id: string }[]>`
+    UPDATE common.invites
+    SET revoked_at = NOW()
+    WHERE id = ${inviteId} AND org_id = ${userId} AND revoked_at IS NULL AND accepted_at IS NULL
+    RETURNING id
+  `;
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ id: inviteId, revoked: true });
+}
+
+async function handleAcceptInvite(req: Request, userId: string): Promise<Response> {
+  const body = await req.json() as { token?: string };
+  const token = body.token?.trim();
+  if (!token) return Response.json({ error: "token is required" }, { status: 400 });
+
+  const tokenHash = await sha256hex(token);
+  const [invite] = await sql<{
+    id: string; org_id: string; email: string; role: string;
+    expires_at: Date; accepted_at: Date | null; revoked_at: Date | null;
+  }[]>`
+    SELECT id, org_id, email, role, expires_at, accepted_at, revoked_at
+    FROM common.invites WHERE token_hash = ${tokenHash}
+  `;
+  if (!invite)             return Response.json({ error: "Invalid invite token" }, { status: 404 });
+  if (invite.revoked_at)   return Response.json({ error: "Invite has been revoked" }, { status: 410 });
+  if (invite.accepted_at)  return Response.json({ error: "Invite already accepted" }, { status: 409 });
+  if (new Date(invite.expires_at) < new Date())
+                           return Response.json({ error: "Invite has expired" }, { status: 410 });
+  if (invite.org_id === userId)
+                           return Response.json({ error: "Cannot accept your own invite" }, { status: 400 });
+
+  await sql`
+    INSERT INTO common.org_members (org_id, user_id, role)
+    VALUES (${invite.org_id}, ${userId}, ${invite.role})
+    ON CONFLICT (org_id, user_id) DO UPDATE SET role = ${invite.role}
+  `;
+  await sql`UPDATE common.invites SET accepted_at = NOW() WHERE id = ${invite.id}`;
+
+  return Response.json({ accepted: true, orgId: invite.org_id });
+}
+
+// -------------------------------------------------------
+// Member handlers
+// -------------------------------------------------------
+
+async function handleListMembers(userId: string): Promise<Response> {
+  const members = await sql<{ user_id: string; role: string; joined_at: Date; name: string; email: string }[]>`
+    SELECT m.user_id, m.role, m.joined_at, u.name, u.email
+    FROM common.org_members m
+    JOIN "user" u ON u.id = m.user_id
+    WHERE m.org_id = ${userId}
+    ORDER BY m.joined_at ASC
+  `;
+  return Response.json({
+    members: members.map(m => ({
+      userId: m.user_id,
+      role: m.role,
+      joinedAt: m.joined_at,
+      name: m.name,
+      email: m.email,
+    })),
+  });
+}
+
+async function handleRemoveMember(memberId: string, userId: string): Promise<Response> {
+  const rows = await sql<{ user_id: string }[]>`
+    DELETE FROM common.org_members
+    WHERE org_id = ${userId} AND user_id = ${memberId}
+    RETURNING user_id
+  `;
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ userId: memberId, removed: true });
 }
 
 // -------------------------------------------------------
