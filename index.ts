@@ -426,11 +426,14 @@ async function handleList(schemaName: string, collection: string, url: URL, _use
   const offset = parseInt(url.searchParams.get("offset") ?? "0");
 
   const [items, [{ total }]] = await withTenant(schemaName, async tx => {
-    const rows = await tx<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date }[]>`
-      SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at
+    const rows = await tx<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date; labels: string[] }[]>`
+      SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at,
+             COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
       FROM documents d
       JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+      LEFT JOIN labels l ON l.document_id = d.id
       WHERE d.collection = ${collection} AND d.deleted_at IS NULL
+      GROUP BY d.id, d.current_version, v.data, d.created_at, d.updated_at
       ORDER BY d.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -443,7 +446,7 @@ async function handleList(schemaName: string, collection: string, url: URL, _use
 
   return Response.json({
     collection,
-    items: items.map(r => ({ id: r.id, version: r.version, data: r.data, createdAt: r.created_at, updatedAt: r.updated_at })),
+    items: items.map(r => ({ id: r.id, version: r.version, data: r.data, createdAt: r.created_at, updatedAt: r.updated_at, labels: r.labels })),
     total: parseInt(total),
   });
 }
@@ -627,17 +630,20 @@ async function handleGet(schemaName: string, collection: string, id: string, url
       `;
       return rows[0] ?? null;
     }
-    const rows = await tx<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date }[]>`
-      SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at
+    const rows = await tx<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date; labels: string[] }[]>`
+      SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at,
+             COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
       FROM documents d
       JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+      LEFT JOIN labels l ON l.document_id = d.id
       WHERE d.id = ${id} AND d.collection = ${collection} AND d.deleted_at IS NULL
+      GROUP BY d.id, d.current_version, v.data, d.created_at, d.updated_at
     `;
     return rows[0] ?? null;
   });
 
   if (!row) return Response.json({ error: "Not found" }, { status: 404 });
-  return Response.json({ id: row.id, version: row.version, collection, data: row.data, createdAt: row.created_at, updatedAt: row.updated_at });
+  return Response.json({ id: row.id, version: row.version, collection, data: row.data, createdAt: row.created_at, updatedAt: row.updated_at, labels: row.labels });
 }
 
 async function handleUpdate(schemaName: string, collection: string, id: string, req: Request, userId: string): Promise<Response> {
@@ -693,12 +699,16 @@ async function handleVersionList(schemaName: string, collection: string, id: str
     `;
     if (!doc) return null;
 
-    const rows = await tx<{ version: number; created_at: Date; created_by: string }[]>`
-      SELECT version, created_at, created_by
-      FROM versions WHERE document_id = ${id}
-      ORDER BY version ASC
+    const rows = await tx<{ version: number; created_at: Date; created_by: string; labels: string[] }[]>`
+      SELECT v.version, v.created_at, v.created_by,
+             COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
+      FROM versions v
+      LEFT JOIN labels l ON l.document_id = v.document_id AND l.version = v.version
+      WHERE v.document_id = ${id}
+      GROUP BY v.version, v.created_at, v.created_by
+      ORDER BY v.version ASC
     `;
-    return rows.map(r => ({ version: r.version, createdAt: r.created_at, createdBy: r.created_by }));
+    return rows.map(r => ({ version: r.version, createdAt: r.created_at, createdBy: r.created_by, labels: r.labels }));
   });
 
   if (!versions) return Response.json({ error: "Not found" }, { status: 404 });
