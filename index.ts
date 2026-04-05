@@ -300,12 +300,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    // Invite management routes — /api/invites[/:inviteId | /accept]
+    // Invite management routes — /api/invites[/:inviteId | /accept | /received]
     if (collection === "api" && id === "invites") {
-      if (req.method === "GET"    && !sub)              return handleListInvites(user.userId);
-      if (req.method === "POST"   && !sub)              return handleCreateInvite(req, user.userId);
-      if (req.method === "POST"   && sub === "accept")  return handleAcceptInvite(req, user.userId);
-      if (req.method === "DELETE" && sub)               return handleRevokeInvite(sub, user.userId);
+      if (req.method === "GET"    && !sub)               return handleListInvites(user.userId);
+      if (req.method === "GET"    && sub === "received") return handleListReceivedInvites(user);
+      if (req.method === "POST"   && !sub)               return handleCreateInvite(req, user.userId);
+      if (req.method === "POST"   && sub === "accept")   return handleAcceptInvite(req, user.userId);
+      if (req.method === "POST"   && version === "accept") return handleAcceptInviteById(sub, user);
+      if (req.method === "DELETE" && sub)                return handleRevokeInvite(sub, user.userId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -1232,6 +1234,69 @@ async function handleCreateInvite(req: Request, userId: string): Promise<Respons
     acceptedAt: null,
     revokedAt: null,
   }, { status: 201 });
+}
+
+async function handleListReceivedInvites(user: SessionUser): Promise<Response> {
+  const [u] = await sql<{ email: string }[]>`SELECT email FROM "user" WHERE id = ${user.userId}`;
+  if (!u) return Response.json({ invites: [] });
+
+  const invites = await sql<{
+    id: string; org_id: string; role: string;
+    created_at: Date; expires_at: Date; accepted_at: Date | null; revoked_at: Date | null;
+    owner_name: string; owner_email: string;
+  }[]>`
+    SELECT i.id, i.org_id, i.role, i.created_at, i.expires_at, i.accepted_at, i.revoked_at,
+           own.name AS owner_name, own.email AS owner_email
+    FROM common.invites i
+    JOIN "user" own ON own.id = i.org_id
+    WHERE i.email = ${u.email}
+    ORDER BY i.created_at DESC
+  `;
+  return Response.json({
+    invites: invites.map(i => ({
+      id: i.id,
+      orgId: i.org_id,
+      orgName: i.owner_name,
+      orgEmail: i.owner_email,
+      role: i.role,
+      createdAt: i.created_at,
+      expiresAt: i.expires_at,
+      acceptedAt: i.accepted_at,
+      revokedAt: i.revoked_at,
+    })),
+  });
+}
+
+// Accept an invite by ID — no token required, validates that the logged-in user's email matches
+async function handleAcceptInviteById(inviteId: string, user: SessionUser): Promise<Response> {
+  const [u] = await sql<{ email: string }[]>`SELECT email FROM "user" WHERE id = ${user.userId}`;
+  if (!u) return Response.json({ error: "User not found" }, { status: 404 });
+
+  const [invite] = await sql<{
+    id: string; org_id: string; email: string; role: string;
+    expires_at: Date; accepted_at: Date | null; revoked_at: Date | null;
+  }[]>`
+    SELECT id, org_id, email, role, expires_at, accepted_at, revoked_at
+    FROM common.invites WHERE id = ${inviteId}
+  `;
+  if (!invite)            return Response.json({ error: "Invite not found" }, { status: 404 });
+  if (invite.email !== u.email)
+                          return Response.json({ error: "This invite is for a different email address" }, { status: 403 });
+  if (invite.revoked_at)  return Response.json({ error: "Invite has been revoked" }, { status: 410 });
+  if (invite.accepted_at) return Response.json({ error: "Invite already accepted" }, { status: 409 });
+  if (new Date(invite.expires_at) < new Date())
+                          return Response.json({ error: "Invite has expired" }, { status: 410 });
+  if (invite.org_id === user.userId)
+                          return Response.json({ error: "Cannot accept your own invite" }, { status: 400 });
+
+  await sql`
+    INSERT INTO common.org_members (org_id, user_id, role)
+    VALUES (${invite.org_id}, ${user.userId}, ${invite.role})
+    ON CONFLICT (org_id, user_id) DO UPDATE SET role = ${invite.role}
+  `;
+  await sql`UPDATE common.invites SET accepted_at = NOW() WHERE id = ${invite.id}`;
+
+  return Response.json({ accepted: true, orgId: invite.org_id });
 }
 
 async function handleRevokeInvite(inviteId: string, userId: string): Promise<Response> {
