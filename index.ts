@@ -55,17 +55,26 @@ async function ensureTenant(orgId: string): Promise<string> {
   return sanitizeSchemaName(orgId);
 }
 
-// Returns the org_id (owner userId) this user belongs to.
-// Members inherit the owner's tenant schema.
-async function resolveUserOrgId(userId: string): Promise<string> {
-  const rows = await sql<{ org_id: string }[]>`
-    SELECT org_id FROM common.org_members WHERE user_id = ${userId} LIMIT 1
+// Returns the org_id (owner userId) this user's session is currently scoped to.
+// Priority: explicit per-session preference → auto-select if exactly one membership → own org.
+async function resolveUserOrgId(userId: string, sessionId: string | null): Promise<string> {
+  if (sessionId) {
+    const pref = await sql<{ org_id: string }[]>`
+      SELECT org_id FROM common.session_orgs WHERE session_id = ${sessionId}
+    `;
+    if (pref.length) return pref[0].org_id;
+  }
+  // No explicit preference — auto-select if member of exactly one foreign org
+  const memberships = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.org_members WHERE user_id = ${userId}
   `;
-  return rows.length ? rows[0].org_id : userId;
+  if (memberships.length === 1) return memberships[0].org_id;
+  // Multiple memberships with no preference set, or no memberships at all: use own org
+  return userId;
 }
 
-async function resolveUserOrg(userId: string): Promise<string> {
-  const orgId = await resolveUserOrgId(userId);
+async function resolveUserOrg(userId: string, sessionId: string | null): Promise<string> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
   return ensureTenant(orgId);
 }
 
@@ -121,7 +130,9 @@ function generateInviteToken(): string {
   return "inv_" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function checkApiKey(req: Request): Promise<{ userId: string; name: string; email: string } | null> {
+type SessionUser = { userId: string; name: string; email: string; sessionId: string | null };
+
+async function checkApiKey(req: Request): Promise<SessionUser | null> {
   const header = req.headers.get("Authorization") ?? "";
   if (!header.startsWith("Bearer wren_")) return null;
   const token = header.slice(7);
@@ -139,15 +150,16 @@ async function checkApiKey(req: Request): Promise<{ userId: string; name: string
     SELECT id, name, email FROM "user" WHERE id = ${userId}
   `;
   if (!users.length) return null;
-  return { userId: users[0].id, name: users[0].name, email: users[0].email };
+  // API keys have no session — org switching is browser-session only
+  return { userId: users[0].id, name: users[0].name, email: users[0].email, sessionId: null };
 }
 
-async function requireSession(req: Request): Promise<{ userId: string; name: string; email: string } | null> {
+async function requireSession(req: Request): Promise<SessionUser | null> {
   const apiKey = await checkApiKey(req);
   if (apiKey) return apiKey;
   const session = await auth.api.getSession({ headers: req.headers });
   if (!session) return null;
-  return { userId: session.user.id, name: session.user.name, email: session.user.email };
+  return { userId: session.user.id, name: session.user.name, email: session.user.email, sessionId: session.session.id };
 }
 
 function unauthorized(): Response {
@@ -281,6 +293,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
+    // Org context routes — /api/org
+    if (collection === "api" && id === "org" && !sub) {
+      if (req.method === "GET") return handleGetOrg(user.userId, user.sessionId);
+      if (req.method === "PUT") return handleSwitchOrg(req, user.userId, user.sessionId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
     // Invite management routes — /api/invites[/:inviteId | /accept]
     if (collection === "api" && id === "invites") {
       if (req.method === "GET"    && !sub)              return handleListInvites(user.userId);
@@ -297,7 +316,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    const schemaName = await resolveUserOrg(user.userId);
+    const schemaName = await resolveUserOrg(user.userId, user.sessionId);
 
     // Route: GET /collections — list distinct collection names
     if (req.method === "GET" && collection === "collections" && !id) {
@@ -1106,6 +1125,58 @@ async function handleRevokeApiKey(keyId: string, userId: string): Promise<Respon
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ id: keyId, revoked: true });
+}
+
+// -------------------------------------------------------
+// Org context handlers
+// -------------------------------------------------------
+
+async function handleGetOrg(userId: string, sessionId: string | null): Promise<Response> {
+  const current = await resolveUserOrgId(userId, sessionId);
+
+  // All orgs accessible to this user: own + any they're a member of
+  const memberships = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.org_members WHERE user_id = ${userId}
+  `;
+  const foreignIds = memberships.map(m => m.org_id);
+  const owners = foreignIds.length
+    ? await sql<{ id: string; name: string; email: string }[]>`
+        SELECT id, name, email FROM "user" WHERE id = ANY(${foreignIds})
+      `
+    : [];
+
+  const orgs = [
+    { id: userId, name: "My workspace", own: true },
+    ...owners.map(o => ({ id: o.id, name: o.name, email: o.email, own: false })),
+  ];
+
+  return Response.json({ current, orgs });
+}
+
+async function handleSwitchOrg(req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  if (!sessionId) {
+    return Response.json({ error: "Org switching requires a browser session, not an API key" }, { status: 400 });
+  }
+  const body = await req.json() as { orgId?: string };
+  const orgId = body.orgId?.trim();
+  if (!orgId) return Response.json({ error: "orgId is required" }, { status: 400 });
+
+  // Validate: must be own org or an org the user is a member of
+  if (orgId !== userId) {
+    const rows = await sql<{ org_id: string }[]>`
+      SELECT org_id FROM common.org_members
+      WHERE org_id = ${orgId} AND user_id = ${userId}
+    `;
+    if (!rows.length) return Response.json({ error: "Not a member of that org" }, { status: 403 });
+  }
+
+  await sql`
+    INSERT INTO common.session_orgs (session_id, org_id)
+    VALUES (${sessionId}, ${orgId})
+    ON CONFLICT (session_id) DO UPDATE SET org_id = ${orgId}, updated_at = NOW()
+  `;
+
+  return Response.json({ current: orgId });
 }
 
 // -------------------------------------------------------
