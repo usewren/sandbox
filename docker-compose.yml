@@ -4,9 +4,12 @@ services:
       context: ..
       dockerfile: sandbox/Dockerfile
     ports:
-      - "4000:4000"
+      - "4000:4000"   # API, docs (/docs), admin UI (/admin)
     environment:
       DATABASE_URL: postgres://wren:wren@db:5432/wren
+      BETTER_AUTH_URL: http://localhost:4000
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-change-me-in-production}
+      NODE_ENV: production
     depends_on:
       db:
         condition: service_healthy
