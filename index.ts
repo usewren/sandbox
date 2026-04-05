@@ -333,7 +333,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const treePath = "/" + segments.slice(2).join("/");
       if (!treeName) return Response.json({ error: "Tree name required" }, { status: 400 });
       if (req.method === "GET" && url.searchParams.get("full") === "true")
-        return handleTreeFull(schemaName, treeName);
+        return handleTreeFull(schemaName, treeName, url.searchParams.get("label") ?? undefined);
       if (req.method === "GET")    return handleTreeGet(schemaName, treeName, treePath);
       if (req.method === "PUT")    return handleTreePut(schemaName, treeName, treePath, req, user.userId);
       if (req.method === "DELETE") return handleTreeDelete(schemaName, treeName, treePath, user.userId);
@@ -928,17 +928,28 @@ async function handleListTrees(schemaName: string): Promise<Response> {
   return Response.json({ trees: rows.map(r => ({ name: r.tree, count: parseInt(r.count) })) });
 }
 
-async function handleTreeFull(schemaName: string, treeName: string): Promise<Response> {
-  const nodes = await withTenant(schemaName, async tx =>
-    tx<{ path: string; document_id: string; collection: string; version: number; data: unknown }[]>`
+async function handleTreeFull(schemaName: string, treeName: string, label?: string): Promise<Response> {
+  const nodes = await withTenant(schemaName, async tx => {
+    if (label) {
+      return tx<{ path: string; document_id: string; collection: string; version: number; data: unknown }[]>`
+        SELECT p.path, p.document_id, d.collection, l.version, v.data
+        FROM paths p
+        JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
+        JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+        JOIN versions v ON v.document_id = d.id AND v.version = l.version
+        WHERE p.tree = ${treeName}
+        ORDER BY p.path
+      `;
+    }
+    return tx<{ path: string; document_id: string; collection: string; version: number; data: unknown }[]>`
       SELECT p.path, p.document_id, d.collection, d.current_version AS version, v.data
       FROM paths p
       JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
       JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
       WHERE p.tree = ${treeName}
       ORDER BY p.path
-    `
-  );
+    `;
+  });
   return Response.json({
     tree: treeName,
     nodes: nodes.map(n => ({
