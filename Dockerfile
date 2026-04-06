@@ -39,13 +39,13 @@ COPY sandbox/package.json sandbox/bun.lock* ./
 RUN bun install
 
 # -------------------------------------------------------
-# Build admin UI into static files served under /admin
+# Build legacy React admin UI served under /oldadmin
 # -------------------------------------------------------
 
-RUN cd /adminui && bun build ./index.html --outdir=/app/public/admin --public-path=/admin/
+RUN cd /adminui && bun build ./index.html --outdir=/app/public/oldadmin --public-path=/oldadmin/
 
-# Copy plain-JS admin UI directly (no build step needed)
-RUN cp -r /adminui2 /app/public/admin2
+# Copy plain-JS admin UI directly (no build step needed), served under /admin
+RUN cp -r /adminui2 /app/public/admin
 
 # Copy marketing site static files
 RUN cp -r /marketing /app/public/marketing

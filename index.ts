@@ -11,13 +11,13 @@ import jsonata from "jsonata";
 
 const ajv = new Ajv({ allErrors: true });
 
-// Admin UI static files — built by `bun build` into public/admin/
+// Plain-JS admin UI — served directly (no build step) from public/admin/
 const ADMIN_DIR = join(import.meta.dir, "public", "admin");
 const ADMIN_INDEX = join(ADMIN_DIR, "index.html");
 
-// Plain-JS admin UI — served directly (no build step) from public/admin2/
-const ADMIN2_DIR = join(import.meta.dir, "public", "admin2");
-const ADMIN2_INDEX = join(ADMIN2_DIR, "index.html");
+// Legacy React admin UI — built by `bun build` into public/oldadmin/
+const OLDADMIN_DIR = join(import.meta.dir, "public", "oldadmin");
+const OLDADMIN_INDEX = join(OLDADMIN_DIR, "index.html");
 
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -39,14 +39,14 @@ function serveAdminIndex(): Response {
   return new Response(Bun.file(ADMIN_INDEX), { headers: { "Content-Type": "text/html" } });
 }
 
-function serveAdmin2File(filePath: string): Response | null {
+function serveOldAdminFile(filePath: string): Response | null {
   if (!existsSync(filePath)) return null;
   const type = MIME[extname(filePath)] ?? "application/octet-stream";
   return new Response(Bun.file(filePath), { headers: { "Content-Type": type } });
 }
 
-function serveAdmin2Index(): Response {
-  return new Response(Bun.file(ADMIN2_INDEX), { headers: { "Content-Type": "text/html" } });
+function serveOldAdminIndex(): Response {
+  return new Response(Bun.file(OLDADMIN_INDEX), { headers: { "Content-Type": "text/html" } });
 }
 
 const sql = postgres(process.env.DATABASE_URL ?? "postgres://wren:wren@localhost:5432/wren");
@@ -362,7 +362,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       });
     }
 
-    // Admin UI — serve built static files, SPA fallback to index.html
+    // Plain-JS admin UI — served directly from public/admin/ (no build step)
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
       const subPath = url.pathname.slice("/admin".length);
       const filePath = (!subPath || subPath === "/")
@@ -371,13 +371,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return serveAdminFile(filePath) ?? serveAdminIndex();
     }
 
-    // Plain-JS admin UI — served directly from public/admin2/ (no build step)
-    if (url.pathname === "/admin2" || url.pathname.startsWith("/admin2/")) {
-      const subPath = url.pathname.slice("/admin2".length);
+    // Legacy React admin UI — built static files with SPA fallback
+    if (url.pathname === "/oldadmin" || url.pathname.startsWith("/oldadmin/")) {
+      const subPath = url.pathname.slice("/oldadmin".length);
       const filePath = (!subPath || subPath === "/")
-        ? ADMIN2_INDEX
-        : join(ADMIN2_DIR, subPath);
-      return serveAdmin2File(filePath) ?? serveAdmin2Index();
+        ? OLDADMIN_INDEX
+        : join(OLDADMIN_DIR, subPath);
+      return serveOldAdminFile(filePath) ?? serveOldAdminIndex();
     }
 
     // Auth routes — handled by Better Auth
