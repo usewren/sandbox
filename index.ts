@@ -104,30 +104,59 @@ async function withTenant<T>(schemaName: string, fn: (tx: Sql) => Promise<T>): P
 // Org slug helpers
 // -------------------------------------------------------
 
-async function getOrCreateSlug(orgId: string, email: string): Promise<string> {
-  // Try to find an existing slug
+const SLUG_WORDS = [
+  // colours & textures
+  "amber","azure","beige","brass","bronze","coral","cream","crisp","dusty","fawn",
+  "gold","ivory","jade","khaki","lemon","lilac","linen","mocha","olive","pearl",
+  "pine","plum","rose","rust","sage","sand","slate","smoke","steel","stone",
+  "tawny","teal","umber","wheat",
+  // nature — landscape
+  "arch","bay","bluff","brook","canyon","cape","cave","cliff","coast","cove",
+  "crag","creek","dale","dell","dune","fell","fen","fjord","ford","glen",
+  "gorge","gulf","heath","hill","isle","knoll","lake","ledge","loch","mead",
+  "mesa","moor","peak","pond","pool","reef","ridge","rise","shoal","slope",
+  "sound","spur","vale","vault","wold",
+  // nature — flora & fauna
+  "ash","birch","cedar","elm","fern","fir","fox","hawk","heron","iris",
+  "jay","kite","lark","lynx","moth","oak","otter","owl","rook","rook",
+  "rush","seal","swan","thorn","vine","wren","yew",
+  // qualities & moods
+  "bold","brave","bright","brisk","calm","clear","cool","crisp","deft","deep",
+  "fair","fast","fierce","firm","fleet","free","keen","kind","lean","light",
+  "lone","mild","neat","noble","pure","quick","quiet","rare","sharp","slim",
+  "soft","still","swift","tall","tame","true","warm","wild","wise","young",
+  // elements & materials
+  "ash","bark","beam","brine","clay","coal","crest","dew","drift","dust",
+  "ember","flint","foam","frost","gale","glow","haze","husk","mist","moss",
+  "mud","ore","peat","rime","salt","silt","snow","soil","steam","tide",
+  "wave","wind",
+];
+
+function randomSlug(): string {
+  const pick = () => SLUG_WORDS[Math.floor(Math.random() * SLUG_WORDS.length)]!;
+  return `${pick()}-${pick()}-${pick()}`;
+}
+
+async function getOrCreateSlug(orgId: string, _email: string): Promise<string> {
+  // Return existing slug if already assigned
   const existing = await sql<{ slug: string }[]>`
     SELECT slug FROM common.org_slugs WHERE org_id = ${orgId}
   `;
-  if (existing.length) return existing[0].slug;
+  if (existing.length) return existing[0].slug!;
 
-  // Derive base slug from email local part
-  const local = email.split("@")[0] ?? orgId;
-  const base = local.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-
-  // Find a unique slug by trying base, base-2, base-3, ...
-  let candidate = base;
-  let suffix = 2;
-  while (true) {
+  // Generate a unique 3-word slug
+  let candidate = randomSlug();
+  let attempts = 0;
+  while (attempts < 20) {
     const conflict = await sql<{ org_id: string }[]>`
       SELECT org_id FROM common.org_slugs WHERE slug = ${candidate}
     `;
     if (!conflict.length) break;
-    candidate = `${base}-${suffix}`;
-    suffix++;
+    candidate = randomSlug();
+    attempts++;
   }
 
-  // Race-safe: INSERT ... ON CONFLICT DO NOTHING, then re-select
+  // Race-safe insert — if another request won the race, re-select
   await sql`
     INSERT INTO common.org_slugs (org_id, slug)
     VALUES (${orgId}, ${candidate})
