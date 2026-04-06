@@ -73,25 +73,23 @@ async function ensureTenant(orgId: string): Promise<string> {
 }
 
 // Returns the org_id (owner userId) this user's session is currently scoped to.
-// Priority: explicit per-session preference → auto-select if exactly one membership → own org.
-async function resolveUserOrgId(userId: string, sessionId: string | null): Promise<string> {
+// Priority: API key stored org → explicit per-session preference → auto-select if exactly one membership → own org.
+async function resolveUserOrgId(userId: string, sessionId: string | null, keyOrgId?: string): Promise<string> {
+  // API keys carry their org at creation time — no session lookup needed
+  if (keyOrgId) return keyOrgId;
   if (sessionId) {
     const pref = await sql<{ org_id: string }[]>`
       SELECT org_id FROM common.session_orgs WHERE session_id = ${sessionId}
     `;
     if (pref.length) return pref[0].org_id;
   }
-  // No explicit preference — auto-select if member of exactly one foreign org
-  const memberships = await sql<{ org_id: string }[]>`
-    SELECT org_id FROM common.org_members WHERE user_id = ${userId}
-  `;
-  if (memberships.length === 1) return memberships[0].org_id;
-  // Multiple memberships with no preference set, or no memberships at all: use own org
+  // No explicit session preference — always use the user's own org as the default.
+  // Switching to a foreign org is done explicitly via the org switcher.
   return userId;
 }
 
-async function resolveUserOrg(userId: string, sessionId: string | null): Promise<string> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function resolveUserOrg(userId: string, sessionId: string | null, keyOrgId?: string): Promise<string> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   return ensureTenant(orgId);
 }
 
@@ -100,6 +98,56 @@ async function withTenant<T>(schemaName: string, fn: (tx: Sql) => Promise<T>): P
     await tx.unsafe(`SET LOCAL search_path TO ${schemaName}, common, public`);
     return fn(tx as unknown as Sql);
   });
+}
+
+// -------------------------------------------------------
+// Org slug helpers
+// -------------------------------------------------------
+
+async function getOrCreateSlug(orgId: string, email: string): Promise<string> {
+  // Try to find an existing slug
+  const existing = await sql<{ slug: string }[]>`
+    SELECT slug FROM common.org_slugs WHERE org_id = ${orgId}
+  `;
+  if (existing.length) return existing[0].slug;
+
+  // Derive base slug from email local part
+  const local = email.split("@")[0] ?? orgId;
+  const base = local.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+
+  // Find a unique slug by trying base, base-2, base-3, ...
+  let candidate = base;
+  let suffix = 2;
+  while (true) {
+    const conflict = await sql<{ org_id: string }[]>`
+      SELECT org_id FROM common.org_slugs WHERE slug = ${candidate}
+    `;
+    if (!conflict.length) break;
+    candidate = `${base}-${suffix}`;
+    suffix++;
+  }
+
+  // Race-safe: INSERT ... ON CONFLICT DO NOTHING, then re-select
+  await sql`
+    INSERT INTO common.org_slugs (org_id, slug)
+    VALUES (${orgId}, ${candidate})
+    ON CONFLICT DO NOTHING
+  `;
+  const row = await sql<{ slug: string }[]>`
+    SELECT slug FROM common.org_slugs WHERE org_id = ${orgId}
+  `;
+  return row[0]?.slug ?? candidate;
+}
+
+async function setSlug(orgId: string, slug: string): Promise<void> {
+  if (!/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(slug)) {
+    throw new Error("Invalid slug: must be 3-40 lowercase alphanumeric characters or hyphens, no leading/trailing hyphens");
+  }
+  await sql`
+    INSERT INTO common.org_slugs (org_id, slug, updated_at)
+    VALUES (${orgId}, ${slug}, NOW())
+    ON CONFLICT (org_id) DO UPDATE SET slug = ${slug}, updated_at = NOW()
+  `;
 }
 
 // -------------------------------------------------------
@@ -147,30 +195,26 @@ function generateInviteToken(): string {
   return "inv_" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-type SessionUser = { userId: string; name: string; email: string; sessionId: string | null; keyId?: string };
+type SessionUser = { userId: string; name: string; email: string; sessionId: string | null; keyId?: string; keyOrgId?: string };
 
 async function checkApiKey(req: Request): Promise<SessionUser | null> {
   const header = req.headers.get("Authorization") ?? "";
   if (!header.startsWith("Bearer wren_")) return null;
   const token = header.slice(7);
   const hash = await sha256hex(token);
-  const rows = await sql<{ id: string; user_id: string; expires_at: Date | null }[]>`
-    SELECT id, user_id, expires_at FROM common.api_keys
+  const rows = await sql<{ id: string; user_id: string; org_id: string; expires_at: Date | null }[]>`
+    SELECT id, user_id, org_id, expires_at FROM common.api_keys
     WHERE key_hash = ${hash} AND revoked_at IS NULL
   `;
   if (!rows.length) return null;
   const key = rows[0];
-  // Check expiry
   if (key.expires_at && new Date(key.expires_at) < new Date()) return null;
-  // Update last_used_at without blocking the request
   sql`UPDATE common.api_keys SET last_used_at = NOW() WHERE key_hash = ${hash}`.catch(() => {});
-  // Fetch user info from Better Auth's user table
   const users = await sql<{ id: string; name: string; email: string }[]>`
     SELECT id, name, email FROM "user" WHERE id = ${key.user_id}
   `;
   if (!users.length) return null;
-  // API keys have no session — org switching is browser-session only
-  return { userId: users[0].id, name: users[0].name, email: users[0].email, sessionId: null, keyId: key.id };
+  return { userId: users[0].id, name: users[0].name, email: users[0].email, sessionId: null, keyId: key.id, keyOrgId: key.org_id };
 }
 
 async function requireSession(req: Request): Promise<SessionUser | null> {
@@ -361,6 +405,41 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         headers: { "Content-Type": "text/html" },
       });
     }
+    // LLM / crawler discovery files
+    if (url.pathname === "/robots.txt") {
+      const base = `${url.protocol}//${url.host}`;
+      return new Response(
+        `User-agent: *\nAllow: /\n\n# AI crawlers — welcome\nUser-agent: GPTBot\nAllow: /\n\nUser-agent: ClaudeBot\nAllow: /\n\nUser-agent: PerplexityBot\nAllow: /\n\nUser-agent: anthropic-ai\nAllow: /\n\nSitemap: ${base}/sitemap.xml\n`,
+        { headers: { "Content-Type": "text/plain; charset=utf-8" } },
+      );
+    }
+    if (url.pathname === "/sitemap.xml") {
+      const base = `${url.protocol}//${url.host}`;
+      const now = new Date().toISOString().split("T")[0];
+      return new Response(
+        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
+        { headers: { "Content-Type": "application/xml; charset=utf-8" } },
+      );
+    }
+    if (url.pathname === "/llms.txt") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "llms.txt")), {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+    if (url.pathname === "/llms-full.txt") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "llms-full.txt")), {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    if (url.pathname.startsWith("/img/")) {
+      const imgFile = Bun.file(join(import.meta.dir, "public", "marketing", url.pathname));
+      if (await imgFile.exists()) {
+        const ext = url.pathname.split(".").pop() ?? "";
+        const mime: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml" };
+        return new Response(imgFile, { headers: { "Content-Type": mime[ext] ?? "application/octet-stream" } });
+      }
+    }
 
     // Plain-JS admin UI — served directly from public/admin/ (no build step)
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
@@ -426,6 +505,16 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       );
     }
 
+    // Public org llms.txt — /orgs/{slug}/llms.txt
+    if (req.method === "GET" && collection === "orgs" && sub === "llms.txt") {
+      return handleOrgLlmsTxt(id, url, null);
+    }
+
+    // Well-known llms.txt — /.well-known/llms.txt
+    if (req.method === "GET" && url.pathname === "/.well-known/llms.txt") {
+      return handleWellKnownLlmsTxt(url);
+    }
+
     if (!collection) {
       return Response.json({ error: "Not found" }, { status: 404 });
     }
@@ -436,34 +525,44 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // API key management routes — /api/keys[/:keyId]
     if (collection === "api" && id === "keys") {
-      if (req.method === "GET"    && !sub)  return handleListApiKeys(user.userId);
-      if (req.method === "POST"   && !sub)  return handleCreateApiKey(req, user.userId);
-      if (req.method === "DELETE" && sub)   return handleRevokeApiKey(sub, user.userId);
+      if (req.method === "GET"    && !sub)  return handleListApiKeys(user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && !sub)  return handleCreateApiKey(req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && sub)   return handleRevokeApiKey(sub, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    // Org context routes — /api/org
+    // Org context routes — /api/org and /api/org/slug
     if (collection === "api" && id === "org" && !sub) {
       if (req.method === "GET") return handleGetOrg(user.userId, user.sessionId);
       if (req.method === "PUT") return handleSwitchOrg(req, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
+    if (collection === "api" && id === "org" && sub === "slug" && !version) {
+      if (req.method === "PUT") return handleSetOrgSlug(req, user.userId, user.sessionId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Authenticated org llms.txt — /api/orgs/{slug}/llms.txt
+    if (collection === "api" && id === "orgs" && version === "llms.txt") {
+      if (req.method === "GET") return handleOrgLlmsTxt(sub, url, user);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
 
     // Invite management routes — /api/invites[/:inviteId | /accept | /received]
     if (collection === "api" && id === "invites") {
-      if (req.method === "GET"    && !sub)               return handleListInvites(user.userId);
+      if (req.method === "GET"    && !sub)               return handleListInvites(user.userId, user.sessionId);
       if (req.method === "GET"    && sub === "received") return handleListReceivedInvites(user);
-      if (req.method === "POST"   && !sub)               return handleCreateInvite(req, user.userId);
+      if (req.method === "POST"   && !sub)               return handleCreateInvite(req, user.userId, user.sessionId);
       if (req.method === "POST"   && sub === "accept")   return handleAcceptInvite(req, user.userId);
       if (req.method === "POST"   && version === "accept") return handleAcceptInviteById(sub, user);
-      if (req.method === "DELETE" && sub)                return handleRevokeInvite(sub, user.userId);
+      if (req.method === "DELETE" && sub)                return handleRevokeInvite(sub, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Member management routes — /api/members[/:memberId]
     if (collection === "api" && id === "members") {
-      if (req.method === "GET"    && !sub) return handleListMembers(user.userId);
-      if (req.method === "DELETE" && sub)  return handleRemoveMember(sub, user.userId);
+      if (req.method === "GET"    && !sub) return handleListMembers(user.userId, user.sessionId);
+      if (req.method === "DELETE" && sub)  return handleRemoveMember(sub, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -477,7 +576,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     // Resolve org — split into orgId + schemaName so access checks can use orgId
-    const orgId = await resolveUserOrgId(user.userId, user.sessionId);
+    const orgId = await resolveUserOrgId(user.userId, user.sessionId, user.keyOrgId);
     const schemaName = await ensureTenant(orgId);
     const principal = principalFor(user);
 
@@ -1370,14 +1469,18 @@ async function handleTreeDelete(schemaName: string, treeName: string, treePath: 
 // API key handlers
 // -------------------------------------------------------
 
-async function handleListApiKeys(userId: string): Promise<Response> {
+async function handleListApiKeys(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const keys = await sql<{
     id: string; name: string; key_prefix: string;
     created_at: Date; last_used_at: Date | null; revoked_at: Date | null;
   }[]>`
     SELECT id, name, key_prefix, created_at, last_used_at, revoked_at
     FROM common.api_keys
-    WHERE user_id = ${userId}
+    WHERE org_id = ${orgId} AND revoked_at IS NULL
     ORDER BY created_at DESC
   `;
   return Response.json({
@@ -1392,18 +1495,22 @@ async function handleListApiKeys(userId: string): Promise<Response> {
   });
 }
 
-async function handleCreateApiKey(req: Request, userId: string): Promise<Response> {
+async function handleCreateApiKey(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const body = await req.json() as { name?: string };
   const name = body.name?.trim();
   if (!name) return Response.json({ error: "name is required" }, { status: 400 });
 
   const rawKey = generateApiKey();
   const keyHash = await sha256hex(rawKey);
-  const keyPrefix = rawKey.slice(0, 12); // "wren_" + 7 hex chars
+  const keyPrefix = rawKey.slice(0, 12);
 
   const [key] = await sql<{ id: string; created_at: Date }[]>`
-    INSERT INTO common.api_keys (user_id, name, key_hash, key_prefix)
-    VALUES (${userId}, ${name}, ${keyHash}, ${keyPrefix})
+    INSERT INTO common.api_keys (user_id, org_id, name, key_hash, key_prefix)
+    VALUES (${userId}, ${orgId}, ${name}, ${keyHash}, ${keyPrefix})
     RETURNING id, created_at
   `;
   return Response.json({
@@ -1417,11 +1524,15 @@ async function handleCreateApiKey(req: Request, userId: string): Promise<Respons
   }, { status: 201 });
 }
 
-async function handleRevokeApiKey(keyId: string, userId: string): Promise<Response> {
+async function handleRevokeApiKey(keyId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const rows = await sql<{ id: string }[]>`
     UPDATE common.api_keys
     SET revoked_at = NOW()
-    WHERE id = ${keyId} AND user_id = ${userId} AND revoked_at IS NULL
+    WHERE id = ${keyId} AND org_id = ${orgId} AND revoked_at IS NULL
     RETURNING id
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
@@ -1446,9 +1557,26 @@ async function handleGetOrg(userId: string, sessionId: string | null): Promise<R
       `
     : [];
 
+  // Fetch the current user's email for slug creation
+  const selfRows = await sql<{ email: string }[]>`
+    SELECT email FROM "user" WHERE id = ${userId}
+  `;
+  const selfEmail = selfRows[0]?.email ?? userId;
+  const selfSlug = await getOrCreateSlug(userId, selfEmail);
+
+  const foreignOrgs = await Promise.all(
+    owners.map(async o => ({
+      id: o.id,
+      name: o.name,
+      email: o.email,
+      slug: await getOrCreateSlug(o.id, o.email),
+      own: false,
+    }))
+  );
+
   const orgs = [
-    { id: userId, name: "My workspace", own: true },
-    ...owners.map(o => ({ id: o.id, name: o.name, email: o.email, own: false })),
+    { id: userId, name: "My workspace", slug: selfSlug, own: true },
+    ...foreignOrgs,
   ];
 
   return Response.json({ current, orgs });
@@ -1481,10 +1609,380 @@ async function handleSwitchOrg(req: Request, userId: string, sessionId: string |
 }
 
 // -------------------------------------------------------
+// Slug + llms.txt handlers
+// -------------------------------------------------------
+
+async function handleSetOrgSlug(req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const currentOrgId = await resolveUserOrgId(userId, sessionId);
+  // Only the org owner can set their own slug
+  if (currentOrgId !== userId) {
+    return Response.json({ error: "Only the org owner can set the slug" }, { status: 403 });
+  }
+  const body = await req.json() as { slug?: string };
+  const slug = body.slug?.trim();
+  if (!slug) return Response.json({ error: "slug is required" }, { status: 400 });
+  try {
+    await setSlug(userId, slug);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("Invalid slug")) return Response.json({ error: msg }, { status: 400 });
+    if (msg.includes("unique") || msg.includes("duplicate") || msg.includes("already exists")) {
+      return Response.json({ error: "Slug already taken" }, { status: 409 });
+    }
+    throw e;
+  }
+  return Response.json({ slug });
+}
+
+// Resolve a slug to its orgId. Returns null if not found.
+async function resolveSlugToOrgId(slug: string): Promise<string | null> {
+  const rows = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.org_slugs WHERE slug = ${slug}
+  `;
+  return rows[0]?.org_id ?? null;
+}
+
+// Determine which collections are publicly accessible for an org.
+// Returns: { collectionNames: string[], allPublic: boolean, publicTrees: string[] | null (null = all) }
+async function getPublicResources(orgId: string): Promise<{ collections: Set<string> | "all"; trees: Set<string> | "all" }> {
+  const perms = await sql<{ resource: string }[]>`
+    SELECT resource FROM common.permissions
+    WHERE org_id = ${orgId}
+      AND principal = '*'
+      AND access IN ('read', 'write', 'admin')
+  `;
+
+  let collectionAll = false;
+  let treeAll = false;
+  const collections = new Set<string>();
+  const trees = new Set<string>();
+
+  for (const p of perms) {
+    const r = p.resource;
+    if (r === "*" || r === "collection:*") collectionAll = true;
+    else if (r.startsWith("collection:")) collections.add(r.slice("collection:".length));
+    if (r === "*" || r === "tree:*") treeAll = true;
+    else if (r.startsWith("tree:")) trees.add(r.slice("tree:".length));
+  }
+
+  return {
+    collections: collectionAll ? "all" : collections,
+    trees: treeAll ? "all" : trees,
+  };
+}
+
+// Generate llms.txt markdown for an org.
+async function generateLlmsTxt(
+  orgId: string,
+  orgName: string,
+  slug: string,
+  base: string,
+  accessibleCollections: string[],
+  accessibleTrees: string[],
+  authenticated: boolean,
+): Promise<string> {
+  const schema = sanitizeSchemaName(orgId);
+
+  // Check if the tenant schema exists
+  const schemaExists = await sql<{ exists: boolean }[]>`
+    SELECT EXISTS(
+      SELECT 1 FROM information_schema.schemata WHERE schema_name = ${schema}
+    ) AS exists
+  `;
+  if (!schemaExists[0]?.exists) {
+    const date = new Date().toISOString().split("T")[0];
+    return [
+      `# ${orgName} — Wren data context`,
+      ``,
+      `> Versioned JSON document store. No collections yet.`,
+      ``,
+      `*${authenticated ? "Authenticated" : "Public"} data context. Generated ${date}.*`,
+      ``,
+      `## Access`,
+      ``,
+      `Base URL: ${base}`,
+      `API docs: ${base}/docs`,
+      authenticated ? `` : `Full authenticated context: ${base}/api/orgs/${slug}/llms.txt`,
+    ].filter(l => l !== undefined).join("\n");
+  }
+
+  // Collect per-collection data
+  type CollectionData = {
+    name: string;
+    count: number;
+    schema: Record<string, unknown> | null;
+    labels: { label: string; count: number }[];
+    samples: { id: string; version: number; labels: string[]; data: unknown }[];
+  };
+
+  const collectionData: CollectionData[] = [];
+
+  for (const col of accessibleCollections) {
+    // Count
+    const countRows = await sql<{ count: string }[]>`
+      SELECT COUNT(*) AS count FROM ${sql.unsafe(schema)}.documents
+      WHERE collection = ${col} AND deleted_at IS NULL
+    `;
+    const count = parseInt(countRows[0]?.count ?? "0", 10);
+
+    // Schema
+    const schemaRows = await sql<{ schema: unknown }[]>`
+      SELECT schema FROM ${sql.unsafe(schema)}.collection_schemas
+      WHERE collection = ${col}
+    `;
+    const colSchema = (schemaRows[0]?.schema ?? null) as Record<string, unknown> | null;
+
+    // Labels in use
+    const labelRows = await sql<{ label: string; count: string }[]>`
+      SELECT DISTINCT l.label, COUNT(DISTINCT l.document_id)::text AS count
+      FROM ${sql.unsafe(schema)}.labels l
+      JOIN ${sql.unsafe(schema)}.documents d ON d.id = l.document_id
+      WHERE d.collection = ${col} AND d.deleted_at IS NULL
+      GROUP BY l.label
+      ORDER BY count DESC
+    `;
+    const labels = labelRows.map(r => ({ label: r.label, count: parseInt(r.count, 10) }));
+
+    // Sample documents
+    const sampleRows = await sql<{ data: unknown; id: string; current_version: number; labels: string[] }[]>`
+      SELECT v.data, d.id, d.current_version,
+             ARRAY(SELECT label FROM ${sql.unsafe(schema)}.labels WHERE document_id = d.id ORDER BY label) AS labels
+      FROM ${sql.unsafe(schema)}.documents d
+      JOIN ${sql.unsafe(schema)}.versions v ON v.document_id = d.id AND v.version = d.current_version
+      WHERE d.collection = ${col} AND d.deleted_at IS NULL
+      ORDER BY d.updated_at DESC NULLS LAST
+      LIMIT 3
+    `;
+    const samples = sampleRows.map(r => ({
+      id: r.id,
+      version: r.current_version,
+      labels: r.labels,
+      data: r.data,
+    }));
+
+    collectionData.push({ name: col, count, schema: colSchema, labels, samples });
+  }
+
+  const totalDocs = collectionData.reduce((s, c) => s + c.count, 0);
+  const date = new Date().toISOString().split("T")[0];
+
+  const lines: string[] = [
+    `# ${orgName} — Wren data context`,
+    ``,
+    `> Versioned JSON document store. ${accessibleCollections.length} collections, ${totalDocs} total documents.`,
+    ``,
+    `*${authenticated ? "Authenticated" : "Public"} data context. Generated ${date}.*`,
+    ``,
+    `## Collections`,
+    ``,
+  ];
+
+  if (collectionData.length === 0) {
+    lines.push("No public collections.");
+  }
+
+  for (const col of collectionData) {
+    lines.push(`### ${col.name} (${col.count} documents)`);
+
+    // Schema summary
+    if (col.schema && typeof col.schema === "object") {
+      const props = (col.schema as { properties?: Record<string, { type?: string; enum?: unknown[] }> }).properties;
+      if (props) {
+        const fields = Object.entries(props).map(([k, v]) => {
+          const typePart = v.type ?? "any";
+          const enumPart = Array.isArray(v.enum) ? ` (enum: ${v.enum.join("|")})` : "";
+          return `${k}: ${typePart}${enumPart}`;
+        });
+        lines.push(`Schema: ${fields.join(", ")}`);
+      } else {
+        lines.push("Schema: schema-free");
+      }
+    } else {
+      lines.push("Schema: schema-free");
+    }
+
+    // Labels
+    if (col.labels.length) {
+      lines.push(`Labels in use: ${col.labels.map(l => `${l.label} (${l.count} docs)`).join(", ")}`);
+    } else {
+      lines.push("Labels in use: none");
+    }
+
+    // Sample documents
+    lines.push("Sample documents:");
+    if (col.samples.length === 0) {
+      lines.push("- (no documents)");
+    }
+    for (const s of col.samples) {
+      const displayName = (s.data as Record<string, unknown>)?.name ?? (s.data as Record<string, unknown>)?.title ?? s.id;
+      const labelStr = s.labels.length ? s.labels.join(", ") : "none";
+      const raw = JSON.stringify(s.data);
+      const dataStr = raw.length > 200 ? raw.slice(0, 200) + "…" : raw;
+      lines.push(`- "${displayName}" (v${s.version}, labels: ${labelStr})`);
+      lines.push(`  ${dataStr}`);
+    }
+    lines.push("");
+  }
+
+  // Trees section
+  if (accessibleTrees.length > 0) {
+    lines.push("## Trees", "");
+
+    for (const treeName of accessibleTrees) {
+      const pathRows = await sql<{ path: string; document_id: string; collection: string }[]>`
+        SELECT p.path, p.document_id, d.collection
+        FROM ${sql.unsafe(schema)}.paths p
+        JOIN ${sql.unsafe(schema)}.documents d ON d.id = p.assignment_doc_id
+        WHERE p.tree = ${treeName}
+        ORDER BY p.path
+        LIMIT 20
+      `;
+
+      const totalPaths = await sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS count FROM ${sql.unsafe(schema)}.paths WHERE tree = ${treeName}
+      `;
+      const pathCount = parseInt(totalPaths[0]?.count ?? "0", 10);
+
+      lines.push(`### ${treeName} (${pathCount} paths)`);
+      for (const p of pathRows) {
+        lines.push(`${p.path} → ${p.collection}/${p.document_id}`);
+      }
+      if (pathCount > 20) lines.push(`… (${pathCount - 20} more paths not shown)`);
+      lines.push("");
+    }
+  }
+
+  lines.push("## Access", "");
+  lines.push(`Base URL: ${base}`);
+  lines.push(`API docs: ${base}/docs`);
+  if (!authenticated) {
+    lines.push(`Full authenticated context: ${base}/api/orgs/${slug}/llms.txt`);
+  } else {
+    lines.push(`API key creation: POST ${base}/api/keys`);
+  }
+
+  return lines.join("\n");
+}
+
+async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: SessionUser | null): Promise<Response> {
+  if (!slug) return new Response("Slug required", { status: 400 });
+
+  const orgId = await resolveSlugToOrgId(slug);
+  if (!orgId) return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+
+  const base = `${url.protocol}//${url.host}`;
+  const authenticated = user !== null;
+
+  // Determine org name
+  const orgUserRows = await sql<{ name: string; email: string }[]>`
+    SELECT name, email FROM "user" WHERE id = ${orgId}
+  `;
+  const orgName = orgUserRows[0]?.name ?? slug;
+  const orgEmail = orgUserRows[0]?.email ?? "";
+
+  let accessibleCollections: string[];
+  let accessibleTrees: string[];
+
+  if (authenticated && (user!.userId === orgId || (() => false)())) {
+    // Authenticated as owner: show all collections
+    const colRows = await sql<{ collection: string }[]>`
+      SELECT DISTINCT collection FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.documents
+      WHERE deleted_at IS NULL
+      ORDER BY collection
+    `.catch(() => [] as { collection: string }[]);
+    accessibleCollections = colRows.map(r => r.collection);
+
+    const treeRows = await sql<{ tree: string }[]>`
+      SELECT DISTINCT tree FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.paths ORDER BY tree
+    `.catch(() => [] as { tree: string }[]);
+    accessibleTrees = treeRows.map(r => r.tree);
+  } else if (authenticated) {
+    // Authenticated as someone else: check membership + permissions
+    const isMember = user!.userId === orgId || (await sql<{ org_id: string }[]>`
+      SELECT org_id FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${user!.userId}
+    `).length > 0;
+
+    if (isMember) {
+      const colRows = await sql<{ collection: string }[]>`
+        SELECT DISTINCT collection FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.documents
+        WHERE deleted_at IS NULL
+        ORDER BY collection
+      `.catch(() => [] as { collection: string }[]);
+      accessibleCollections = colRows.map(r => r.collection);
+
+      const treeRows = await sql<{ tree: string }[]>`
+        SELECT DISTINCT tree FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.paths ORDER BY tree
+      `.catch(() => [] as { tree: string }[]);
+      accessibleTrees = treeRows.map(r => r.tree);
+    } else {
+      // Not a member — fall back to public access rules
+      const resources = await getPublicResources(orgId);
+      if (resources.collections === "all") {
+        const colRows = await sql<{ collection: string }[]>`
+          SELECT DISTINCT collection FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.documents
+          WHERE deleted_at IS NULL ORDER BY collection
+        `.catch(() => [] as { collection: string }[]);
+        accessibleCollections = colRows.map(r => r.collection);
+      } else {
+        accessibleCollections = Array.from(resources.collections as Set<string>);
+      }
+      if (resources.trees === "all") {
+        const treeRows = await sql<{ tree: string }[]>`
+          SELECT DISTINCT tree FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.paths ORDER BY tree
+        `.catch(() => [] as { tree: string }[]);
+        accessibleTrees = treeRows.map(r => r.tree);
+      } else {
+        accessibleTrees = Array.from(resources.trees as Set<string>);
+      }
+    }
+  } else {
+    // Unauthenticated: public access only
+    const resources = await getPublicResources(orgId);
+    if (resources.collections === "all") {
+      const colRows = await sql<{ collection: string }[]>`
+        SELECT DISTINCT collection FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.documents
+        WHERE deleted_at IS NULL ORDER BY collection
+      `.catch(() => [] as { collection: string }[]);
+      accessibleCollections = colRows.map(r => r.collection);
+    } else {
+      accessibleCollections = Array.from(resources.collections as Set<string>);
+    }
+    if (resources.trees === "all") {
+      const treeRows = await sql<{ tree: string }[]>`
+        SELECT DISTINCT tree FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.paths ORDER BY tree
+      `.catch(() => [] as { tree: string }[]);
+      accessibleTrees = treeRows.map(r => r.tree);
+    } else {
+      accessibleTrees = Array.from(resources.trees as Set<string>);
+    }
+  }
+
+  const body = await generateLlmsTxt(orgId, orgName, slug, base, accessibleCollections, accessibleTrees, authenticated);
+  return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+}
+
+async function handleWellKnownLlmsTxt(url: URL): Promise<Response> {
+  // Find the instance owner: the user with the earliest created_at
+  const ownerRows = await sql<{ id: string; email: string }[]>`
+    SELECT id, email FROM "user" ORDER BY created_at ASC LIMIT 1
+  `;
+  if (!ownerRows.length) {
+    return new Response("# Wren — no users yet\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  }
+  const owner = ownerRows[0];
+  const slug = await getOrCreateSlug(owner.id, owner.email);
+  return handleOrgLlmsTxt(slug, url, null);
+}
+
+// -------------------------------------------------------
 // Invite handlers
 // -------------------------------------------------------
 
-async function handleListInvites(userId: string): Promise<Response> {
+async function handleListInvites(userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const invites = await sql<{
     id: string; email: string; role: string;
     created_at: Date; expires_at: Date;
@@ -1492,7 +1990,7 @@ async function handleListInvites(userId: string): Promise<Response> {
   }[]>`
     SELECT id, email, role, created_at, expires_at, accepted_at, revoked_at
     FROM common.invites
-    WHERE org_id = ${userId}
+    WHERE org_id = ${orgId}
     ORDER BY created_at DESC
   `;
   return Response.json({
@@ -1508,7 +2006,11 @@ async function handleListInvites(userId: string): Promise<Response> {
   });
 }
 
-async function handleCreateInvite(req: Request, userId: string): Promise<Response> {
+async function handleCreateInvite(req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const body = await req.json() as { email?: string; role?: string };
   const email = body.email?.trim().toLowerCase();
   const role = body.role ?? "member";
@@ -1520,7 +2022,7 @@ async function handleCreateInvite(req: Request, userId: string): Promise<Respons
 
   const [invite] = await sql<{ id: string; created_at: Date; expires_at: Date }[]>`
     INSERT INTO common.invites (org_id, email, token_hash, token_prefix, role, invited_by)
-    VALUES (${userId}, ${email}, ${tokenHash}, ${tokenPrefix}, ${role}, ${userId})
+    VALUES (${orgId}, ${email}, ${tokenHash}, ${tokenPrefix}, ${role}, ${userId})
     RETURNING id, created_at, expires_at
   `;
   return Response.json({
@@ -1598,11 +2100,15 @@ async function handleAcceptInviteById(inviteId: string, user: SessionUser): Prom
   return Response.json({ accepted: true, orgId: invite.org_id });
 }
 
-async function handleRevokeInvite(inviteId: string, userId: string): Promise<Response> {
+async function handleRevokeInvite(inviteId: string, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const rows = await sql<{ id: string }[]>`
     UPDATE common.invites
     SET revoked_at = NOW()
-    WHERE id = ${inviteId} AND org_id = ${userId} AND revoked_at IS NULL AND accepted_at IS NULL
+    WHERE id = ${inviteId} AND org_id = ${orgId} AND revoked_at IS NULL AND accepted_at IS NULL
     RETURNING id
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
@@ -1644,12 +2150,16 @@ async function handleAcceptInvite(req: Request, userId: string): Promise<Respons
 // Member handlers
 // -------------------------------------------------------
 
-async function handleListMembers(userId: string): Promise<Response> {
+async function handleListMembers(userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
   const members = await sql<{ user_id: string; role: string; joined_at: Date; name: string; email: string }[]>`
     SELECT m.user_id, m.role, m.joined_at, u.name, u.email
     FROM common.org_members m
     JOIN "user" u ON u.id = m.user_id
-    WHERE m.org_id = ${userId}
+    WHERE m.org_id = ${orgId}
     ORDER BY m.joined_at ASC
   `;
   return Response.json({
@@ -1663,10 +2173,17 @@ async function handleListMembers(userId: string): Promise<Response> {
   });
 }
 
-async function handleRemoveMember(memberId: string, userId: string): Promise<Response> {
+async function handleRemoveMember(memberId: string, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  // Prevent removing yourself
+  if (memberId === userId) return Response.json({ error: "Cannot remove yourself" }, { status: 400 });
+
   const rows = await sql<{ user_id: string }[]>`
     DELETE FROM common.org_members
-    WHERE org_id = ${userId} AND user_id = ${memberId}
+    WHERE org_id = ${orgId} AND user_id = ${memberId}
     RETURNING user_id
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
@@ -1677,22 +2194,23 @@ async function handleRemoveMember(memberId: string, userId: string): Promise<Res
 // Permission handlers (owner-only: only the org owner can manage permissions)
 // -------------------------------------------------------
 
-async function ownerOrgId(userId: string, sessionId: string | null): Promise<string> {
-  // Only the owner of the org can manage permissions, so we use the current org but
-  // require that the requesting user actually IS the org owner (userId === orgId).
-  return resolveUserOrgId(userId, sessionId);
+/** Returns true if userId is the org owner OR has role 'admin' in that org. */
+async function isOrgAdminOrOwner(userId: string, orgId: string): Promise<boolean> {
+  if (userId === orgId) return true;
+  const rows = await sql<{ role: string }[]>`
+    SELECT role FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${userId}
+  `;
+  return rows.length > 0 && rows[0].role === "admin";
 }
 
-function forbiddenIfNotOwner(userId: string, orgId: string): Response | null {
-  if (userId !== orgId) {
-    return Response.json({ error: "Only the org owner can manage permissions" }, { status: 403 });
-  }
-  return null;
+async function forbiddenIfNotAdminOrOwner(userId: string, orgId: string): Promise<Response | null> {
+  if (await isOrgAdminOrOwner(userId, orgId)) return null;
+  return Response.json({ error: "Only org owners or admin members can manage this" }, { status: 403 });
 }
 
 async function handleListPermissions(userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await ownerOrgId(userId, sessionId);
-  const guard = forbiddenIfNotOwner(userId, orgId);
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
   const rows = await sql<{
@@ -1724,8 +2242,8 @@ async function handleListPermissions(userId: string, sessionId: string | null): 
 }
 
 async function handleCreatePermission(req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await ownerOrgId(userId, sessionId);
-  const guard = forbiddenIfNotOwner(userId, orgId);
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
   const body = await req.json() as {
@@ -1769,8 +2287,8 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
 }
 
 async function handleUpdatePermission(permId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await ownerOrgId(userId, sessionId);
-  const guard = forbiddenIfNotOwner(userId, orgId);
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
   const body = await req.json() as {
@@ -1807,8 +2325,8 @@ async function handleUpdatePermission(permId: string, req: Request, userId: stri
 }
 
 async function handleDeletePermission(permId: string, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await ownerOrgId(userId, sessionId);
-  const guard = forbiddenIfNotOwner(userId, orgId);
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
   const rows = await sql<{ id: string }[]>`
