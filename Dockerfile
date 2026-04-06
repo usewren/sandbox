@@ -23,6 +23,7 @@ COPY componentlibrary/ /componentlibrary/
 COPY db/               /db/
 COPY docs/             /docs/
 COPY adminui/          /adminui/
+COPY adminui2/         /adminui2/
 COPY marketing/        /marketing/
 COPY sandbox/          /app/
 
@@ -42,6 +43,9 @@ RUN bun install
 # -------------------------------------------------------
 
 RUN cd /adminui && bun build ./index.html --outdir=/app/public/admin --public-path=/admin/
+
+# Copy plain-JS admin UI directly (no build step needed)
+RUN cp -r /adminui2 /app/public/admin2
 
 # Copy marketing site static files
 RUN cp -r /marketing /app/public/marketing

@@ -15,6 +15,10 @@ const ajv = new Ajv({ allErrors: true });
 const ADMIN_DIR = join(import.meta.dir, "public", "admin");
 const ADMIN_INDEX = join(ADMIN_DIR, "index.html");
 
+// Plain-JS admin UI — served directly (no build step) from public/admin2/
+const ADMIN2_DIR = join(import.meta.dir, "public", "admin2");
+const ADMIN2_INDEX = join(ADMIN2_DIR, "index.html");
+
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js":   "application/javascript",
@@ -33,6 +37,16 @@ function serveAdminFile(filePath: string): Response | null {
 
 function serveAdminIndex(): Response {
   return new Response(Bun.file(ADMIN_INDEX), { headers: { "Content-Type": "text/html" } });
+}
+
+function serveAdmin2File(filePath: string): Response | null {
+  if (!existsSync(filePath)) return null;
+  const type = MIME[extname(filePath)] ?? "application/octet-stream";
+  return new Response(Bun.file(filePath), { headers: { "Content-Type": type } });
+}
+
+function serveAdmin2Index(): Response {
+  return new Response(Bun.file(ADMIN2_INDEX), { headers: { "Content-Type": "text/html" } });
 }
 
 const sql = postgres(process.env.DATABASE_URL ?? "postgres://wren:wren@localhost:5432/wren");
@@ -355,6 +369,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         ? ADMIN_INDEX
         : join(ADMIN_DIR, subPath);
       return serveAdminFile(filePath) ?? serveAdminIndex();
+    }
+
+    // Plain-JS admin UI — served directly from public/admin2/ (no build step)
+    if (url.pathname === "/admin2" || url.pathname.startsWith("/admin2/")) {
+      const subPath = url.pathname.slice("/admin2".length);
+      const filePath = (!subPath || subPath === "/")
+        ? ADMIN2_INDEX
+        : join(ADMIN2_DIR, subPath);
+      return serveAdmin2File(filePath) ?? serveAdmin2Index();
     }
 
     // Auth routes — handled by Better Auth
