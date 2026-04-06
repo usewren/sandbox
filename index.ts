@@ -5,6 +5,9 @@ import { join, extname } from "path";
 import { auth } from "auth";
 import { setupCommon, createTenant, listTenants, migrateAllTenants, sanitizeSchemaName } from "db/runner";
 import Ajv from "ajv";
+import { json as jqJson } from "jq-wasm";
+import jmespath from "jmespath";
+import jsonata from "jsonata";
 
 const ajv = new Ajv({ allErrors: true });
 
@@ -130,28 +133,30 @@ function generateInviteToken(): string {
   return "inv_" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-type SessionUser = { userId: string; name: string; email: string; sessionId: string | null };
+type SessionUser = { userId: string; name: string; email: string; sessionId: string | null; keyId?: string };
 
 async function checkApiKey(req: Request): Promise<SessionUser | null> {
   const header = req.headers.get("Authorization") ?? "";
   if (!header.startsWith("Bearer wren_")) return null;
   const token = header.slice(7);
   const hash = await sha256hex(token);
-  const rows = await sql<{ user_id: string }[]>`
-    SELECT user_id FROM common.api_keys
+  const rows = await sql<{ id: string; user_id: string; expires_at: Date | null }[]>`
+    SELECT id, user_id, expires_at FROM common.api_keys
     WHERE key_hash = ${hash} AND revoked_at IS NULL
   `;
   if (!rows.length) return null;
-  const userId = rows[0].user_id;
+  const key = rows[0];
+  // Check expiry
+  if (key.expires_at && new Date(key.expires_at) < new Date()) return null;
   // Update last_used_at without blocking the request
   sql`UPDATE common.api_keys SET last_used_at = NOW() WHERE key_hash = ${hash}`.catch(() => {});
   // Fetch user info from Better Auth's user table
   const users = await sql<{ id: string; name: string; email: string }[]>`
-    SELECT id, name, email FROM "user" WHERE id = ${userId}
+    SELECT id, name, email FROM "user" WHERE id = ${key.user_id}
   `;
   if (!users.length) return null;
   // API keys have no session — org switching is browser-session only
-  return { userId: users[0].id, name: users[0].name, email: users[0].email, sessionId: null };
+  return { userId: users[0].id, name: users[0].name, email: users[0].email, sessionId: null, keyId: key.id };
 }
 
 async function requireSession(req: Request): Promise<SessionUser | null> {
@@ -164,6 +169,127 @@ async function requireSession(req: Request): Promise<SessionUser | null> {
 
 function unauthorized(): Response {
   return Response.json({ error: "Unauthorized" }, { status: 401 });
+}
+
+// -------------------------------------------------------
+// Access control
+// -------------------------------------------------------
+
+type AccessResult = {
+  allowed: boolean;
+  access?: string;
+  labelFilter?: string;
+  filterLang?: string;
+  filterExpr?: string;
+  auditReads: boolean;
+  auditWrites: boolean;
+  permissionId?: string;
+};
+
+const ACCESS_LEVELS: Record<string, number> = { none: 0, read: 1, write: 2, admin: 3 };
+
+function principalFor(user: SessionUser): string {
+  return user.keyId ? `key:${user.keyId}` : `member:${user.userId}`;
+}
+
+async function checkAccess(
+  orgId: string,
+  userId: string,
+  principal: string,
+  resource: string,
+  requiredAccess: "read" | "write" | "admin",
+): Promise<AccessResult> {
+  // Org owners bypass all permission checks
+  if (userId === orgId) {
+    return { allowed: true, auditReads: false, auditWrites: false };
+  }
+
+  const [type] = resource.split(":");
+  const categoryWild = `${type}:*`;
+
+  // Query the most-specific matching permission rule
+  const rows = await sql<{
+    id: string; access: string;
+    label_filter: string | null;
+    filter_lang: string | null;
+    filter_expr: string | null;
+    audit_reads: boolean;
+    audit_writes: boolean;
+    resource: string;
+  }[]>`
+    SELECT id, access, label_filter, filter_lang, filter_expr, audit_reads, audit_writes, resource
+    FROM common.permissions
+    WHERE org_id = ${orgId}
+      AND principal = ${principal}
+      AND resource = ANY(ARRAY[${resource}, ${categoryWild}, '*'])
+    ORDER BY CASE resource
+        WHEN ${resource}      THEN 0
+        WHEN ${categoryWild}  THEN 1
+        ELSE 2
+      END
+    LIMIT 1
+  `;
+
+  if (!rows.length) {
+    // No matching rule → deny by default
+    return { allowed: false, auditReads: false, auditWrites: false };
+  }
+
+  const rule = rows[0];
+  const ruleLevel = ACCESS_LEVELS[rule.access] ?? 0;
+  const requiredLevel = ACCESS_LEVELS[requiredAccess] ?? 1;
+
+  if (ruleLevel === 0 || ruleLevel < requiredLevel) {
+    return {
+      allowed: false,
+      access: rule.access,
+      auditReads: rule.audit_reads,
+      auditWrites: rule.audit_writes,
+      permissionId: rule.id,
+    };
+  }
+
+  return {
+    allowed: true,
+    access: rule.access,
+    labelFilter: rule.label_filter ?? undefined,
+    filterLang: rule.filter_lang ?? undefined,
+    filterExpr: rule.filter_expr ?? undefined,
+    auditReads: rule.audit_reads,
+    auditWrites: rule.audit_writes,
+    permissionId: rule.id,
+  };
+}
+
+function logAccess(
+  orgId: string,
+  principal: string,
+  resource: string,
+  method: string,
+  path: string,
+  status: number,
+): void {
+  sql`
+    INSERT INTO common.access_log (org_id, principal, resource, method, path, status)
+    VALUES (${orgId}, ${principal}, ${resource}, ${method}, ${path}, ${status})
+  `.catch(() => {});
+}
+
+async function applyDataFilter(data: unknown, lang: string, expr: string): Promise<unknown> {
+  try {
+    if (lang === "jq") {
+      return await jqJson(data, expr);
+    }
+    if (lang === "jmespath") {
+      return jmespath.search(data, expr);
+    }
+    if (lang === "jsonata") {
+      return await jsonata(expr).evaluate(data);
+    }
+  } catch {
+    return null;
+  }
+  return data;
 }
 
 // -------------------------------------------------------
@@ -318,7 +444,53 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    const schemaName = await resolveUserOrg(user.userId, user.sessionId);
+    // Permission management routes — /api/permissions[/:permissionId]
+    if (collection === "api" && id === "permissions") {
+      if (req.method === "GET"    && !sub)  return handleListPermissions(user.userId, user.sessionId);
+      if (req.method === "POST"   && !sub)  return handleCreatePermission(req, user.userId, user.sessionId);
+      if (req.method === "PUT"    && sub)   return handleUpdatePermission(sub, req, user.userId, user.sessionId);
+      if (req.method === "DELETE" && sub)   return handleDeletePermission(sub, user.userId, user.sessionId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Resolve org — split into orgId + schemaName so access checks can use orgId
+    const orgId = await resolveUserOrgId(user.userId, user.sessionId);
+    const schemaName = await ensureTenant(orgId);
+    const principal = principalFor(user);
+
+    // Helper: check access and return 403 on denial (fires audit log on deny)
+    async function gate(resource: string, reqAccess: "read" | "write" | "admin"): Promise<AccessResult | Response> {
+      const ar = await checkAccess(orgId, user.userId, principal, resource, reqAccess);
+      if (!ar.allowed) {
+        const shouldLog = reqAccess === "read" ? ar.auditReads : ar.auditWrites;
+        if (shouldLog) logAccess(orgId, principal, resource, req.method, url.pathname, 403);
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
+      return ar;
+    }
+
+    // Helper: audit a successful response if the rule asks for it
+    function audit(ar: AccessResult, resource: string, isRead: boolean, status: number) {
+      const shouldLog = isRead ? ar.auditReads : ar.auditWrites;
+      if (shouldLog) logAccess(orgId, principal, resource, req.method, url.pathname, status);
+    }
+
+    // Helper: apply per-permission data filter to document data field(s) in a response
+    async function filterResponse(res: Response, ar: AccessResult): Promise<Response> {
+      if (!ar.filterExpr || !ar.filterLang) return res;
+      const body = await res.json() as Record<string, unknown>;
+      if (Array.isArray(body.items)) {
+        body.items = await Promise.all(
+          (body.items as { data: unknown }[]).map(async item => ({
+            ...item,
+            data: await applyDataFilter(item.data, ar.filterLang!, ar.filterExpr!),
+          }))
+        );
+      } else if ("data" in body) {
+        body.data = await applyDataFilter(body.data, ar.filterLang!, ar.filterExpr!);
+      }
+      return Response.json(body, { status: res.status });
+    }
 
     // Route: GET /collections — list distinct collection names
     if (req.method === "GET" && collection === "collections" && !id) {
@@ -332,86 +504,137 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const treeName = id; // second segment is the tree name
       const treePath = "/" + segments.slice(2).join("/");
       if (!treeName) return Response.json({ error: "Tree name required" }, { status: 400 });
+      const treeResource = `tree:${treeName}`;
+      const treeIsRead = req.method === "GET";
+      const treeAr = await gate(treeResource, treeIsRead ? "read" : "write");
+      if (treeAr instanceof Response) return treeAr;
+      let treeRes: Response;
       if (req.method === "GET" && url.searchParams.get("full") === "true")
-        return handleTreeFull(schemaName, treeName, url.searchParams.get("label") ?? undefined);
-      if (req.method === "GET")    return handleTreeGet(schemaName, treeName, treePath);
-      if (req.method === "PUT")    return handleTreePut(schemaName, treeName, treePath, req, user.userId);
-      if (req.method === "DELETE") return handleTreeDelete(schemaName, treeName, treePath, user.userId);
+        treeRes = await handleTreeFull(schemaName, treeName, treeAr.labelFilter ?? url.searchParams.get("label") ?? undefined);
+      else if (req.method === "GET")
+        treeRes = await handleTreeGet(schemaName, treeName, treePath);
+      else if (req.method === "PUT")
+        treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId);
+      else if (req.method === "DELETE")
+        treeRes = await handleTreeDelete(schemaName, treeName, treePath, user.userId);
+      else return Response.json({ error: "Method not allowed" }, { status: 405 });
+      audit(treeAr, treeResource, treeIsRead, treeRes.status);
+      return treeIsRead ? filterResponse(treeRes, treeAr) : treeRes;
     }
+
+    // All remaining routes are collection-scoped
+    const colResource = `collection:${collection}`;
+
+    // Determine required access level from method + sub-route
+    let reqAccess: "read" | "write" | "admin" = "read";
+    if (id === "_schema" && req.method !== "GET") reqAccess = "admin";
+    else if (req.method !== "GET") reqAccess = "write";
+
+    const colAr = await gate(colResource, reqAccess);
+    if (colAr instanceof Response) return colAr;
+
+    const colIsRead = reqAccess === "read";
 
     // Route: GET /{collection}
     if (req.method === "GET" && !id) {
-      return handleList(schemaName, collection, url, user.userId);
+      const res = await handleList(schemaName, collection, url, user.userId, colAr.labelFilter);
+      audit(colAr, colResource, true, res.status);
+      return filterResponse(res, colAr);
     }
 
     // Schema routes: GET|PUT|DELETE /{collection}/_schema
     if (id === "_schema" && !sub) {
-      if (req.method === "GET")    return handleGetSchema(schemaName, collection);
-      if (req.method === "PUT")    return handleSetSchema(schemaName, collection, req, user.userId);
-      if (req.method === "DELETE") return handleDeleteSchema(schemaName, collection);
+      if (req.method === "GET")    { const r = await handleGetSchema(schemaName, collection);    audit(colAr, colResource, true, r.status);  return r; }
+      if (req.method === "PUT")    { const r = await handleSetSchema(schemaName, collection, req, user.userId); audit(colAr, colResource, false, r.status); return r; }
+      if (req.method === "DELETE") { const r = await handleDeleteSchema(schemaName, collection); audit(colAr, colResource, false, r.status); return r; }
     }
 
     // Route: GET /{collection}/{id}/raw  (binary asset download)
     if (req.method === "GET" && id && sub === "raw") {
-      return handleGetAssetRaw(schemaName, collection, id, url);
+      const r = await handleGetAssetRaw(schemaName, collection, id, url);
+      audit(colAr, colResource, true, r.status);
+      return r;
     }
 
     // Route: GET /{collection}/{id}
     if (req.method === "GET" && id && !sub) {
-      return handleGet(schemaName, collection, id, url);
+      // If permission has a label filter, use it (overrides explicit ?label= only if not set by user)
+      const effectiveLabel = colAr.labelFilter ?? url.searchParams.get("label") ?? undefined;
+      const effectiveUrl = effectiveLabel
+        ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
+        : url;
+      const r = await handleGet(schemaName, collection, id, effectiveUrl);
+      audit(colAr, colResource, true, r.status);
+      return filterResponse(r, colAr);
     }
 
     // Route: POST /{collection}  — multipart = binary upload, JSON = document
     if (req.method === "POST" && !id) {
       const ct = req.headers.get("content-type") ?? "";
-      if (ct.startsWith("multipart/form-data")) {
-        return handleCreateAsset(schemaName, collection, req, user.userId);
-      }
-      return handleCreate(schemaName, collection, req, user.userId);
+      const r = ct.startsWith("multipart/form-data")
+        ? await handleCreateAsset(schemaName, collection, req, user.userId)
+        : await handleCreate(schemaName, collection, req, user.userId);
+      audit(colAr, colResource, false, r.status);
+      return r;
     }
 
     // Route: PUT /{collection}/{id}  — multipart = new binary version, JSON = document update
     if (req.method === "PUT" && id && !sub) {
       const ct = req.headers.get("content-type") ?? "";
-      if (ct.startsWith("multipart/form-data")) {
-        return handleUpdateAsset(schemaName, collection, id, req, user.userId);
-      }
-      return handleUpdate(schemaName, collection, id, req, user.userId);
+      const r = ct.startsWith("multipart/form-data")
+        ? await handleUpdateAsset(schemaName, collection, id, req, user.userId)
+        : await handleUpdate(schemaName, collection, id, req, user.userId);
+      audit(colAr, colResource, false, r.status);
+      return r;
     }
 
     // Route: DELETE /{collection}/{id}
     if (req.method === "DELETE" && id && !sub) {
-      return handleDelete(schemaName, collection, id);
+      const r = await handleDelete(schemaName, collection, id);
+      audit(colAr, colResource, false, r.status);
+      return r;
     }
 
     // Route: GET /{collection}/{id}/paths
     if (req.method === "GET" && id && sub === "paths" && !version) {
-      return handleDocumentPaths(schemaName, collection, id);
+      const r = await handleDocumentPaths(schemaName, collection, id);
+      audit(colAr, colResource, true, r.status);
+      return r;
     }
 
     // Route: GET /{collection}/{id}/versions
     if (req.method === "GET" && id && sub === "versions" && !version) {
-      return handleVersionList(schemaName, collection, id);
+      const r = await handleVersionList(schemaName, collection, id);
+      audit(colAr, colResource, true, r.status);
+      return r;
     }
 
     // Route: GET /{collection}/{id}/versions/{v}
     if (req.method === "GET" && id && sub === "versions" && version) {
-      return handleVersionGet(schemaName, collection, id, version);
+      const r = await handleVersionGet(schemaName, collection, id, version);
+      audit(colAr, colResource, true, r.status);
+      return filterResponse(r, colAr);
     }
 
     // Route: POST /{collection}/{id}/rollback/{v}
     if (req.method === "POST" && id && sub === "rollback" && version) {
-      return handleRollback(schemaName, collection, id, version, user.userId);
+      const r = await handleRollback(schemaName, collection, id, version, user.userId);
+      audit(colAr, colResource, false, r.status);
+      return r;
     }
 
     // Route: POST /{collection}/{id}/labels
     if (req.method === "POST" && id && sub === "labels") {
-      return handleLabel(schemaName, collection, id, req, user.userId);
+      const r = await handleLabel(schemaName, collection, id, req, user.userId);
+      audit(colAr, colResource, false, r.status);
+      return r;
     }
 
     // Route: GET /{collection}/{id}/diff
     if (req.method === "GET" && id && sub === "diff") {
-      return handleDiff(schemaName, collection, id, url);
+      const r = await handleDiff(schemaName, collection, id, url);
+      audit(colAr, colResource, true, r.status);
+      return r;
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });
@@ -421,26 +644,58 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 // Handlers
 // -------------------------------------------------------
 
-async function handleList(schemaName: string, collection: string, url: URL, _userId: string): Promise<Response> {
+async function handleList(
+  schemaName: string,
+  collection: string,
+  url: URL,
+  _userId: string,
+  labelFilter?: string,
+): Promise<Response> {
   const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50"), 200);
   const offset = parseInt(url.searchParams.get("offset") ?? "0");
+  // ?label= on the URL takes precedence over the permission label filter
+  const effectiveLabel = url.searchParams.get("label") ?? labelFilter;
 
   const [items, [{ total }]] = await withTenant(schemaName, async tx => {
-    const rows = await tx<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date; labels: string[] }[]>`
-      SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at,
-             COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
-      FROM documents d
-      JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
-      LEFT JOIN labels l ON l.document_id = d.id
-      WHERE d.collection = ${collection} AND d.deleted_at IS NULL
-      GROUP BY d.id, d.current_version, v.data, d.created_at, d.updated_at
-      ORDER BY d.created_at DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `;
-    const count = await tx<{ total: string }[]>`
-      SELECT COUNT(*)::text AS total FROM documents
-      WHERE collection = ${collection} AND deleted_at IS NULL
-    `;
+    let rows: { id: string; version: number; data: unknown; created_at: Date; updated_at: Date; labels: string[] }[];
+    if (effectiveLabel) {
+      // Only return documents that carry this label, at the labelled version
+      rows = await tx<typeof rows>`
+        SELECT d.id, lf.version, v.data, d.created_at, d.updated_at,
+               COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
+        FROM documents d
+        JOIN labels lf ON lf.document_id = d.id AND lf.label = ${effectiveLabel}
+        JOIN versions v ON v.document_id = d.id AND v.version = lf.version
+        LEFT JOIN labels l ON l.document_id = d.id
+        WHERE d.collection = ${collection} AND d.deleted_at IS NULL
+        GROUP BY d.id, lf.version, v.data, d.created_at, d.updated_at
+        ORDER BY d.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    } else {
+      rows = await tx<typeof rows>`
+        SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at,
+               COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
+        FROM documents d
+        JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+        LEFT JOIN labels l ON l.document_id = d.id
+        WHERE d.collection = ${collection} AND d.deleted_at IS NULL
+        GROUP BY d.id, d.current_version, v.data, d.created_at, d.updated_at
+        ORDER BY d.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    }
+    const count = effectiveLabel
+      ? await tx<{ total: string }[]>`
+          SELECT COUNT(*)::text AS total
+          FROM documents d
+          JOIN labels lf ON lf.document_id = d.id AND lf.label = ${effectiveLabel}
+          WHERE d.collection = ${collection} AND d.deleted_at IS NULL
+        `
+      : await tx<{ total: string }[]>`
+          SELECT COUNT(*)::text AS total FROM documents
+          WHERE collection = ${collection} AND deleted_at IS NULL
+        `;
     return [rows, count];
   });
 
@@ -1393,6 +1648,151 @@ async function handleRemoveMember(memberId: string, userId: string): Promise<Res
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ userId: memberId, removed: true });
+}
+
+// -------------------------------------------------------
+// Permission handlers (owner-only: only the org owner can manage permissions)
+// -------------------------------------------------------
+
+async function ownerOrgId(userId: string, sessionId: string | null): Promise<string> {
+  // Only the owner of the org can manage permissions, so we use the current org but
+  // require that the requesting user actually IS the org owner (userId === orgId).
+  return resolveUserOrgId(userId, sessionId);
+}
+
+function forbiddenIfNotOwner(userId: string, orgId: string): Response | null {
+  if (userId !== orgId) {
+    return Response.json({ error: "Only the org owner can manage permissions" }, { status: 403 });
+  }
+  return null;
+}
+
+async function handleListPermissions(userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await ownerOrgId(userId, sessionId);
+  const guard = forbiddenIfNotOwner(userId, orgId);
+  if (guard) return guard;
+
+  const rows = await sql<{
+    id: string; principal: string; resource: string; access: string;
+    label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
+    audit_reads: boolean; audit_writes: boolean; created_at: Date;
+  }[]>`
+    SELECT id, principal, resource, access, label_filter, filter_lang, filter_expr,
+           audit_reads, audit_writes, created_at
+    FROM common.permissions
+    WHERE org_id = ${orgId}
+    ORDER BY created_at DESC
+  `;
+
+  return Response.json({
+    permissions: rows.map(r => ({
+      id: r.id,
+      principal: r.principal,
+      resource: r.resource,
+      access: r.access,
+      labelFilter: r.label_filter,
+      filterLang: r.filter_lang,
+      filterExpr: r.filter_expr,
+      auditReads: r.audit_reads,
+      auditWrites: r.audit_writes,
+      createdAt: r.created_at,
+    })),
+  });
+}
+
+async function handleCreatePermission(req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await ownerOrgId(userId, sessionId);
+  const guard = forbiddenIfNotOwner(userId, orgId);
+  if (guard) return guard;
+
+  const body = await req.json() as {
+    principal?: string; resource?: string; access?: string;
+    labelFilter?: string; filterLang?: string; filterExpr?: string;
+    auditReads?: boolean; auditWrites?: boolean;
+  };
+
+  const { principal, resource, access = "read", labelFilter = null, filterLang = null, filterExpr = null,
+          auditReads = false, auditWrites = false } = body;
+
+  if (!principal) return Response.json({ error: "principal is required" }, { status: 400 });
+  if (!resource)  return Response.json({ error: "resource is required" }, { status: 400 });
+  if (!["none", "read", "write", "admin"].includes(access))
+    return Response.json({ error: "access must be none|read|write|admin" }, { status: 400 });
+  if (filterLang && !["jq", "jmespath", "jsonata"].includes(filterLang))
+    return Response.json({ error: "filterLang must be jq|jmespath|jsonata" }, { status: 400 });
+  if (filterExpr && !filterLang)
+    return Response.json({ error: "filterLang is required when filterExpr is set" }, { status: 400 });
+
+  const [row] = await sql<{ id: string; created_at: Date }[]>`
+    INSERT INTO common.permissions
+      (org_id, principal, resource, access, label_filter, filter_lang, filter_expr, audit_reads, audit_writes)
+    VALUES
+      (${orgId}, ${principal}, ${resource}, ${access}, ${labelFilter}, ${filterLang}, ${filterExpr},
+       ${auditReads}, ${auditWrites})
+    ON CONFLICT (principal, resource) DO UPDATE
+      SET access       = EXCLUDED.access,
+          label_filter = EXCLUDED.label_filter,
+          filter_lang  = EXCLUDED.filter_lang,
+          filter_expr  = EXCLUDED.filter_expr,
+          audit_reads  = EXCLUDED.audit_reads,
+          audit_writes = EXCLUDED.audit_writes
+    RETURNING id, created_at
+  `;
+
+  return Response.json({
+    id: row.id, principal, resource, access, labelFilter, filterLang, filterExpr,
+    auditReads, auditWrites, createdAt: row.created_at,
+  }, { status: 201 });
+}
+
+async function handleUpdatePermission(permId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await ownerOrgId(userId, sessionId);
+  const guard = forbiddenIfNotOwner(userId, orgId);
+  if (guard) return guard;
+
+  const body = await req.json() as {
+    access?: string; labelFilter?: string | null; filterLang?: string | null; filterExpr?: string | null;
+    auditReads?: boolean; auditWrites?: boolean;
+  };
+
+  if (body.access && !["none", "read", "write", "admin"].includes(body.access))
+    return Response.json({ error: "access must be none|read|write|admin" }, { status: 400 });
+  if (body.filterLang && !["jq", "jmespath", "jsonata"].includes(body.filterLang))
+    return Response.json({ error: "filterLang must be jq|jmespath|jsonata" }, { status: 400 });
+
+  const rows = await sql<{ id: string; principal: string; resource: string; access: string;
+    label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
+    audit_reads: boolean; audit_writes: boolean; created_at: Date }[]>`
+    UPDATE common.permissions SET
+      access       = COALESCE(${body.access ?? null}, access),
+      label_filter = CASE WHEN ${("labelFilter" in body)} THEN ${body.labelFilter ?? null} ELSE label_filter END,
+      filter_lang  = CASE WHEN ${("filterLang"  in body)} THEN ${body.filterLang  ?? null} ELSE filter_lang  END,
+      filter_expr  = CASE WHEN ${("filterExpr"  in body)} THEN ${body.filterExpr  ?? null} ELSE filter_expr  END,
+      audit_reads  = COALESCE(${body.auditReads  ?? null}, audit_reads),
+      audit_writes = COALESCE(${body.auditWrites ?? null}, audit_writes)
+    WHERE id = ${permId} AND org_id = ${orgId}
+    RETURNING id, principal, resource, access, label_filter, filter_lang, filter_expr,
+              audit_reads, audit_writes, created_at
+  `;
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  const r = rows[0];
+  return Response.json({
+    id: r.id, principal: r.principal, resource: r.resource, access: r.access,
+    labelFilter: r.label_filter, filterLang: r.filter_lang, filterExpr: r.filter_expr,
+    auditReads: r.audit_reads, auditWrites: r.audit_writes, createdAt: r.created_at,
+  });
+}
+
+async function handleDeletePermission(permId: string, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await ownerOrgId(userId, sessionId);
+  const guard = forbiddenIfNotOwner(userId, orgId);
+  if (guard) return guard;
+
+  const rows = await sql<{ id: string }[]>`
+    DELETE FROM common.permissions WHERE id = ${permId} AND org_id = ${orgId} RETURNING id
+  `;
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ id: permId, deleted: true });
 }
 
 // -------------------------------------------------------

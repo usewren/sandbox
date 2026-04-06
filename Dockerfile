@@ -35,7 +35,7 @@ COPY adminui/package.json adminui/bun.lock* /adminui/
 RUN cd /adminui && bun install --frozen-lockfile
 
 COPY sandbox/package.json sandbox/bun.lock* ./
-RUN bun install --frozen-lockfile
+RUN bun install
 
 # -------------------------------------------------------
 # Build admin UI into static files served under /admin
