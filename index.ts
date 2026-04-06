@@ -405,7 +405,7 @@ const server = Bun.serve({
 async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Raw segments — used only for routes that do NOT move under /api/v1/
     const rawSegments = url.pathname.replace(/^\//, "").split("/");
-    const [rawCollection, rawId, rawSub] = rawSegments;
+    const [rawCollection, rawId, rawSub, rawId2, rawSub2] = rawSegments;
 
     // Health check
     if (url.pathname === "/health") {
@@ -538,6 +538,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Public org llms.txt — /orgs/{slug}/llms.txt
     if (req.method === "GET" && rawCollection === "orgs" && rawSub === "llms.txt") {
       return handleOrgLlmsTxt(rawId, url, null);
+    }
+
+    // Public collection routes — /orgs/{slug}/{collection}[/{id}[/raw]]
+    // Only permitted where a principal='*' read rule exists on the collection.
+    if (rawCollection === "orgs" && rawId && rawSub && rawSub !== "llms.txt") {
+      const pubSlug = rawId;
+      const pubCollection = rawSub;
+      const pubId = rawId2;   // may be undefined
+      const pubSub = rawSub2; // may be undefined
+
+      if (req.method === "GET") {
+        return handlePublicCollectionRequest(pubSlug, pubCollection, pubId, pubSub, url);
+      }
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Well-known llms.txt — /.well-known/llms.txt
@@ -1002,6 +1016,65 @@ async function handleGetAssetRaw(schemaName: string, collection: string, docId: 
       "Cache-Control": "public, max-age=31536000, immutable",
     },
   });
+}
+
+// ── Public collection access (no auth required — gated by principal='*' rules) ──
+
+async function handlePublicCollectionRequest(
+  slug: string,
+  collection: string,
+  id: string | undefined,
+  sub: string | undefined,
+  url: URL,
+): Promise<Response> {
+  // Resolve org from slug
+  const slugRows = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.org_slugs WHERE slug = ${slug}
+  `;
+  if (!slugRows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  const orgId = slugRows[0].org_id;
+
+  // Check that a principal='*' read rule exists for this collection (or collection:*)
+  const resource = `collection:${collection}`;
+  const ar = await checkAccess(orgId, "", "*", resource, "read");
+  if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
+
+  const schemaName = `tenant_${orgId}`;
+
+  // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset
+  if (id && sub === "raw") {
+    return handleGetAssetRaw(schemaName, collection, id, url);
+  }
+
+  // GET /orgs/{slug}/{collection}/{id} — get JSON document
+  if (id && !sub) {
+    const effectiveLabel = ar.labelFilter ?? url.searchParams.get("label") ?? undefined;
+    const effectiveUrl = effectiveLabel
+      ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
+      : url;
+    const r = await handleGet(schemaName, collection, id, effectiveUrl);
+    return filterPublicResponse(r, ar);
+  }
+
+  // GET /orgs/{slug}/{collection} — list documents
+  const r = await handleList(schemaName, collection, url, "", ar.labelFilter);
+  return filterPublicResponse(r, ar);
+}
+
+async function filterPublicResponse(res: Response, ar: AccessResult): Promise<Response> {
+  if (!ar.filterExpr || !ar.filterLang) return res;
+  const body = await res.json() as Record<string, unknown>;
+  if (Array.isArray(body.items)) {
+    body.items = await Promise.all(
+      (body.items as { data: unknown }[]).map(async item => ({
+        ...item,
+        data: await applyDataFilter(item.data, ar.filterLang!, ar.filterExpr!),
+      }))
+    );
+  } else if ("data" in body) {
+    body.data = await applyDataFilter(body.data, ar.filterLang!, ar.filterExpr!);
+  }
+  return Response.json(body, { status: res.status });
 }
 
 async function handleCreate(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
