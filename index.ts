@@ -61,6 +61,37 @@ const openapiYaml = await Bun.file(openapiPath).text();
 const openapiJson = parseYaml(openapiYaml);
 
 // -------------------------------------------------------
+// Request stats — in-memory counters flushed hourly
+// -------------------------------------------------------
+
+type StatCounters = { reads: number; writes: number };
+const requestStats = new Map<string, StatCounters>();
+
+function trackRequest(orgId: string, isRead: boolean): void {
+  let c = requestStats.get(orgId);
+  if (!c) { c = { reads: 0, writes: 0 }; requestStats.set(orgId, c); }
+  if (isRead) c.reads++; else c.writes++;
+}
+
+async function flushRequestStats(): Promise<void> {
+  if (requestStats.size === 0) return;
+  const entries = Array.from(requestStats.entries());
+  requestStats.clear();
+  const today = new Date().toISOString().split("T")[0];
+  await Promise.all(entries.map(([orgId, c]) =>
+    sql`
+      INSERT INTO common.request_stats (org_id, date, reads, writes)
+      VALUES (${orgId}, ${today}, ${c.reads}, ${c.writes})
+      ON CONFLICT (org_id, date) DO UPDATE
+        SET reads  = common.request_stats.reads  + EXCLUDED.reads,
+            writes = common.request_stats.writes + EXCLUDED.writes
+    `.catch(() => {})
+  ));
+}
+
+setInterval(flushRequestStats, 3_600_000); // flush every hour
+
+// -------------------------------------------------------
 // Tenant helpers
 // -------------------------------------------------------
 
@@ -580,6 +611,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (req.method === "PUT") return handleSetOrgSlug(req, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
+    if (collection === "org" && id === "usage" && !sub) {
+      if (req.method === "GET") return handleGetOrgUsage(user.userId, user.sessionId, user.keyOrgId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
 
     // Invite management routes — /api/v1/invites[/:inviteId | /accept | /received]
     if (collection === "invites") {
@@ -663,6 +698,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const treeIsRead = req.method === "GET";
       const treeAr = await gate(treeResource, treeIsRead ? "read" : "write");
       if (treeAr instanceof Response) return treeAr;
+      trackRequest(orgId, treeIsRead);
       let treeRes: Response;
       if (req.method === "GET" && url.searchParams.get("full") === "true")
         treeRes = await handleTreeFull(schemaName, treeName, treeAr.labelFilter ?? url.searchParams.get("label") ?? undefined);
@@ -689,6 +725,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (colAr instanceof Response) return colAr;
 
     const colIsRead = reqAccess === "read";
+    trackRequest(orgId, colIsRead);
 
     // Route: GET /{collection}
     if (req.method === "GET" && !id) {
@@ -1698,6 +1735,70 @@ async function handleSwitchOrg(req: Request, userId: string, sessionId: string |
   `;
 
   return Response.json({ current: orgId });
+}
+
+// -------------------------------------------------------
+// Org usage handler
+// -------------------------------------------------------
+
+// Cache disk usage per org: orgId → { bytes, fetchedAt }
+const diskUsageCache = new Map<string, { bytes: number; fetchedAt: number }>();
+const DISK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function handleGetOrgUsage(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const schemaName = sanitizeSchemaName(orgId);
+
+  // Disk usage — cached 5 minutes
+  let diskBytes: number;
+  const cached = diskUsageCache.get(orgId);
+  if (cached && Date.now() - cached.fetchedAt < DISK_CACHE_TTL_MS) {
+    diskBytes = cached.bytes;
+  } else {
+    // Sum pg_relation_size() across all tables in the tenant schema
+    const rows = await sql<{ total_bytes: string }[]>`
+      SELECT COALESCE(SUM(pg_relation_size(quote_ident(schemaname) || '.' || quote_ident(tablename))), 0)::text AS total_bytes
+      FROM pg_tables
+      WHERE schemaname = ${schemaName}
+    `.catch(() => [{ total_bytes: "0" }]);
+    diskBytes = parseInt(rows[0]?.total_bytes ?? "0", 10);
+    diskUsageCache.set(orgId, { bytes: diskBytes, fetchedAt: Date.now() });
+  }
+
+  // Include in-memory (unflushed) counts in the today totals
+  const inMemory = requestStats.get(orgId) ?? { reads: 0, writes: 0 };
+  const today = new Date().toISOString().split("T")[0];
+
+  // Last 30 days from DB (already-flushed counts)
+  const statsRows = await sql<{ date: string; reads: string; writes: string }[]>`
+    SELECT date::text, reads::text, writes::text
+    FROM common.request_stats
+    WHERE org_id = ${orgId}
+      AND date >= CURRENT_DATE - INTERVAL '29 days'
+    ORDER BY date DESC
+  `.catch(() => [] as { date: string; reads: string; writes: string }[]);
+
+  // Merge today's in-memory counts into the stats rows
+  const dailyStats = statsRows.map(r => ({
+    date: r.date,
+    reads: parseInt(r.reads, 10) + (r.date === today ? inMemory.reads : 0),
+    writes: parseInt(r.writes, 10) + (r.date === today ? inMemory.writes : 0),
+  }));
+  // If today has no DB row yet, prepend it (if there's in-memory activity)
+  if (!statsRows.find(r => r.date === today) && (inMemory.reads > 0 || inMemory.writes > 0)) {
+    dailyStats.unshift({ date: today, reads: inMemory.reads, writes: inMemory.writes });
+  }
+
+  const totalReads  = dailyStats.reduce((s, r) => s + r.reads,  0);
+  const totalWrites = dailyStats.reduce((s, r) => s + r.writes, 0);
+
+  return Response.json({
+    disk: { bytes: diskBytes },
+    requests: {
+      last30Days: { reads: totalReads, writes: totalWrites },
+      daily: dailyStats,
+    },
+  });
 }
 
 // -------------------------------------------------------
