@@ -403,8 +403,6 @@ const server = Bun.serve({
 });
 
 async function handleRequest(req: Request, url: URL): Promise<Response> {
-    const segments = url.pathname.replace(/^\//, "").split("/");
-    const [collection, id, sub, version] = segments;
 
     // Health check
     if (url.pathname === "/health") {
@@ -534,73 +532,79 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       );
     }
 
-    // Public org llms.txt — /orgs/{slug}/llms.txt
-    if (req.method === "GET" && collection === "orgs" && sub === "llms.txt") {
-      return handleOrgLlmsTxt(id, url, null);
-    }
-
     // Well-known llms.txt — /.well-known/llms.txt
     if (req.method === "GET" && url.pathname === "/.well-known/llms.txt") {
       return handleWellKnownLlmsTxt(url);
     }
 
-    if (!collection) {
+    // All data/management API routes live under /api/v1/
+    if (!url.pathname.startsWith("/api/v1/")) {
       return Response.json({ error: "Not found" }, { status: 404 });
     }
 
-    // All data routes require authentication
+    // Strip /api/v1 prefix and re-parse segments for API routing
+    const apiPath = url.pathname.slice(7); // removes "/api/v1"
+    const segments = apiPath.replace(/^\//, "").split("/");
+    const [collection, id, sub, version, subsub] = segments;
+
+    // /api/v1/orgs/{slug}/... — context-aware: auth optional
+    // llms.txt: serves public context if no session, full context if authenticated
+    // collection routes: public access gated by principal='*' permission rules
+    if (collection === "orgs" && id) {
+      if (req.method !== "GET") return Response.json({ error: "Method not allowed" }, { status: 405 });
+      const optionalUser = await requireSession(req); // null = unauthenticated
+      if (sub === "llms.txt") return handleOrgLlmsTxt(id, url, optionalUser);
+      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url);
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+
+    // All other routes require authentication
     const user = await requireSession(req);
     if (!user) return unauthorized();
 
-    // API key management routes — /api/keys[/:keyId]
-    if (collection === "api" && id === "keys") {
-      if (req.method === "GET"    && !sub)  return handleListApiKeys(user.userId, user.sessionId, user.keyOrgId);
-      if (req.method === "POST"   && !sub)  return handleCreateApiKey(req, user.userId, user.sessionId, user.keyOrgId);
-      if (req.method === "DELETE" && sub)   return handleRevokeApiKey(sub, user.userId, user.sessionId, user.keyOrgId);
+    // API key management routes — /api/v1/keys[/:keyId]
+    if (collection === "keys") {
+      if (req.method === "GET"    && !id)   return handleListApiKeys(user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && !id)   return handleCreateApiKey(req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && id)    return handleRevokeApiKey(id, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    // Org context routes — /api/org and /api/org/slug
-    if (collection === "api" && id === "org" && !sub) {
+    // Org context routes — /api/v1/org and /api/v1/org/slug
+    if (collection === "org" && !id) {
       if (req.method === "GET") return handleGetOrg(user.userId, user.sessionId);
       if (req.method === "PUT") return handleSwitchOrg(req, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    if (collection === "api" && id === "org" && sub === "slug" && !version) {
+    if (collection === "org" && id === "slug" && !sub) {
       if (req.method === "PUT") return handleSetOrgSlug(req, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    // Authenticated org llms.txt — /api/orgs/{slug}/llms.txt
-    if (collection === "api" && id === "orgs" && version === "llms.txt") {
-      if (req.method === "GET") return handleOrgLlmsTxt(sub, url, user);
+    // Invite management routes — /api/v1/invites[/:inviteId | /accept | /received]
+    if (collection === "invites") {
+      if (req.method === "GET"    && !id)               return handleListInvites(user.userId, user.sessionId);
+      if (req.method === "GET"    && id === "received")  return handleListReceivedInvites(user);
+      if (req.method === "POST"   && !id)               return handleCreateInvite(req, user.userId, user.sessionId);
+      if (req.method === "POST"   && id === "accept")   return handleAcceptInvite(req, user.userId);
+      if (req.method === "POST"   && sub === "accept")  return handleAcceptInviteById(id, user);
+      if (req.method === "DELETE" && id)                return handleRevokeInvite(id, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    // Invite management routes — /api/invites[/:inviteId | /accept | /received]
-    if (collection === "api" && id === "invites") {
-      if (req.method === "GET"    && !sub)               return handleListInvites(user.userId, user.sessionId);
-      if (req.method === "GET"    && sub === "received") return handleListReceivedInvites(user);
-      if (req.method === "POST"   && !sub)               return handleCreateInvite(req, user.userId, user.sessionId);
-      if (req.method === "POST"   && sub === "accept")   return handleAcceptInvite(req, user.userId);
-      if (req.method === "POST"   && version === "accept") return handleAcceptInviteById(sub, user);
-      if (req.method === "DELETE" && sub)                return handleRevokeInvite(sub, user.userId, user.sessionId);
+    // Member management routes — /api/v1/members[/:memberId]
+    if (collection === "members") {
+      if (req.method === "GET"    && !id) return handleListMembers(user.userId, user.sessionId);
+      if (req.method === "DELETE" && id)  return handleRemoveMember(id, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
-    // Member management routes — /api/members[/:memberId]
-    if (collection === "api" && id === "members") {
-      if (req.method === "GET"    && !sub) return handleListMembers(user.userId, user.sessionId);
-      if (req.method === "DELETE" && sub)  return handleRemoveMember(sub, user.userId, user.sessionId);
-      return Response.json({ error: "Method not allowed" }, { status: 405 });
-    }
-
-    // Permission management routes — /api/permissions[/:permissionId]
-    if (collection === "api" && id === "permissions") {
-      if (req.method === "GET"    && !sub)  return handleListPermissions(user.userId, user.sessionId);
-      if (req.method === "POST"   && !sub)  return handleCreatePermission(req, user.userId, user.sessionId);
-      if (req.method === "PUT"    && sub)   return handleUpdatePermission(sub, req, user.userId, user.sessionId);
-      if (req.method === "DELETE" && sub)   return handleDeletePermission(sub, user.userId, user.sessionId);
+    // Permission management routes — /api/v1/permissions[/:permissionId]
+    if (collection === "permissions") {
+      if (req.method === "GET"    && !id)  return handleListPermissions(user.userId, user.sessionId);
+      if (req.method === "POST"   && !id)  return handleCreatePermission(req, user.userId, user.sessionId);
+      if (req.method === "PUT"    && id)   return handleUpdatePermission(id, req, user.userId, user.sessionId);
+      if (req.method === "DELETE" && id)   return handleDeletePermission(id, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -995,6 +999,65 @@ async function handleGetAssetRaw(schemaName: string, collection: string, docId: 
       "Cache-Control": "public, max-age=31536000, immutable",
     },
   });
+}
+
+// ── Public collection access (no auth required — gated by principal='*' rules) ──
+
+async function handlePublicCollectionRequest(
+  slug: string,
+  collection: string,
+  id: string | undefined,
+  sub: string | undefined,
+  url: URL,
+): Promise<Response> {
+  // Resolve org from slug
+  const slugRows = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.org_slugs WHERE slug = ${slug}
+  `;
+  if (!slugRows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  const orgId = slugRows[0].org_id;
+
+  // Check that a principal='*' read rule exists for this collection (or collection:*)
+  const resource = `collection:${collection}`;
+  const ar = await checkAccess(orgId, "", "*", resource, "read");
+  if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
+
+  const schemaName = `tenant_${orgId}`;
+
+  // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset
+  if (id && sub === "raw") {
+    return handleGetAssetRaw(schemaName, collection, id, url);
+  }
+
+  // GET /orgs/{slug}/{collection}/{id} — get JSON document
+  if (id && !sub) {
+    const effectiveLabel = ar.labelFilter ?? url.searchParams.get("label") ?? undefined;
+    const effectiveUrl = effectiveLabel
+      ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
+      : url;
+    const r = await handleGet(schemaName, collection, id, effectiveUrl);
+    return filterPublicResponse(r, ar);
+  }
+
+  // GET /orgs/{slug}/{collection} — list documents
+  const r = await handleList(schemaName, collection, url, "", ar.labelFilter);
+  return filterPublicResponse(r, ar);
+}
+
+async function filterPublicResponse(res: Response, ar: AccessResult): Promise<Response> {
+  if (!ar.filterExpr || !ar.filterLang) return res;
+  const body = await res.json() as Record<string, unknown>;
+  if (Array.isArray(body.items)) {
+    body.items = await Promise.all(
+      (body.items as { data: unknown }[]).map(async item => ({
+        ...item,
+        data: await applyDataFilter(item.data, ar.filterLang!, ar.filterExpr!),
+      }))
+    );
+  } else if ("data" in body) {
+    body.data = await applyDataFilter(body.data, ar.filterLang!, ar.filterExpr!);
+  }
+  return Response.json(body, { status: res.status });
 }
 
 async function handleCreate(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
@@ -1731,7 +1794,7 @@ async function generateLlmsTxt(
       ``,
       `Base URL: ${base}`,
       `API docs: ${base}/docs`,
-      authenticated ? `` : `Full authenticated context: ${base}/api/orgs/${slug}/llms.txt`,
+      authenticated ? `` : `Full authenticated context: ${base}/api/v1/orgs/${slug}/llms.txt`,
     ].filter(l => l !== undefined).join("\n");
   }
 
@@ -1885,7 +1948,7 @@ async function generateLlmsTxt(
   lines.push(`Base URL: ${base}`);
   lines.push(`API docs: ${base}/docs`);
   if (!authenticated) {
-    lines.push(`Full authenticated context: ${base}/api/orgs/${slug}/llms.txt`);
+    lines.push(`Full authenticated context: ${base}/api/v1/orgs/${slug}/llms.txt`);
   } else {
     lines.push(`API key creation: POST ${base}/api/keys`);
   }
