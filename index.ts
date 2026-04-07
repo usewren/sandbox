@@ -403,9 +403,6 @@ const server = Bun.serve({
 });
 
 async function handleRequest(req: Request, url: URL): Promise<Response> {
-    // Raw segments — used only for routes that do NOT move under /api/v1/
-    const rawSegments = url.pathname.replace(/^\//, "").split("/");
-    const [rawCollection, rawId, rawSub, rawId2, rawSub2] = rawSegments;
 
     // Health check
     if (url.pathname === "/health") {
@@ -535,25 +532,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       );
     }
 
-    // Public org llms.txt — /orgs/{slug}/llms.txt
-    if (req.method === "GET" && rawCollection === "orgs" && rawSub === "llms.txt") {
-      return handleOrgLlmsTxt(rawId, url, null);
-    }
-
-    // Public collection routes — /orgs/{slug}/{collection}[/{id}[/raw]]
-    // Only permitted where a principal='*' read rule exists on the collection.
-    if (rawCollection === "orgs" && rawId && rawSub && rawSub !== "llms.txt") {
-      const pubSlug = rawId;
-      const pubCollection = rawSub;
-      const pubId = rawId2;   // may be undefined
-      const pubSub = rawSub2; // may be undefined
-
-      if (req.method === "GET") {
-        return handlePublicCollectionRequest(pubSlug, pubCollection, pubId, pubSub, url);
-      }
-      return Response.json({ error: "Method not allowed" }, { status: 405 });
-    }
-
     // Well-known llms.txt — /.well-known/llms.txt
     if (req.method === "GET" && url.pathname === "/.well-known/llms.txt") {
       return handleWellKnownLlmsTxt(url);
@@ -567,9 +545,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Strip /api/v1 prefix and re-parse segments for API routing
     const apiPath = url.pathname.slice(7); // removes "/api/v1"
     const segments = apiPath.replace(/^\//, "").split("/");
-    const [collection, id, sub, version] = segments;
+    const [collection, id, sub, version, subsub] = segments;
 
-    // All data routes require authentication
+    // /api/v1/orgs/{slug}/... — context-aware: auth optional
+    // llms.txt: serves public context if no session, full context if authenticated
+    // collection routes: public access gated by principal='*' permission rules
+    if (collection === "orgs" && id) {
+      if (req.method !== "GET") return Response.json({ error: "Method not allowed" }, { status: 405 });
+      const optionalUser = await requireSession(req); // null = unauthenticated
+      if (sub === "llms.txt") return handleOrgLlmsTxt(id, url, optionalUser);
+      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url);
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+
+    // All other routes require authentication
     const user = await requireSession(req);
     if (!user) return unauthorized();
 
@@ -589,12 +578,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
     if (collection === "org" && id === "slug" && !sub) {
       if (req.method === "PUT") return handleSetOrgSlug(req, user.userId, user.sessionId);
-      return Response.json({ error: "Method not allowed" }, { status: 405 });
-    }
-
-    // Authenticated org llms.txt — /api/v1/orgs/{slug}/llms.txt
-    if (collection === "orgs" && sub === "llms.txt") {
-      if (req.method === "GET") return handleOrgLlmsTxt(id, url, user);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -1811,7 +1794,7 @@ async function generateLlmsTxt(
       ``,
       `Base URL: ${base}`,
       `API docs: ${base}/docs`,
-      authenticated ? `` : `Full authenticated context: ${base}/api/orgs/${slug}/llms.txt`,
+      authenticated ? `` : `Full authenticated context: ${base}/api/v1/orgs/${slug}/llms.txt`,
     ].filter(l => l !== undefined).join("\n");
   }
 
@@ -1965,7 +1948,7 @@ async function generateLlmsTxt(
   lines.push(`Base URL: ${base}`);
   lines.push(`API docs: ${base}/docs`);
   if (!authenticated) {
-    lines.push(`Full authenticated context: ${base}/api/orgs/${slug}/llms.txt`);
+    lines.push(`Full authenticated context: ${base}/api/v1/orgs/${slug}/llms.txt`);
   } else {
     lines.push(`API key creation: POST ${base}/api/keys`);
   }
