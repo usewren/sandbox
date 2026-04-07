@@ -1323,8 +1323,8 @@ async function handleDocumentPaths(schemaName: string, collection: string, id: s
 
 async function handleGetSchema(schemaName: string, collection: string): Promise<Response> {
   const rows = await withTenant(schemaName, async tx =>
-    tx<{ schema: unknown; display_name: string | null; collection_type: string; updated_at: Date }[]>`
-      SELECT schema, display_name, collection_type, updated_at FROM collection_schemas WHERE collection = ${collection}
+    tx<{ schema: unknown; display_name: string | null; collection_type: string; list_columns: string[] | null; updated_at: Date }[]>`
+      SELECT schema, display_name, collection_type, list_columns, updated_at FROM collection_schemas WHERE collection = ${collection}
     `
   );
   if (rows.length === 0) return Response.json({ error: "Not found" }, { status: 404 });
@@ -1333,6 +1333,7 @@ async function handleGetSchema(schemaName: string, collection: string): Promise<
     collectionType: rows[0].collection_type,
     schema:         rows[0].collection_type === "binary" ? null : rows[0].schema,
     displayName:    rows[0].display_name ?? null,
+    listColumns:    rows[0].list_columns ?? null,
     updatedAt:      rows[0].updated_at,
   });
 }
@@ -1340,8 +1341,8 @@ async function handleGetSchema(schemaName: string, collection: string): Promise<
 async function handleSetSchema(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
   const body = await req.json() as Record<string, unknown>;
 
-  // Accept either a plain JSON Schema or a wrapper { schema?, displayName?, collectionType? }
-  const isWrapper = body && typeof body === "object" && ("schema" in body || "collectionType" in body || "displayName" in body);
+  // Accept either a plain JSON Schema or a wrapper { schema?, displayName?, collectionType?, listColumns? }
+  const isWrapper = body && typeof body === "object" && ("schema" in body || "collectionType" in body || "displayName" in body || "listColumns" in body);
   const collectionType: string =
     (isWrapper && typeof body.collectionType === "string") ? body.collectionType : "json";
   const schema = collectionType === "binary"
@@ -1349,6 +1350,10 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
     : (isWrapper ? body.schema : body) ?? {};
   const displayName: string | null =
     (isWrapper && typeof body.displayName === "string") ? body.displayName : null;
+  const listColumns: string[] | null =
+    (isWrapper && Array.isArray(body.listColumns) && body.listColumns.length > 0)
+      ? (body.listColumns as string[]).filter(c => typeof c === "string" && c.trim())
+      : null;
 
   if (collectionType !== "binary") {
     try { ajv.compile(schema as object); }
@@ -1357,16 +1362,17 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
 
   await withTenant(schemaName, async tx => {
     await tx`
-      INSERT INTO collection_schemas (collection, schema, display_name, collection_type, created_by)
-      VALUES (${collection}, ${tx.json(schema)}, ${displayName}, ${collectionType}, ${userId})
+      INSERT INTO collection_schemas (collection, schema, display_name, collection_type, list_columns, created_by)
+      VALUES (${collection}, ${tx.json(schema)}, ${displayName}, ${collectionType}, ${listColumns}, ${userId})
       ON CONFLICT (collection) DO UPDATE
         SET schema          = EXCLUDED.schema,
             display_name    = EXCLUDED.display_name,
             collection_type = EXCLUDED.collection_type,
+            list_columns    = EXCLUDED.list_columns,
             updated_at      = NOW()
     `;
   });
-  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName });
+  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns });
 }
 
 async function handleDeleteSchema(schemaName: string, collection: string): Promise<Response> {
