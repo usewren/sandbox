@@ -1054,12 +1054,35 @@ async function handlePublicCollectionRequest(
   if (!slugRows.length) return Response.json({ error: "Not found" }, { status: 404 });
   const orgId = slugRows[0].org_id;
 
-  // Check that a principal='*' read rule exists for this collection (or collection:*)
+  const schemaName = sanitizeSchemaName(orgId);
+
+  // ── Public tree access: GET /orgs/{slug}/tree/{treeName}[/{...path}] ──────
+  if (collection === "tree") {
+    const treeName = id;
+    if (!treeName) return Response.json({ error: "Tree name required" }, { status: 400 });
+
+    const treeResource = `tree:${treeName}`;
+    const ar = await checkAccess(orgId, "", "*", treeResource, "read");
+    if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
+
+    // sub and beyond form the path: /orgs/{slug}/tree/{treeName}/{...path}
+    // The URL segments after stripping /api/v1/orgs/{slug}/ are: tree / {treeName} / {sub} / {version} / {subsub}
+    // Reconstruct the full tree path from the raw URL
+    const treePrefix = `/api/v1/orgs/${slug}/tree/${treeName}`;
+    const treePath = url.pathname.startsWith(treePrefix)
+      ? url.pathname.slice(treePrefix.length) || "/"
+      : "/";
+
+    if (url.searchParams.get("full") === "true") {
+      return handleTreeFull(schemaName, treeName, ar.labelFilter ?? url.searchParams.get("label") ?? undefined);
+    }
+    return handleTreeGet(schemaName, treeName, treePath);
+  }
+
+  // ── Public collection access ───────────────────────────────────────────────
   const resource = `collection:${collection}`;
   const ar = await checkAccess(orgId, "", "*", resource, "read");
   if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
-
-  const schemaName = `tenant_${orgId}`;
 
   // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset
   if (id && sub === "raw") {
