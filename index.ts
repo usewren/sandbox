@@ -585,7 +585,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (req.method !== "GET") return Response.json({ error: "Method not allowed" }, { status: 405 });
       const optionalUser = await requireSession(req); // null = unauthenticated
       if (sub === "llms.txt") return handleOrgLlmsTxt(id, url, optionalUser);
-      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url);
+      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url, req.headers.get("accept"));
       return Response.json({ error: "Not found" }, { status: 404 });
     }
 
@@ -703,7 +703,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (req.method === "GET" && url.searchParams.get("full") === "true")
         treeRes = await handleTreeFull(schemaName, treeName, treeAr.labelFilter ?? url.searchParams.get("label") ?? undefined);
       else if (req.method === "GET")
-        treeRes = await handleTreeGet(schemaName, treeName, treePath);
+        treeRes = await handleTreeGet(schemaName, treeName, treePath, req.headers.get("accept"));
       else if (req.method === "PUT")
         treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId);
       else if (req.method === "DELETE")
@@ -1046,6 +1046,7 @@ async function handlePublicCollectionRequest(
   id: string | undefined,
   sub: string | undefined,
   url: URL,
+  accept?: string | null,
 ): Promise<Response> {
   // Resolve org from slug
   const slugRows = await sql<{ org_id: string }[]>`
@@ -1076,7 +1077,7 @@ async function handlePublicCollectionRequest(
     if (url.searchParams.get("full") === "true") {
       return handleTreeFull(schemaName, treeName, ar.labelFilter ?? url.searchParams.get("label") ?? undefined);
     }
-    return handleTreeGet(schemaName, treeName, treePath);
+    return handleTreeGet(schemaName, treeName, treePath, accept);
   }
 
   // ── Public collection access ───────────────────────────────────────────────
@@ -1495,7 +1496,19 @@ async function handleTreeFull(schemaName: string, treeName: string, label?: stri
   });
 }
 
-async function handleTreeGet(schemaName: string, treeName: string, treePath: string): Promise<Response> {
+// Return true when the Accept header prefers a non-JSON content type over JSON.
+// Browsers send e.g. "text/html,*/*;q=0.8" — no explicit application/json → serve binary.
+// API clients that want JSON send "application/json" explicitly → serve JSON.
+// No Accept header or "*/*" only (bare curl) → serve JSON for backwards compat.
+function shouldServeBinary(accept: string | null): boolean {
+  if (!accept) return false;
+  const types = accept.split(",").map(p => p.trim().split(";")[0].trim());
+  const hasJson = types.some(t => t === "application/json");
+  const hasSpecific = types.some(t => t !== "*/*" && t !== "application/*");
+  return hasSpecific && !hasJson;
+}
+
+async function handleTreeGet(schemaName: string, treeName: string, treePath: string, accept?: string | null): Promise<Response> {
   const result = await withTenant(schemaName, async tx => {
     // Exact match at this path in this tree
     const [exact] = await tx<{ document_id: string; assignment_doc_id: string | null }[]>`
@@ -1527,6 +1540,18 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
   if (!result.document && result.children.length === 0) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
+
+  // Content negotiation: if the document is a binary asset and the client prefers
+  // a non-JSON content type (e.g. a browser requesting text/html or image/*), stream
+  // the raw bytes directly instead of the JSON envelope.
+  const doc = result.document;
+  if (doc && shouldServeBinary(accept ?? null)) {
+    const data = doc.data as Record<string, unknown>;
+    if (data?._binary === true) {
+      return handleGetAssetRaw(schemaName, doc.collection, doc.id, new URL("http://x/?version=" + doc.version));
+    }
+  }
+
   return Response.json(result);
 }
 
