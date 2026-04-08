@@ -568,6 +568,26 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return handleWellKnownLlmsTxt(url);
     }
 
+    // Clean public URLs: /orgs/{slug}/... — alias for /api/v1/orgs/{slug}/...
+    // Allows tree paths like /orgs/tkd/tree/site/index.html to open directly in a browser.
+    if (req.method === "GET" && url.pathname.startsWith("/orgs/")) {
+      const parts = url.pathname.slice("/orgs/".length).split("/");
+      const [slug, ...rest] = parts;
+      if (slug && rest.length > 0) {
+        const sub = rest[0];
+        if (sub === "llms.txt") {
+          const optionalUser = await requireSession(req);
+          return handleOrgLlmsTxt(slug, url, optionalUser);
+        }
+        // Pass everything after /orgs/{slug}/ to the public collection/tree handler
+        const collection = rest[0];
+        const id = rest[1];
+        const subSeg = rest[2];
+        return handlePublicCollectionRequest(slug, collection, id, subSeg, url, req.headers.get("accept"));
+      }
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+
     // All data/management API routes live under /api/v1/
     if (!url.pathname.startsWith("/api/v1/")) {
       return Response.json({ error: "Not found" }, { status: 404 });
@@ -1066,13 +1086,13 @@ async function handlePublicCollectionRequest(
     const ar = await checkAccess(orgId, "", "*", treeResource, "read");
     if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
 
-    // sub and beyond form the path: /orgs/{slug}/tree/{treeName}/{...path}
-    // The URL segments after stripping /api/v1/orgs/{slug}/ are: tree / {treeName} / {sub} / {version} / {subsub}
-    // Reconstruct the full tree path from the raw URL
-    const treePrefix = `/api/v1/orgs/${slug}/tree/${treeName}`;
-    const treePath = url.pathname.startsWith(treePrefix)
-      ? url.pathname.slice(treePrefix.length) || "/"
-      : "/";
+    // Reconstruct the full tree path from the raw URL — support both the canonical
+    // /api/v1/orgs/{slug}/tree/{treeName}/... and the short /orgs/{slug}/tree/{treeName}/... alias.
+    const apiPrefix   = `/api/v1/orgs/${slug}/tree/${treeName}`;
+    const shortPrefix = `/orgs/${slug}/tree/${treeName}`;
+    const treePath = url.pathname.startsWith(apiPrefix)   ? url.pathname.slice(apiPrefix.length)   || "/" :
+                     url.pathname.startsWith(shortPrefix) ? url.pathname.slice(shortPrefix.length) || "/" :
+                     "/";
 
     if (url.searchParams.get("full") === "true") {
       return handleTreeFull(schemaName, treeName, ar.labelFilter ?? url.searchParams.get("label") ?? undefined);
