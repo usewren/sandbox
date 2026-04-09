@@ -448,7 +448,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok" });
+      return Response.json({ status: "ok", version: "0.2.0", build: "20260409b" });
     }
 
 
