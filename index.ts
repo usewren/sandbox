@@ -451,6 +451,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ status: "ok" });
     }
 
+
     // Wren logo — served from public directory (no auth required)
     if (url.pathname === "/wren-logo.svg") {
       return new Response(Bun.file(join(import.meta.dir, "public", "wren-logo.svg")), {
@@ -529,7 +530,22 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     // Auth routes — handled by Better Auth
+    // Cloudflare Tunnel (and other reverse proxies) terminate TLS and forward
+    // plain HTTP. Better Auth auto-detects its origin from the request URL, so
+    // it sees http:// while the browser sends Origin: https://. Rewrite the
+    // request URL to match the real protocol so origin validation succeeds.
     if (url.pathname.startsWith("/api/auth")) {
+      const proto = req.headers.get("x-forwarded-proto");
+      if (proto === "https" && !req.url.startsWith("https://")) {
+        const secureUrl = req.url.replace(/^http:/, "https:");
+        return auth.handler(new Request(secureUrl, {
+          method: req.method,
+          headers: req.headers,
+          body: req.body,
+          // @ts-ignore — Bun supports duplex
+          duplex: "half",
+        }));
+      }
       return auth.handler(req);
     }
 
