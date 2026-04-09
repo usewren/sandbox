@@ -1664,14 +1664,13 @@ async function handleTreePut(schemaName: string, treeName: string, treePath: str
               assignment_doc_id = EXCLUDED.assignment_doc_id
       `;
     } else {
-      // Create an empty folder (path with no document)
-      if (!existing) {
-        await tx`
-          INSERT INTO paths (document_id, tree, path)
-          VALUES (${null}, ${treeName}, ${treePath})
-          ON CONFLICT (tree, path) DO NOTHING
-        `;
-      }
+      // Create an empty folder or unassign a document (clear document_id)
+      await tx`
+        INSERT INTO paths (document_id, tree, path)
+        VALUES (${null}, ${treeName}, ${treePath})
+        ON CONFLICT (tree, path) DO UPDATE
+          SET document_id = NULL
+      `;
     }
   });
 
