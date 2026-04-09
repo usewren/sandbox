@@ -224,8 +224,15 @@ const ALLOWED_ORIGINS = new Set([
     : []),
 ]);
 
-function corsHeaders(origin: string | null): Record<string, string> {
-  const allowed = origin && ALLOWED_ORIGINS.has(origin) ? origin : "";
+function corsHeaders(origin: string | null, host: string | null): Record<string, string> {
+  let allowed = "";
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    allowed = origin;
+  } else if (origin && host) {
+    // Same-site: if the Origin's host matches the request Host header, always allow.
+    // This covers Cloudflare Tunnel and any reverse proxy without needing env vars.
+    try { if (new URL(origin).host === host) allowed = origin; } catch {}
+  }
   return {
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Credentials": "true",
@@ -424,7 +431,7 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     const origin = req.headers.get("origin");
-    const cors = corsHeaders(origin);
+    const cors = corsHeaders(origin, req.headers.get("host"));
 
     // CORS preflight
     if (req.method === "OPTIONS") {
