@@ -29,14 +29,16 @@ const MIME: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
+const NO_CACHE = { "Cache-Control": "no-cache, no-store, must-revalidate" };
+
 function serveAdminFile(filePath: string): Response | null {
   if (!existsSync(filePath)) return null;
   const type = MIME[extname(filePath)] ?? "application/octet-stream";
-  return new Response(Bun.file(filePath), { headers: { "Content-Type": type } });
+  return new Response(Bun.file(filePath), { headers: { "Content-Type": type, ...NO_CACHE } });
 }
 
 function serveAdminIndex(): Response {
-  return new Response(Bun.file(ADMIN_INDEX), { headers: { "Content-Type": "text/html" } });
+  return new Response(Bun.file(ADMIN_INDEX), { headers: { "Content-Type": "text/html", ...NO_CACHE } });
 }
 
 function serveOldAdminFile(filePath: string): Response | null {
@@ -448,7 +450,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.2.0", build: "20260409b" });
+      return Response.json({ status: "ok", version: "0.2.1", build: "20260409c" });
     }
 
 
