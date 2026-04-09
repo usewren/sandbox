@@ -1573,7 +1573,7 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
     `;
 
     let doc = null;
-    if (exact) {
+    if (exact?.document_id) {
       const [row] = await tx<{ id: string; collection: string; version: number; data: unknown }[]>`
         SELECT d.id, d.collection, d.current_version AS version, v.data
         FROM documents d
@@ -1583,10 +1583,12 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
       doc = row ?? null;
     }
 
-    return { tree: treeName, path: treePath, document: doc, assignmentDocId: exact?.assignment_doc_id ?? null, children: children.map(c => ({ path: c.path, documentId: c.document_id })) };
+    const pathExists = !!exact;
+    return { tree: treeName, path: treePath, document: doc, assignmentDocId: exact?.assignment_doc_id ?? null, pathExists, children: children.map(c => ({ path: c.path, documentId: c.document_id })) };
   });
 
-  if (!result.document && result.children.length === 0) {
+  // 404 only if the path doesn't exist AND has no descendants
+  if (!result.pathExists && result.children.length === 0) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 
@@ -1605,60 +1607,72 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
 }
 
 async function handleTreePut(schemaName: string, treeName: string, treePath: string, req: Request, userId: string): Promise<Response> {
-  const { documentId } = await req.json() as { documentId: string };
-  if (!documentId) return Response.json({ error: "documentId is required" }, { status: 400 });
+  const body = await req.json() as { documentId?: string };
+  const documentId = body.documentId || null;
 
   await withTenant(schemaName, async tx => {
-    const [doc] = await tx<{ id: string }[]>`
-      SELECT id FROM documents WHERE id = ${documentId} AND deleted_at IS NULL
-    `;
-    if (!doc) throw new Error("Document not found");
+    // If a documentId is provided, verify it exists
+    if (documentId) {
+      const [doc] = await tx<{ id: string }[]>`
+        SELECT id FROM documents WHERE id = ${documentId} AND deleted_at IS NULL
+      `;
+      if (!doc) throw new Error("Document not found");
+    }
 
     // Get existing path row (if any) to find the assignment doc
     const [existing] = await tx<{ assignment_doc_id: string | null }[]>`
       SELECT assignment_doc_id FROM paths WHERE tree = ${treeName} AND path = ${treePath}
     `;
 
-    const assignmentData = { tree: treeName, path: treePath, documentId };
-    let assignmentDocId: string;
+    if (documentId) {
+      // Assign a document — create assignment tracking doc
+      const assignmentData = { tree: treeName, path: treePath, documentId };
+      let assignmentDocId: string;
 
-    if (existing?.assignment_doc_id) {
-      // Update the existing assignment document — creates a new version
-      assignmentDocId = existing.assignment_doc_id;
-      const [assignDoc] = await tx<{ current_version: number }[]>`
-        SELECT current_version FROM documents WHERE id = ${assignmentDocId}
-      `;
-      const newVersion = assignDoc.current_version + 1;
+      if (existing?.assignment_doc_id) {
+        assignmentDocId = existing.assignment_doc_id;
+        const [assignDoc] = await tx<{ current_version: number }[]>`
+          SELECT current_version FROM documents WHERE id = ${assignmentDocId}
+        `;
+        const newVersion = assignDoc.current_version + 1;
+        await tx`
+          INSERT INTO versions (document_id, version, data, created_by)
+          VALUES (${assignmentDocId}, ${newVersion}, ${tx.json(assignmentData)}, ${userId})
+        `;
+        await tx`
+          UPDATE documents SET current_version = ${newVersion}, updated_at = NOW()
+          WHERE id = ${assignmentDocId}
+        `;
+      } else {
+        const [newDoc] = await tx<{ id: string }[]>`
+          INSERT INTO documents (collection, current_version, created_by)
+          VALUES ('_paths', 1, ${userId})
+          RETURNING id
+        `;
+        assignmentDocId = newDoc.id;
+        await tx`
+          INSERT INTO versions (document_id, version, data, created_by)
+          VALUES (${assignmentDocId}, 1, ${tx.json(assignmentData)}, ${userId})
+        `;
+      }
+
       await tx`
-        INSERT INTO versions (document_id, version, data, created_by)
-        VALUES (${assignmentDocId}, ${newVersion}, ${tx.json(assignmentData)}, ${userId})
-      `;
-      await tx`
-        UPDATE documents SET current_version = ${newVersion}, updated_at = NOW()
-        WHERE id = ${assignmentDocId}
+        INSERT INTO paths (document_id, tree, path, assignment_doc_id)
+        VALUES (${documentId}, ${treeName}, ${treePath}, ${assignmentDocId})
+        ON CONFLICT (tree, path) DO UPDATE
+          SET document_id = EXCLUDED.document_id,
+              assignment_doc_id = EXCLUDED.assignment_doc_id
       `;
     } else {
-      // Create a new assignment document in the _paths collection
-      const [newDoc] = await tx<{ id: string }[]>`
-        INSERT INTO documents (collection, current_version, created_by)
-        VALUES ('_paths', 1, ${userId})
-        RETURNING id
-      `;
-      assignmentDocId = newDoc.id;
-      await tx`
-        INSERT INTO versions (document_id, version, data, created_by)
-        VALUES (${assignmentDocId}, 1, ${tx.json(assignmentData)}, ${userId})
-      `;
+      // Create an empty folder (path with no document)
+      if (!existing) {
+        await tx`
+          INSERT INTO paths (document_id, tree, path)
+          VALUES (${null}, ${treeName}, ${treePath})
+          ON CONFLICT (tree, path) DO NOTHING
+        `;
+      }
     }
-
-    // Upsert the path row with the assignment doc reference
-    await tx`
-      INSERT INTO paths (document_id, tree, path, assignment_doc_id)
-      VALUES (${documentId}, ${treeName}, ${treePath}, ${assignmentDocId})
-      ON CONFLICT (tree, path) DO UPDATE
-        SET document_id = EXCLUDED.document_id,
-            assignment_doc_id = EXCLUDED.assignment_doc_id
-    `;
   });
 
   return Response.json({ tree: treeName, path: treePath, documentId });
