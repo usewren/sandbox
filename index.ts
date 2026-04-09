@@ -218,6 +218,10 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:4000",
   "http://localhost:4001",
   "http://localhost:4002",
+  ...(process.env.BETTER_AUTH_URL ? [process.env.BETTER_AUTH_URL.replace(/\/$/, "")] : []),
+  ...(process.env.BETTER_AUTH_TRUSTED_ORIGINS
+    ? process.env.BETTER_AUTH_TRUSTED_ORIGINS.split(",").map(s => s.trim().replace(/\/$/, ""))
+    : []),
 ]);
 
 function corsHeaders(origin: string | null): Record<string, string> {
