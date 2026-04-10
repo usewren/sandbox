@@ -450,7 +450,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.2.6", build: "20260409g" });
+      return Response.json({ status: "ok", version: "0.2.7", build: "20260410a" });
     }
 
 
