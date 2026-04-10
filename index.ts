@@ -474,7 +474,19 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
     if (url.pathname === "/tutorial" || url.pathname === "/tutorial.html") {
       return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "tutorial.html")), {
-        headers: { "Content-Type": "text/html" },
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
+    // A/B variant B — tree-focused landing
+    if (url.pathname === "/b" || url.pathname === "/b.html") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "trees.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
+    // Tree-focused tutorial
+    if (url.pathname === "/tutorial/trees" || url.pathname === "/tutorial/trees.html") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "tutorial-trees.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
       });
     }
     // LLM / crawler discovery files
@@ -489,7 +501,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const base = `${url.protocol}//${url.host}`;
       const now = new Date().toISOString().split("T")[0];
       return new Response(
-        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
+        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
         { headers: { "Content-Type": "application/xml; charset=utf-8" } },
       );
     }
