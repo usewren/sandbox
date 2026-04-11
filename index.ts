@@ -621,7 +621,29 @@ const server = Bun.serve({
       return new Response(null, { status: 204, headers: cors });
     }
 
-    const res = await handleRequest(req, url);
+    // HEAD is routed exactly like GET — every handler that answers GET
+    // should also answer HEAD with the same headers (and status) but an
+    // empty body. We rewrite to GET on the way in, then strip the body
+    // (and any auto-set Content-Length conflict) on the way out.
+    const isHead = req.method === "HEAD";
+    const effectiveReq = isHead
+      ? new Request(req.url, { method: "GET", headers: req.headers })
+      : req;
+
+    let res = await handleRequest(effectiveReq, url);
+    if (isHead) {
+      // Per RFC 7231: HEAD returns the same headers as GET but no body.
+      // Preserve the Content-Length the GET response would have reported
+      // by reading the body first and using its byte length as the
+      // Content-Length header, then constructing an empty-body response.
+      const body = await res.arrayBuffer().catch(() => new ArrayBuffer(0));
+      const headers = new Headers(res.headers);
+      if (!headers.has("content-length")) {
+        headers.set("content-length", String(body.byteLength));
+      }
+      res = new Response(null, { status: res.status, headers });
+    }
+
     Object.entries(cors).forEach(([k, v]) => res.headers.set(k, v));
     return res;
   },
