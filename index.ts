@@ -31,6 +31,71 @@ const MIME: Record<string, string> = {
 
 const NO_CACHE = { "Cache-Control": "no-cache, no-store, must-revalidate" };
 
+// Public read policy: short freshness window, long stale-while-revalidate.
+// Combined with explicit purges on mutation, this gives near-instant updates
+// for editors while still absorbing most read traffic at the CDN.
+const PUBLIC_CACHE = "public, max-age=60, stale-while-revalidate=86400";
+
+// Applied to endpoints that do content negotiation (currently: public tree
+// reads, which return either JSON metadata or raw bytes based on Accept).
+// Without this header, CDNs cache the first response for every Accept header.
+const CONTENT_NEGOTIATED_HEADERS = {
+  "Cache-Control": PUBLIC_CACHE,
+  "Vary": "Accept",
+};
+const PUBLIC_CACHE_HEADERS = {
+  "Cache-Control": PUBLIC_CACHE,
+};
+
+function withHeaders(res: Response, headers: Record<string, string>): Response {
+  for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+  return res;
+}
+
+// -------------------------------------------------------
+// Cache purge infrastructure
+// -------------------------------------------------------
+// An abstraction for telling a CDN to drop cached responses after a mutation.
+// Default is a no-op; set CACHE_PURGE_BACKEND=console to log purges to stdout
+// for local debugging. A CloudflarePurger implementation can be dropped in
+// later without touching any call sites.
+
+interface CachePurger {
+  purge(urls: string[]): Promise<void>;
+}
+
+class NoopPurger implements CachePurger {
+  async purge(_urls: string[]): Promise<void> { /* noop */ }
+}
+
+class ConsolePurger implements CachePurger {
+  async purge(urls: string[]): Promise<void> {
+    if (urls.length === 0) return;
+    console.log(`[cache] purge ${urls.length} url${urls.length === 1 ? "" : "s"}:`);
+    for (const u of urls) console.log(`  ${u}`);
+  }
+}
+
+// TODO: class CloudflarePurger implements CachePurger {
+//   constructor(private zoneId: string, private apiToken: string) {}
+//   async purge(urls: string[]) {
+//     await fetch(`https://api.cloudflare.com/client/v4/zones/${this.zoneId}/purge_cache`, {
+//       method: "POST",
+//       headers: { "Authorization": `Bearer ${this.apiToken}`, "Content-Type": "application/json" },
+//       body: JSON.stringify({ files: urls }),
+//     });
+//   }
+// }
+
+const cachePurger: CachePurger = (() => {
+  const backend = (process.env.CACHE_PURGE_BACKEND ?? "noop").toLowerCase();
+  switch (backend) {
+    case "console": return new ConsolePurger();
+    case "noop":
+    default: return new NoopPurger();
+  }
+})();
+
 function serveAdminFile(filePath: string): Response | null {
   if (!existsSync(filePath)) return null;
   const type = MIME[extname(filePath)] ?? "application/octet-stream";
@@ -131,6 +196,122 @@ async function withTenant<T>(schemaName: string, fn: (tx: Sql) => Promise<T>): P
     await tx.unsafe(`SET LOCAL search_path TO ${schemaName}, common, public`);
     return fn(tx as unknown as Sql);
   });
+}
+
+// -------------------------------------------------------
+// Cache purge helpers
+// -------------------------------------------------------
+// After a mutation, figure out which public URLs might now be stale and
+// hand the list to the CachePurger. All functions fire-and-forget: a purge
+// failure must never block or fail the mutation response.
+//
+// Every helper is wrapped in a top-level try/catch and the caller uses
+// `.catch(() => {})` so a misbehaving purger can't leak errors.
+
+function publicUrlsForDocument(slug: string | null, collection: string, docId: string): string[] {
+  if (!slug) return [];
+  return [
+    // Public collection reads — authenticated or via org slug
+    `/api/v1/orgs/${slug}/${collection}/${docId}`,
+    `/api/v1/orgs/${slug}/${collection}/${docId}/raw`,
+    `/orgs/${slug}/${collection}/${docId}`,
+    `/orgs/${slug}/${collection}/${docId}/raw`,
+    // Collection listings (the doc may appear in them)
+    `/api/v1/orgs/${slug}/${collection}`,
+    `/orgs/${slug}/${collection}`,
+  ];
+}
+
+function publicUrlsForTreePath(slug: string | null, treeName: string, treePath: string): string[] {
+  if (!slug) return [];
+  const clean = treePath.replace(/^\/+/, "");
+  const withSlash = clean ? `/${clean}` : "";
+  return [
+    // The path itself — authenticated + public + short alias
+    `/api/v1/orgs/${slug}/tree/${treeName}${withSlash}`,
+    `/orgs/${slug}/tree/${treeName}${withSlash}`,
+    // The whole-tree bundle is invalidated by any path mutation inside it
+    `/api/v1/orgs/${slug}/tree/${treeName}?full=true`,
+    `/orgs/${slug}/tree/${treeName}?full=true`,
+    // Also the tree root listing (children array changes)
+    `/api/v1/orgs/${slug}/tree/${treeName}`,
+    `/orgs/${slug}/tree/${treeName}`,
+  ];
+}
+
+// Queries the paths table for every tree assignment pointing at this document
+// and builds purge URLs for all of them. Called after any document mutation
+// that changes content (update, delete, new version, label change).
+// Resolves an org's public slug. Orgs without a slug cannot have public URLs,
+// so there's nothing to purge — we return null and callers short-circuit.
+async function orgSlug(orgId: string): Promise<string | null> {
+  const rows = await sql<{ slug: string }[]>`
+    SELECT slug FROM common.org_slugs WHERE org_id = ${orgId}
+  `;
+  return rows[0]?.slug ?? null;
+}
+
+// Called after a fresh document is created. The doc itself has no cached URL yet,
+// but any listing that includes the collection is now stale.
+async function purgeForCollection(orgId: string, collection: string): Promise<void> {
+  try {
+    const slug = await orgSlug(orgId);
+    if (!slug) return;
+    await cachePurger.purge([
+      `/api/v1/orgs/${slug}/${collection}`,
+      `/orgs/${slug}/${collection}`,
+    ]);
+  } catch (err) {
+    console.error("[cache] purgeForCollection failed:", err);
+  }
+}
+
+async function purgeForDocument(orgId: string, collection: string, docId: string): Promise<void> {
+  try {
+    const schemaName = sanitizeSchemaName(orgId);
+    const slug = await orgSlug(orgId);
+
+    const urls = new Set<string>(publicUrlsForDocument(slug, collection, docId));
+
+    // Every tree path pointing at this doc also needs purging
+    const treePaths = await withTenant(schemaName, async tx =>
+      tx<{ tree: string; path: string }[]>`
+        SELECT tree, path FROM paths WHERE document_id = ${docId}
+      `
+    ).catch(() => [] as { tree: string; path: string }[]);
+
+    for (const { tree, path } of treePaths) {
+      for (const u of publicUrlsForTreePath(slug, tree, path)) urls.add(u);
+    }
+
+    await cachePurger.purge([...urls]);
+  } catch (err) {
+    // Purge failures must never break mutations
+    console.error("[cache] purgeForDocument failed:", err);
+  }
+}
+
+// Called after tree PUT/DELETE — the path itself changed regardless of which
+// document it now points at.
+async function purgeForTreePath(orgId: string, treeName: string, treePath: string): Promise<void> {
+  try {
+    const slug = await orgSlug(orgId);
+
+    const urls = new Set<string>(publicUrlsForTreePath(slug, treeName, treePath));
+
+    // Every ancestor path is also affected (its children array changed)
+    const parts = treePath.split("/").filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      const ancestor = "/" + parts.slice(0, i).join("/");
+      for (const u of publicUrlsForTreePath(slug, treeName, ancestor === "/" ? "" : ancestor)) {
+        urls.add(u);
+      }
+    }
+
+    await cachePurger.purge([...urls]);
+  } catch (err) {
+    console.error("[cache] purgeForTreePath failed:", err);
+  }
 }
 
 // -------------------------------------------------------
@@ -450,7 +631,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.2.7", build: "20260410a" });
+      return Response.json({ status: "ok", version: "0.3.0", build: "20260411a" });
     }
 
 
@@ -778,10 +959,18 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         treeRes = await handleTreeFull(schemaName, treeName, treeAr.labelFilter ?? url.searchParams.get("label") ?? undefined);
       else if (req.method === "GET")
         treeRes = await handleTreeGet(schemaName, treeName, treePath, req.headers.get("accept"));
-      else if (req.method === "PUT")
-        treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId);
-      else if (req.method === "DELETE")
+      else if (req.method === "PUT") {
+        treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId, orgId);
+        if (treeRes.status < 400) {
+          purgeForTreePath(orgId, treeName, treePath).catch(() => {});
+        }
+      }
+      else if (req.method === "DELETE") {
         treeRes = await handleTreeDelete(schemaName, treeName, treePath, user.userId);
+        if (treeRes.status < 400) {
+          purgeForTreePath(orgId, treeName, treePath).catch(() => {});
+        }
+      }
       else return Response.json({ error: "Method not allowed" }, { status: 405 });
       audit(treeAr, treeResource, treeIsRead, treeRes.status);
       return treeIsRead ? filterResponse(treeRes, treeAr) : treeRes;
@@ -841,6 +1030,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         ? await handleCreateAsset(schemaName, collection, req, user.userId)
         : await handleCreate(schemaName, collection, req, user.userId);
       audit(colAr, colResource, false, r.status);
+      // Fresh create → new URL, nothing cached yet, but purge the collection
+      // list URLs since the doc appears in them.
+      if (r.status < 400) {
+        purgeForCollection(orgId, collection).catch(() => {});
+      }
       return r;
     }
 
@@ -851,6 +1045,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         ? await handleUpdateAsset(schemaName, collection, id, req, user.userId)
         : await handleUpdate(schemaName, collection, id, req, user.userId);
       audit(colAr, colResource, false, r.status);
+      if (r.status < 400) {
+        purgeForDocument(orgId, collection, id).catch(() => {});
+      }
       return r;
     }
 
@@ -858,6 +1055,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (req.method === "DELETE" && id && !sub) {
       const r = await handleDelete(schemaName, collection, id);
       audit(colAr, colResource, false, r.status);
+      if (r.status < 400) {
+        purgeForDocument(orgId, collection, id).catch(() => {});
+      }
       return r;
     }
 
@@ -886,6 +1086,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (req.method === "POST" && id && sub === "rollback" && version) {
       const r = await handleRollback(schemaName, collection, id, version, user.userId);
       audit(colAr, colResource, false, r.status);
+      if (r.status < 400) {
+        purgeForDocument(orgId, collection, id).catch(() => {});
+      }
       return r;
     }
 
@@ -893,6 +1096,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (req.method === "POST" && id && sub === "labels") {
       const r = await handleLabel(schemaName, collection, id, req, user.userId);
       audit(colAr, colResource, false, r.status);
+      // Label changes affect ?label=foo responses
+      if (r.status < 400) {
+        purgeForDocument(orgId, collection, id).catch(() => {});
+      }
       return r;
     }
 
@@ -1107,7 +1314,14 @@ async function handleGetAssetRaw(schemaName: string, collection: string, docId: 
     headers: {
       "Content-Type": mime_type,
       "Content-Disposition": `inline; filename="${filename}"`,
-      "Cache-Control": "public, max-age=31536000, immutable",
+      // Short freshness, long stale-while-revalidate. Combined with explicit
+      // purges on mutation, this keeps reads fast without serving stale bytes
+      // for long when a new version is uploaded.
+      "Cache-Control": PUBLIC_CACHE,
+      // Tree-served raw bytes come from a content-negotiated URL, so the CDN
+      // must key its cache by Accept — otherwise a JSON probe poisons the
+      // HTML response for the same path.
+      "Vary": "Accept",
     },
   });
 }
@@ -1159,7 +1373,8 @@ async function handlePublicCollectionRequest(
   const ar = await checkAccess(orgId, "", "*", resource, "read");
   if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
 
-  // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset
+  // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset.
+  // handleGetAssetRaw already emits the public cache policy + Vary: Accept.
   if (id && sub === "raw") {
     return handleGetAssetRaw(schemaName, collection, id, url);
   }
@@ -1171,12 +1386,12 @@ async function handlePublicCollectionRequest(
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
     const r = await handleGet(schemaName, collection, id, effectiveUrl);
-    return filterPublicResponse(r, ar);
+    return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
   // GET /orgs/{slug}/{collection} — list documents
   const r = await handleList(schemaName, collection, url, "", ar.labelFilter);
-  return filterPublicResponse(r, ar);
+  return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
 }
 
 async function filterPublicResponse(res: Response, ar: AccessResult): Promise<Response> {
@@ -1560,14 +1775,14 @@ async function handleTreeFull(schemaName: string, treeName: string, label?: stri
       ORDER BY p.path
     `;
   });
-  return Response.json({
+  return withHeaders(Response.json({
     tree: treeName,
     nodes: nodes.map(n => ({
       path: n.path,
       documentId: n.document_id,
       document: { id: n.document_id, collection: n.collection, version: n.version, data: n.data },
     })),
-  });
+  }), PUBLIC_CACHE_HEADERS);
 }
 
 // Return true when the Accept header prefers a non-JSON content type over JSON.
@@ -1628,12 +1843,24 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
     }
   }
 
-  return Response.json(result);
+  // Tree GET is content-negotiated — the same URL can return JSON or raw bytes
+  // depending on Accept. Vary: Accept tells the CDN to key its cache on both.
+  return withHeaders(Response.json(result), CONTENT_NEGOTIATED_HEADERS);
 }
 
-async function handleTreePut(schemaName: string, treeName: string, treePath: string, req: Request, userId: string): Promise<Response> {
+async function handleTreePut(schemaName: string, treeName: string, treePath: string, req: Request, userId: string, orgId: string): Promise<Response> {
   const body = await req.json() as { documentId?: string };
   const documentId = body.documentId || null;
+
+  // Detect whether the tree already exists before we mutate it. If this PUT
+  // creates the first path for a new tree, we'll return a one-off hint in
+  // the response explaining that the tree is not publicly readable by default.
+  const treeExistsBefore = await withTenant(schemaName, async tx => {
+    const rows = await tx<{ exists: boolean }[]>`
+      SELECT EXISTS(SELECT 1 FROM paths WHERE tree = ${treeName}) AS exists
+    `;
+    return rows[0]?.exists ?? false;
+  });
 
   await withTenant(schemaName, async tx => {
     // If a documentId is provided, verify it exists
@@ -1699,7 +1926,36 @@ async function handleTreePut(schemaName: string, treeName: string, treePath: str
     }
   });
 
-  return Response.json({ tree: treeName, path: treePath, documentId });
+  const response: Record<string, unknown> = { tree: treeName, path: treePath, documentId };
+
+  // If this PUT just brought a new tree into existence, check whether a
+  // public read rule is in place and include a one-off hint in the response
+  // telling the caller how to make the tree publicly readable. This catches
+  // the silent "I created a tree but reads return 403" footgun at creation
+  // time instead of later.
+  if (!treeExistsBefore) {
+    const publicRule = await sql<{ id: string }[]>`
+      SELECT id FROM common.permissions
+      WHERE org_id = ${orgId}
+        AND principal = '*'
+        AND access IN ('read', 'write', 'admin')
+        AND (resource = ${"tree:" + treeName} OR resource = 'tree:*' OR resource = '*')
+      LIMIT 1
+    `;
+    response.hint = {
+      created_tree: treeName,
+      message: publicRule.length > 0
+        ? `Tree '${treeName}' created. A public read rule already covers it, so reads via /orgs/{slug}/tree/${treeName}/... will work without auth.`
+        : `Tree '${treeName}' created. It is not publicly readable by default — only authenticated users with a matching permission rule can read from it. To make it publicly readable, create a permission rule with principal='*' on resource='tree:${treeName}'.`,
+      public_read_example: publicRule.length > 0 ? undefined : {
+        method: "POST",
+        url: "/api/v1/permissions",
+        body: { principal: "*", resource: `tree:${treeName}`, access: "read" },
+      },
+    };
+  }
+
+  return Response.json(response);
 }
 
 async function handleTreeDelete(schemaName: string, treeName: string, treePath: string, userId: string): Promise<Response> {
