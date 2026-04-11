@@ -657,10 +657,29 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
 
-    // Wren logo — served from public directory (no auth required)
+    // WREN logo — served from public directory (no auth required)
     if (url.pathname === "/wren-logo.svg") {
       return new Response(Bun.file(join(import.meta.dir, "public", "wren-logo.svg")), {
-        headers: { "Content-Type": "image/svg+xml", "Cache-Control": "max-age=3600" },
+        headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=3600" },
+      });
+    }
+
+    // Favicons — the SVG is the authoritative source; /favicon.ico is
+    // aliased to the same file so browsers that blindly request it
+    // (Firefox, curl probing, etc.) don't get a 404 in every access log.
+    // Modern browsers prefer the <link rel="icon" type="image/svg+xml">
+    // declared in each HTML page, which points directly at /favicon.svg.
+    if (url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "wren-logo.svg")), {
+        headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" },
+      });
+    }
+
+    // PWA / "add to home screen" manifest. Used for tab theming on mobile,
+    // app icons, and the standalone-display launcher state.
+    if (url.pathname === "/site.webmanifest" || url.pathname === "/manifest.json") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "site.webmanifest")), {
+        headers: { "Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=86400" },
       });
     }
 

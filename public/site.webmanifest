@@ -1,0 +1,24 @@
+{
+  "name": "WREN",
+  "short_name": "WREN",
+  "description": "Versioned JSON storage with multi-tenancy built in.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1e1b4b",
+  "theme_color": "#4338ca",
+  "icons": [
+    {
+      "src": "/wren-logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/wren-logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
