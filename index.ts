@@ -1003,8 +1003,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Determine required access level from method + sub-route
     let reqAccess: "read" | "write" | "admin" = "read";
-    if (id === "_schema" && req.method !== "GET") reqAccess = "admin";
-    else if (req.method !== "GET") reqAccess = "write";
+    if (id === "_schema" && sub === "validate") {
+      // Dry-run validation is read-only — it never mutates the schema or docs
+      reqAccess = "read";
+    } else if (id === "_schema" && req.method !== "GET") {
+      reqAccess = "admin";
+    } else if (req.method !== "GET") {
+      reqAccess = "write";
+    }
 
     const colAr = await gate(colResource, reqAccess);
     if (colAr instanceof Response) return colAr;
@@ -1024,6 +1030,18 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (req.method === "GET")    { const r = await handleGetSchema(schemaName, collection);    audit(colAr, colResource, true, r.status);  return r; }
       if (req.method === "PUT")    { const r = await handleSetSchema(schemaName, collection, req, user.userId); audit(colAr, colResource, false, r.status); return r; }
       if (req.method === "DELETE") { const r = await handleDeleteSchema(schemaName, collection); audit(colAr, colResource, false, r.status); return r; }
+    }
+
+    // Dry-run schema validation: GET|POST /{collection}/_schema/validate
+    // Read-only — runs the current or a proposed schema against every existing
+    // document and reports which ones would fail, without touching anything.
+    if (id === "_schema" && sub === "validate") {
+      if (req.method === "GET" || req.method === "POST") {
+        const r = await handleValidateSchema(schemaName, collection, req, url);
+        audit(colAr, colResource, true, r.status);
+        return r;
+      }
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Route: GET /{collection}/{id}/raw  (binary asset download)
@@ -1221,6 +1239,129 @@ async function validateAgainstSchema(schemaName: string, collection: string, dat
   const validate = ajv.compile(rows[0].schema as object);
   if (validate(data)) return null;
   return (validate.errors ?? []).map(e => `${e.instancePath || "/"} ${e.message}`);
+}
+
+// Dry-run validation — runs the current or a proposed schema against every
+// existing document in a collection and returns which ones would fail.
+// Never mutates anything. Intended for "what happens if I tighten this schema"
+// before actually setting it.
+//
+// Accepts an optional schema in the request body (POST). If no body is present,
+// the currently-stored schema is used. Caps the number of documents checked
+// and the number of failure details returned so a single call is bounded
+// regardless of collection size.
+async function handleValidateSchema(schemaName: string, collection: string, req: Request, url: URL): Promise<Response> {
+  // Optional proposed schema from the request body
+  let proposedSchema: unknown = undefined;
+  if (req.method === "POST") {
+    try {
+      const body = await req.json() as unknown;
+      if (body && typeof body === "object") {
+        // Wrapper form: { "schema": {...} } — matches handleSetSchema
+        if ("schema" in body) {
+          proposedSchema = (body as { schema: unknown }).schema;
+        } else {
+          // Plain form: the whole body is the JSON Schema
+          proposedSchema = body;
+        }
+      }
+    } catch {
+      // No body or invalid JSON → fall through to stored schema
+    }
+  }
+
+  // Resolve the schema to validate against
+  let schemaToUse: unknown;
+  let schemaSource: "current" | "proposed";
+  if (proposedSchema !== undefined) {
+    schemaToUse = proposedSchema;
+    schemaSource = "proposed";
+  } else {
+    const rows = await withTenant(schemaName, async tx =>
+      tx<{ schema: unknown; collection_type: string }[]>`
+        SELECT schema, collection_type FROM collection_schemas WHERE collection = ${collection}
+      `
+    );
+    if (rows.length === 0) {
+      return Response.json({
+        error: "No schema set for this collection",
+        hint: "Set a schema first via PUT /api/v1/{collection}/_schema, or POST a proposed schema in the body of this request to dry-run against existing documents.",
+      }, { status: 404 });
+    }
+    if (rows[0].collection_type === "binary") {
+      return Response.json({
+        error: "Binary collections do not use JSON Schema validation",
+      }, { status: 400 });
+    }
+    schemaToUse = rows[0].schema;
+    schemaSource = "current";
+  }
+
+  // Compile the validator — also sanity-checks the schema itself
+  let validate: ReturnType<typeof ajv.compile>;
+  try {
+    validate = ajv.compile(schemaToUse as object);
+  } catch (e) {
+    return Response.json({
+      error: "Invalid JSON Schema",
+      details: String(e),
+    }, { status: 422 });
+  }
+
+  // Pagination caps
+  const maxDocs = Math.min(
+    Math.max(parseInt(url.searchParams.get("max") ?? "10000") || 10000, 1),
+    50000,
+  );
+  const failureLimit = Math.min(
+    Math.max(parseInt(url.searchParams.get("limit") ?? "100") || 100, 1),
+    1000,
+  );
+
+  // Fetch up to maxDocs documents at their current version
+  const docs = await withTenant(schemaName, async tx =>
+    tx<{ id: string; version: number; data: unknown }[]>`
+      SELECT d.id, d.current_version AS version, v.data
+      FROM documents d
+      JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+      WHERE d.collection = ${collection} AND d.deleted_at IS NULL
+      ORDER BY d.created_at DESC
+      LIMIT ${maxDocs}
+    `
+  );
+
+  // Run the validator over each document. Errors live on validate.errors
+  // after each call and are overwritten on the next call, so capture
+  // them immediately into the failures array.
+  let validCount = 0;
+  let invalidCount = 0;
+  const failures: Array<{ id: string; version: number; errors: string[] }> = [];
+
+  for (const doc of docs) {
+    if (validate(doc.data)) {
+      validCount++;
+    } else {
+      invalidCount++;
+      if (failures.length < failureLimit) {
+        failures.push({
+          id: doc.id,
+          version: doc.version,
+          errors: (validate.errors ?? []).map(e => `${e.instancePath || "/"} ${e.message}`),
+        });
+      }
+    }
+  }
+
+  return Response.json({
+    collection,
+    schemaSource,
+    checked: docs.length,
+    limitReached: docs.length >= maxDocs,
+    valid: validCount,
+    invalid: invalidCount,
+    failures,
+    failuresTruncated: invalidCount > failures.length,
+  });
 }
 
 // ── Binary asset helpers ─────────────────────────────────────────────────────
