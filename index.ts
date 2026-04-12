@@ -208,9 +208,14 @@ async function withTenant<T>(schemaName: string, fn: (tx: Sql) => Promise<T>): P
 // Every helper is wrapped in a top-level try/catch and the caller uses
 // `.catch(() => {})` so a misbehaving purger can't leak errors.
 
-function publicUrlsForDocument(slug: string | null, collection: string, docId: string): string[] {
+function publicUrlsForDocument(
+  slug: string | null,
+  collection: string,
+  docId: string,
+  naturalKey: string | null = null,
+): string[] {
   if (!slug) return [];
-  return [
+  const urls = [
     // Public collection reads — authenticated or via org slug
     `/api/v1/orgs/${slug}/${collection}/${docId}`,
     `/api/v1/orgs/${slug}/${collection}/${docId}/raw`,
@@ -220,6 +225,17 @@ function publicUrlsForDocument(slug: string | null, collection: string, docId: s
     `/api/v1/orgs/${slug}/${collection}`,
     `/orgs/${slug}/${collection}`,
   ];
+  // If the doc has a natural key, the /by-key/ URL variants also need
+  // invalidating — without this, the addressable-by-key form would serve
+  // stale content for the full cache window after a write.
+  if (naturalKey) {
+    const enc = encodeURIComponent(naturalKey);
+    urls.push(
+      `/api/v1/orgs/${slug}/${collection}/by-key/${enc}`,
+      `/orgs/${slug}/${collection}/by-key/${enc}`,
+    );
+  }
+  return urls;
 }
 
 function publicUrlsForTreePath(slug: string | null, treeName: string, treePath: string): string[] {
@@ -271,7 +287,18 @@ async function purgeForDocument(orgId: string, collection: string, docId: string
     const schemaName = sanitizeSchemaName(orgId);
     const slug = await orgSlug(orgId);
 
-    const urls = new Set<string>(publicUrlsForDocument(slug, collection, docId));
+    // Look up the doc's current natural_key so we can emit the /by-key/
+    // URL variants in the purge set. If the update changed the key value,
+    // this purges the *new* key; the old key's cache entry expires
+    // naturally within the Cache-Control max-age (60s).
+    const docRows = await withTenant(schemaName, async tx =>
+      tx<{ natural_key: string | null }[]>`
+        SELECT natural_key FROM documents WHERE id = ${docId}
+      `
+    ).catch(() => [] as { natural_key: string | null }[]);
+    const naturalKey = docRows[0]?.natural_key ?? null;
+
+    const urls = new Set<string>(publicUrlsForDocument(slug, collection, docId, naturalKey));
 
     // Every tree path pointing at this doc also needs purging
     const treePaths = await withTenant(schemaName, async tx =>
@@ -1027,6 +1054,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       reqAccess = "read";
     } else if (id === "_schema" && req.method !== "GET") {
       reqAccess = "admin";
+    } else if (id === "by-key") {
+      // Natural-key routes: GET is read, PUT/DELETE are write. They
+      // ultimately call the same write path as /{collection}/{id} so the
+      // access level must match.
+      reqAccess = req.method === "GET" ? "read" : "write";
     } else if (req.method !== "GET") {
       reqAccess = "write";
     }
@@ -1059,6 +1091,40 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         const r = await handleValidateSchema(schemaName, collection, req, url);
         audit(colAr, colResource, true, r.status);
         return r;
+      }
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Natural-key routes: GET|PUT|DELETE /{collection}/by-key/{keyValue}
+    // Upsert-by-key is the headline — a single transactional call replaces
+    // the list-then-find-then-put idiom that every ingestion client
+    // otherwise reinvents.
+    if (id === "by-key" && sub) {
+      const keyValue = decodeURIComponent(sub);
+      if (req.method === "GET") {
+        const effectiveLabel = colAr.labelFilter ?? url.searchParams.get("label") ?? undefined;
+        const effectiveUrl = effectiveLabel
+          ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
+          : url;
+        const r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+        audit(colAr, colResource, true, r.status);
+        return filterResponse(r, colAr);
+      }
+      if (req.method === "PUT") {
+        const { res, id: docId } = await handleUpsertByKey(schemaName, collection, keyValue, req, user.userId);
+        audit(colAr, colResource, false, res.status);
+        if (res.status < 400 && docId) {
+          purgeForDocument(orgId, collection, docId).catch(() => {});
+        }
+        return res;
+      }
+      if (req.method === "DELETE") {
+        const { res, id: docId } = await handleDeleteByKey(schemaName, collection, keyValue);
+        audit(colAr, colResource, false, res.status);
+        if (res.status < 400 && docId) {
+          purgeForDocument(orgId, collection, docId).catch(() => {});
+        }
+        return res;
       }
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
@@ -1258,6 +1324,67 @@ async function validateAgainstSchema(schemaName: string, collection: string, dat
   const validate = ajv.compile(rows[0].schema as object);
   if (validate(data)) return null;
   return (validate.errors ?? []).map(e => `${e.instancePath || "/"} ${e.message}`);
+}
+
+// ── Natural key helpers ──────────────────────────────────────────────────────
+//
+// Collections can designate a single top-level field of their document data
+// as a natural key (e.g. "slug"). The value is extracted on write and stored
+// in the `documents.natural_key` column, which is uniquely indexed per
+// collection. This lets callers address documents via /by-key/{value}
+// and implement upsert-by-key in a single transactional call.
+//
+// A tiny per-schema cache avoids a DB round trip on every write. Entries are
+// invalidated whenever handleSetSchema runs.
+
+const naturalKeyCache = new Map<string, { field: string | null; fetchedAt: number }>();
+const NATURAL_KEY_CACHE_TTL_MS = 60_000;
+
+async function getNaturalKeyField(schemaName: string, collection: string): Promise<string | null> {
+  const cacheKey = `${schemaName}:${collection}`;
+  const cached = naturalKeyCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < NATURAL_KEY_CACHE_TTL_MS) {
+    return cached.field;
+  }
+  const rows = await withTenant(schemaName, async tx =>
+    tx<{ natural_key: string | null }[]>`
+      SELECT natural_key FROM collection_schemas WHERE collection = ${collection}
+    `
+  );
+  const field = rows[0]?.natural_key ?? null;
+  naturalKeyCache.set(cacheKey, { field, fetchedAt: Date.now() });
+  return field;
+}
+
+// Pulls the natural-key value out of the incoming document data. Returns null
+// when: no key is configured, the field is missing, the value is nullish,
+// the value is a non-string, or the trimmed value is empty. Non-null return
+// means "this doc has a usable key value that should be persisted to
+// documents.natural_key".
+async function extractNaturalKey(
+  schemaName: string,
+  collection: string,
+  data: unknown,
+): Promise<string | null> {
+  const field = await getNaturalKeyField(schemaName, collection);
+  if (!field) return null;
+  if (!data || typeof data !== "object") return null;
+  const raw = (data as Record<string, unknown>)[field];
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+// Classifies a Postgres error to detect the natural-key unique violation.
+// Postgres error code 23505 is unique_violation; we further narrow by
+// constraint name so we don't misreport unrelated unique conflicts.
+function isNaturalKeyConflict(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: string; constraint_name?: string; constraint?: string };
+  return e.code === "23505" &&
+    (e.constraint_name === "documents_natural_key_unique_idx" ||
+     e.constraint === "documents_natural_key_unique_idx");
 }
 
 // Dry-run validation — runs the current or a proposed schema against every
@@ -1555,6 +1682,19 @@ async function handlePublicCollectionRequest(
   const ar = await checkAccess(orgId, "", "*", resource, "read");
   if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
 
+  // GET /orgs/{slug}/{collection}/by-key/{keyValue} — public natural-key lookup.
+  // Read-only; public mutations are never allowed regardless of how the rule
+  // is configured (write/admin on principal=* is nonsensical here).
+  if (id === "by-key" && sub) {
+    const keyValue = decodeURIComponent(sub);
+    const effectiveLabel = ar.labelFilter ?? url.searchParams.get("label") ?? undefined;
+    const effectiveUrl = effectiveLabel
+      ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
+      : url;
+    const r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+    return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
+  }
+
   // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset.
   // handleGetAssetRaw already emits the public cache policy + Vary: Accept.
   if (id && sub === "raw") {
@@ -1598,23 +1738,37 @@ async function handleCreate(schemaName: string, collection: string, req: Request
   const errors = await validateAgainstSchema(schemaName, collection, data);
   if (errors) return Response.json({ error: "Schema validation failed", details: errors }, { status: 422 });
 
-  const doc = await withTenant(schemaName, async tx => {
-    const [inserted] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
-      INSERT INTO documents (collection, current_version, created_by)
-      VALUES (${collection}, 1, ${userId})
-      RETURNING id, created_at, updated_at
-    `;
-    await tx`
-      INSERT INTO versions (document_id, version, data, created_by)
-      VALUES (${inserted.id}, 1, ${tx.json(data)}, ${userId})
-    `;
-    return inserted;
-  });
+  // Extract natural key from incoming data (null if no key configured for
+  // this collection, or if the field is missing / wrong type / empty).
+  const naturalKey = await extractNaturalKey(schemaName, collection, data);
 
-  return Response.json(
-    { id: doc.id, version: 1, collection, data, createdAt: doc.created_at, updatedAt: doc.updated_at },
-    { status: 201 }
-  );
+  try {
+    const doc = await withTenant(schemaName, async tx => {
+      const [inserted] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
+        INSERT INTO documents (collection, current_version, natural_key, created_by)
+        VALUES (${collection}, 1, ${naturalKey}, ${userId})
+        RETURNING id, created_at, updated_at
+      `;
+      await tx`
+        INSERT INTO versions (document_id, version, data, created_by)
+        VALUES (${inserted.id}, 1, ${tx.json(data)}, ${userId})
+      `;
+      return inserted;
+    });
+
+    return Response.json(
+      { id: doc.id, version: 1, collection, data, naturalKey, createdAt: doc.created_at, updatedAt: doc.updated_at },
+      { status: 201 }
+    );
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) {
+      return Response.json({
+        error: "Natural key conflict",
+        details: `Another document in '${collection}' already has natural_key='${naturalKey}'. Use PUT /by-key/${naturalKey} to update the existing document, or change the key field value.`,
+      }, { status: 409 });
+    }
+    throw err;
+  }
 }
 
 async function handleGet(schemaName: string, collection: string, id: string, url: URL): Promise<Response> {
@@ -1653,29 +1807,47 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
   const errors = await validateAgainstSchema(schemaName, collection, data);
   if (errors) return Response.json({ error: "Schema validation failed", details: errors }, { status: 422 });
 
-  const result = await withTenant(schemaName, async tx => {
-    const [doc] = await tx<{ id: string; current_version: number }[]>`
-      SELECT id, current_version FROM documents
-      WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
-      FOR UPDATE
-    `;
-    if (!doc) return null;
+  // Re-extract the natural key from incoming data. If the user changed the
+  // key field inside data, this moves the column too — the unique index
+  // enforces uniqueness and we map conflicts back to 409.
+  const naturalKey = await extractNaturalKey(schemaName, collection, data);
 
-    const newVersion = doc.current_version + 1;
-    await tx`
-      INSERT INTO versions (document_id, version, data, created_by)
-      VALUES (${id}, ${newVersion}, ${tx.json(data)}, ${userId})
-    `;
-    const [updated] = await tx<{ updated_at: Date }[]>`
-      UPDATE documents SET current_version = ${newVersion}, updated_at = NOW()
-      WHERE id = ${id}
-      RETURNING updated_at
-    `;
-    return { version: newVersion, updated_at: updated.updated_at };
-  });
+  try {
+    const result = await withTenant(schemaName, async tx => {
+      const [doc] = await tx<{ id: string; current_version: number }[]>`
+        SELECT id, current_version FROM documents
+        WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
+        FOR UPDATE
+      `;
+      if (!doc) return null;
 
-  if (!result) return Response.json({ error: "Not found" }, { status: 404 });
-  return Response.json({ id, version: result.version, collection, data, updatedAt: result.updated_at });
+      const newVersion = doc.current_version + 1;
+      await tx`
+        INSERT INTO versions (document_id, version, data, created_by)
+        VALUES (${id}, ${newVersion}, ${tx.json(data)}, ${userId})
+      `;
+      const [updated] = await tx<{ updated_at: Date }[]>`
+        UPDATE documents
+        SET current_version = ${newVersion},
+            natural_key = ${naturalKey},
+            updated_at = NOW()
+        WHERE id = ${id}
+        RETURNING updated_at
+      `;
+      return { version: newVersion, updated_at: updated.updated_at };
+    });
+
+    if (!result) return Response.json({ error: "Not found" }, { status: 404 });
+    return Response.json({ id, version: result.version, collection, data, naturalKey, updatedAt: result.updated_at });
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) {
+      return Response.json({
+        error: "Natural key conflict",
+        details: `Another document in '${collection}' already has natural_key='${naturalKey}'. Pick a different value for the key field.`,
+      }, { status: 409 });
+    }
+    throw err;
+  }
 }
 
 async function handleDelete(schemaName: string, collection: string, id: string): Promise<Response> {
@@ -1690,6 +1862,196 @@ async function handleDelete(schemaName: string, collection: string, id: string):
 
   if (!affected) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ id, deleted: true });
+}
+
+// ── Natural-key routes (GET/PUT/DELETE /{collection}/by-key/{keyValue}) ─────
+//
+// Thin wrappers that resolve the natural key to a document ID via the
+// unique index and then hand off to the existing by-ID handlers.
+// handleUpsertByKey is the exception — it's the headline operation and
+// does its own INSERT-or-UPDATE in a single transaction, replacing the
+// list-then-put idiom that every ingestion client otherwise reinvents.
+
+// Resolves a natural key to the document row (id + current version) or null.
+// Used by handleGetByKey and handleDeleteByKey to turn /by-key/{value} into
+// a regular by-ID lookup.
+async function resolveNaturalKey(
+  schemaName: string,
+  collection: string,
+  keyValue: string,
+): Promise<{ id: string } | null> {
+  const rows = await withTenant(schemaName, async tx =>
+    tx<{ id: string }[]>`
+      SELECT id FROM documents
+      WHERE collection = ${collection} AND natural_key = ${keyValue} AND deleted_at IS NULL
+      LIMIT 1
+    `
+  );
+  return rows[0] ?? null;
+}
+
+async function handleGetByKey(
+  schemaName: string,
+  collection: string,
+  keyValue: string,
+  url: URL,
+): Promise<Response> {
+  const field = await getNaturalKeyField(schemaName, collection);
+  if (!field) {
+    return Response.json({
+      error: "No natural key configured",
+      details: `Collection '${collection}' has no naturalKey set. Add one via PUT /api/v1/${collection}/_schema with {"naturalKey":"slug"}.`,
+    }, { status: 400 });
+  }
+  const row = await resolveNaturalKey(schemaName, collection, keyValue);
+  if (!row) return Response.json({ error: "Not found" }, { status: 404 });
+  return handleGet(schemaName, collection, row.id, url);
+}
+
+async function handleUpsertByKey(
+  schemaName: string,
+  collection: string,
+  keyValue: string,
+  req: Request,
+  userId: string,
+): Promise<{ res: Response; id: string | null }> {
+  const field = await getNaturalKeyField(schemaName, collection);
+  if (!field) {
+    return {
+      res: Response.json({
+        error: "No natural key configured",
+        details: `Collection '${collection}' has no naturalKey set. Add one via PUT /api/v1/${collection}/_schema with {"naturalKey":"slug"}.`,
+      }, { status: 400 }),
+      id: null,
+    };
+  }
+
+  const data = await req.json() as unknown;
+
+  // If the body provides a value for the key field, it must match the URL.
+  // Silently accepting a mismatch would put the "address" and "content" out
+  // of sync; an explicit 400 is the kinder behaviour.
+  if (data && typeof data === "object") {
+    const bodyValue = (data as Record<string, unknown>)[field];
+    if (typeof bodyValue === "string" && bodyValue.trim() !== keyValue) {
+      return {
+        res: Response.json({
+          error: "Natural key mismatch",
+          details: `URL key '${keyValue}' does not match data.${field} value '${bodyValue.trim()}'. Either update the URL or set ${field}='${keyValue}' in the body.`,
+        }, { status: 400 }),
+        id: null,
+      };
+    }
+  }
+
+  // If the body omitted the key field entirely, set it ourselves so that
+  // the stored doc stays in sync with its addressable identity.
+  let payload: Record<string, unknown>;
+  if (data && typeof data === "object") {
+    payload = { ...(data as Record<string, unknown>) };
+    if (payload[field] === undefined || payload[field] === null) {
+      payload[field] = keyValue;
+    }
+  } else {
+    payload = { [field]: keyValue };
+  }
+
+  const errors = await validateAgainstSchema(schemaName, collection, payload);
+  if (errors) {
+    return {
+      res: Response.json({ error: "Schema validation failed", details: errors }, { status: 422 }),
+      id: null,
+    };
+  }
+
+  try {
+    const result = await withTenant(schemaName, async tx => {
+      // Lookup-and-lock an existing doc with this key.
+      const [existing] = await tx<{ id: string; current_version: number }[]>`
+        SELECT id, current_version FROM documents
+        WHERE collection = ${collection} AND natural_key = ${keyValue} AND deleted_at IS NULL
+        FOR UPDATE
+      `;
+
+      if (existing) {
+        // Update path: write a new version against the existing doc.
+        const newVersion = existing.current_version + 1;
+        await tx`
+          INSERT INTO versions (document_id, version, data, created_by)
+          VALUES (${existing.id}, ${newVersion}, ${tx.json(payload)}, ${userId})
+        `;
+        const [updated] = await tx<{ updated_at: Date; created_at: Date }[]>`
+          UPDATE documents SET current_version = ${newVersion}, updated_at = NOW()
+          WHERE id = ${existing.id}
+          RETURNING updated_at, created_at
+        `;
+        return { id: existing.id, version: newVersion, created: false, created_at: updated.created_at, updated_at: updated.updated_at };
+      }
+
+      // Insert path: create a fresh doc with this key.
+      const [inserted] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
+        INSERT INTO documents (collection, current_version, natural_key, created_by)
+        VALUES (${collection}, 1, ${keyValue}, ${userId})
+        RETURNING id, created_at, updated_at
+      `;
+      await tx`
+        INSERT INTO versions (document_id, version, data, created_by)
+        VALUES (${inserted.id}, 1, ${tx.json(payload)}, ${userId})
+      `;
+      return { id: inserted.id, version: 1, created: true, created_at: inserted.created_at, updated_at: inserted.updated_at };
+    });
+
+    return {
+      res: Response.json(
+        {
+          id: result.id,
+          version: result.version,
+          collection,
+          data: payload,
+          naturalKey: keyValue,
+          createdAt: result.created_at,
+          updatedAt: result.updated_at,
+        },
+        { status: result.created ? 201 : 200 }
+      ),
+      id: result.id,
+    };
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) {
+      // Shouldn't happen — we locked on (collection, natural_key) before writing.
+      // But if it does (race under an unusual isolation level), return the
+      // same 409 the regular create/update paths would.
+      return {
+        res: Response.json({
+          error: "Natural key conflict",
+          details: `Another document in '${collection}' already has natural_key='${keyValue}'.`,
+        }, { status: 409 }),
+        id: null,
+      };
+    }
+    throw err;
+  }
+}
+
+async function handleDeleteByKey(
+  schemaName: string,
+  collection: string,
+  keyValue: string,
+): Promise<{ res: Response; id: string | null }> {
+  const field = await getNaturalKeyField(schemaName, collection);
+  if (!field) {
+    return {
+      res: Response.json({
+        error: "No natural key configured",
+        details: `Collection '${collection}' has no naturalKey set.`,
+      }, { status: 400 }),
+      id: null,
+    };
+  }
+  const row = await resolveNaturalKey(schemaName, collection, keyValue);
+  if (!row) return { res: Response.json({ error: "Not found" }, { status: 404 }), id: null };
+  const res = await handleDelete(schemaName, collection, row.id);
+  return { res, id: row.id };
 }
 
 async function handleVersionList(schemaName: string, collection: string, id: string): Promise<Response> {
@@ -1818,8 +2180,8 @@ async function handleDocumentPaths(schemaName: string, collection: string, id: s
 
 async function handleGetSchema(schemaName: string, collection: string): Promise<Response> {
   const rows = await withTenant(schemaName, async tx =>
-    tx<{ schema: unknown; display_name: string | null; collection_type: string; list_columns: string[] | null; updated_at: Date }[]>`
-      SELECT schema, display_name, collection_type, list_columns, updated_at FROM collection_schemas WHERE collection = ${collection}
+    tx<{ schema: unknown; display_name: string | null; collection_type: string; list_columns: string[] | null; natural_key: string | null; updated_at: Date }[]>`
+      SELECT schema, display_name, collection_type, list_columns, natural_key, updated_at FROM collection_schemas WHERE collection = ${collection}
     `
   );
   if (rows.length === 0) return Response.json({ error: "Not found" }, { status: 404 });
@@ -1829,6 +2191,7 @@ async function handleGetSchema(schemaName: string, collection: string): Promise<
     schema:         rows[0].collection_type === "binary" ? null : rows[0].schema,
     displayName:    rows[0].display_name ?? null,
     listColumns:    rows[0].list_columns ?? null,
+    naturalKey:     rows[0].natural_key ?? null,
     updatedAt:      rows[0].updated_at,
   });
 }
@@ -1836,8 +2199,8 @@ async function handleGetSchema(schemaName: string, collection: string): Promise<
 async function handleSetSchema(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
   const body = await req.json() as Record<string, unknown>;
 
-  // Accept either a plain JSON Schema or a wrapper { schema?, displayName?, collectionType?, listColumns? }
-  const isWrapper = body && typeof body === "object" && ("schema" in body || "collectionType" in body || "displayName" in body || "listColumns" in body);
+  // Accept either a plain JSON Schema or a wrapper { schema?, displayName?, collectionType?, listColumns?, naturalKey? }
+  const isWrapper = body && typeof body === "object" && ("schema" in body || "collectionType" in body || "displayName" in body || "listColumns" in body || "naturalKey" in body);
   const collectionType: string =
     (isWrapper && typeof body.collectionType === "string") ? body.collectionType : "json";
   const schema = collectionType === "binary"
@@ -1849,6 +2212,12 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
     (isWrapper && Array.isArray(body.listColumns) && body.listColumns.length > 0)
       ? (body.listColumns as string[]).filter(c => typeof c === "string" && c.trim())
       : null;
+  // Natural key: the top-level field name in document data whose value
+  // becomes the addressable identity. Explicit null or empty string clears it.
+  const naturalKey: string | null =
+    (isWrapper && typeof body.naturalKey === "string" && body.naturalKey.trim())
+      ? body.naturalKey.trim()
+      : null;
 
   if (collectionType !== "binary") {
     try { ajv.compile(schema as object); }
@@ -1857,17 +2226,21 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
 
   await withTenant(schemaName, async tx => {
     await tx`
-      INSERT INTO collection_schemas (collection, schema, display_name, collection_type, list_columns, created_by)
-      VALUES (${collection}, ${tx.json(schema)}, ${displayName}, ${collectionType}, ${listColumns}, ${userId})
+      INSERT INTO collection_schemas (collection, schema, display_name, collection_type, list_columns, natural_key, created_by)
+      VALUES (${collection}, ${tx.json(schema)}, ${displayName}, ${collectionType}, ${listColumns}, ${naturalKey}, ${userId})
       ON CONFLICT (collection) DO UPDATE
         SET schema          = EXCLUDED.schema,
             display_name    = EXCLUDED.display_name,
             collection_type = EXCLUDED.collection_type,
             list_columns    = EXCLUDED.list_columns,
+            natural_key     = EXCLUDED.natural_key,
             updated_at      = NOW()
     `;
   });
-  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns });
+  // Invalidate the in-memory natural-key config cache for this collection
+  // since the schema just changed.
+  naturalKeyCache.delete(`${schemaName}:${collection}`);
+  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns, naturalKey });
 }
 
 async function handleDeleteSchema(schemaName: string, collection: string): Promise<Response> {
