@@ -847,22 +847,45 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json(openapiJson);
     }
 
-    // Scalar API docs
+    // Scalar API docs — with the common marketing nav at the top
     if (url.pathname === "/docs") {
       return new Response(
         `<!doctype html>
 <html>
   <head>
-    <title>Wren API</title>
+    <title>WREN API</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" href="/favicon.ico" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="theme-color" content="#4338ca" />
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      .docs-body { padding-top: var(--nav-height); }
+    </style>
   </head>
   <body>
-    <script id="api-reference" data-url="/openapi.json"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <nav class="nav">
+      <div class="nav__inner">
+        <a href="/" class="nav__logo"><img src="/wren-logo.svg" alt="WREN" class="nav__logo-img" />WREN</a>
+        <ul class="nav__links">
+          <li><a href="/tutorial">Tutorial</a></li>
+          <li><a href="/docs" style="color:var(--color-primary);font-weight:600">Docs</a></li>
+          <li><a href="/#clients">Libraries</a></li>
+          <li><a href="/#pricing">Pricing</a></li>
+          <li><a href="/admin">Admin</a></li>
+          <li><a href="#">GitHub</a></li>
+        </ul>
+      </div>
+    </nav>
+    <div class="docs-body">
+      <script id="api-reference" data-url="/openapi.json"></script>
+      <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    </div>
   </body>
 </html>`,
-        { headers: { "Content-Type": "text/html" } }
+        { headers: { "Content-Type": "text/html", ...NO_CACHE } }
       );
     }
 
