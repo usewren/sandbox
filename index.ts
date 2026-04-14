@@ -939,6 +939,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const user = await requireSession(req);
     if (!user) return unauthorized();
 
+    // Identity & scope — /api/v1/me
+    if (collection === "me" && !id) {
+      if (req.method === "GET") return handleGetMe(user);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
     // API key management routes — /api/v1/keys[/:keyId]
     if (collection === "keys") {
       if (req.method === "GET"    && !id)   return handleListApiKeys(user.userId, user.sessionId, user.keyOrgId);
@@ -2646,6 +2652,77 @@ async function handleRevokeApiKey(keyId: string, userId: string, sessionId: stri
 // -------------------------------------------------------
 // Org context handlers
 // -------------------------------------------------------
+
+async function handleGetMe(user: SessionUser): Promise<Response> {
+  const orgId = await resolveUserOrgId(user.userId, user.sessionId, user.keyOrgId);
+  const own = orgId === user.userId;
+
+  // Org display name + slug (match handleGetOrg logic)
+  const orgUserRows = await sql<{ name: string; email: string }[]>`
+    SELECT name, email FROM "user" WHERE id = ${orgId}
+  `;
+  const orgUser = orgUserRows[0];
+  const orgSlug = orgUser ? await getOrCreateSlug(orgId, orgUser.email) : null;
+  const orgName = own ? "My workspace" : (orgUser?.name ?? orgId);
+
+  // Role: owner if own org, else the org_members.role, else null (shouldn't happen for valid sessions)
+  let role: string;
+  if (own) {
+    role = "owner";
+  } else {
+    const memberRows = await sql<{ role: string }[]>`
+      SELECT role FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${user.userId}
+    `;
+    role = memberRows[0]?.role ?? "none";
+  }
+
+  // API-key details (only when authenticated via key)
+  let apiKey: { id: string; name: string; prefix: string; lastUsedAt: Date | null } | null = null;
+  if (user.keyId) {
+    const keyRows = await sql<{ id: string; name: string; key_prefix: string; last_used_at: Date | null }[]>`
+      SELECT id, name, key_prefix, last_used_at FROM common.api_keys WHERE id = ${user.keyId}
+    `;
+    if (keyRows[0]) {
+      apiKey = {
+        id: keyRows[0].id,
+        name: keyRows[0].name,
+        prefix: keyRows[0].key_prefix,
+        lastUsedAt: keyRows[0].last_used_at,
+      };
+    }
+  }
+
+  // Permission rules that apply to this principal in this org, plus public (*) rules.
+  // Lets an API-keyed caller self-audit its scope without needing admin access to
+  // read the full /api/permissions list.
+  const principal = principalFor(user);
+  const permRows = await sql<{
+    id: string; principal: string; resource: string; access: string;
+    label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
+  }[]>`
+    SELECT id, principal, resource, access, label_filter, filter_lang, filter_expr
+    FROM common.permissions
+    WHERE org_id = ${orgId} AND principal IN (${principal}, '*')
+    ORDER BY created_at DESC
+  `;
+
+  return Response.json({
+    principal,
+    authMethod: user.keyId ? "api_key" : "session",
+    user: { id: user.userId, name: user.name, email: user.email },
+    org: { id: orgId, name: orgName, slug: orgSlug, own, role },
+    apiKey,
+    permissions: permRows.map(r => ({
+      id: r.id,
+      principal: r.principal,
+      resource: r.resource,
+      access: r.access,
+      labelFilter: r.label_filter,
+      filterLang: r.filter_lang,
+      filterExpr: r.filter_expr,
+    })),
+  });
+}
 
 async function handleGetOrg(userId: string, sessionId: string | null): Promise<Response> {
   const current = await resolveUserOrgId(userId, sessionId);
