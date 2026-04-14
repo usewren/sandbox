@@ -680,7 +680,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.4.1", build: "20260414a" });
+      return Response.json({ status: "ok", version: "0.4.2", build: "20260414b" });
     }
 
 
@@ -2655,7 +2655,7 @@ async function handleRevokeApiKey(keyId: string, userId: string, sessionId: stri
 
 async function handleGetMe(user: SessionUser): Promise<Response> {
   const orgId = await resolveUserOrgId(user.userId, user.sessionId, user.keyOrgId);
-  const own = orgId === user.userId;
+  const isOwnOrg = orgId === user.userId;
 
   // Org display name + slug (match handleGetOrg logic)
   const orgUserRows = await sql<{ name: string; email: string }[]>`
@@ -2663,11 +2663,12 @@ async function handleGetMe(user: SessionUser): Promise<Response> {
   `;
   const orgUser = orgUserRows[0];
   const orgSlug = orgUser ? await getOrCreateSlug(orgId, orgUser.email) : null;
-  const orgName = own ? "My workspace" : (orgUser?.name ?? orgId);
+  const orgName = isOwnOrg ? "My workspace" : (orgUser?.name ?? orgId);
 
-  // Role: owner if own org, else the org_members.role, else null (shouldn't happen for valid sessions)
+  // Role is the single source of truth for what this caller can do in this
+  // org. "owner" covers the personal-workspace case — no separate `own` flag.
   let role: string;
-  if (own) {
+  if (isOwnOrg) {
     role = "owner";
   } else {
     const memberRows = await sql<{ role: string }[]>`
@@ -2710,7 +2711,7 @@ async function handleGetMe(user: SessionUser): Promise<Response> {
     principal,
     authMethod: user.keyId ? "api_key" : "session",
     user: { id: user.userId, name: user.name, email: user.email },
-    org: { id: orgId, name: orgName, slug: orgSlug, own, role },
+    org: { id: orgId, name: orgName, slug: orgSlug, role },
     apiKey,
     permissions: permRows.map(r => ({
       id: r.id,
