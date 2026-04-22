@@ -1064,10 +1064,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (treeAr instanceof Response) return treeAr;
       trackRequest(orgId, treeIsRead);
       let treeRes: Response;
+      const effectiveTreeLabel = treeAr.labelFilter ?? url.searchParams.get("label") ?? undefined;
       if (req.method === "GET" && url.searchParams.get("full") === "true")
-        treeRes = await handleTreeFull(schemaName, treeName, treeAr.labelFilter ?? url.searchParams.get("label") ?? undefined);
+        treeRes = await handleTreeFull(schemaName, treeName, effectiveTreeLabel);
       else if (req.method === "GET")
-        treeRes = await handleTreeGet(schemaName, treeName, treePath, req.headers.get("accept"));
+        treeRes = await handleTreeGet(schemaName, treeName, treePath, req.headers.get("accept"), effectiveTreeLabel);
       else if (req.method === "PUT") {
         treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId, orgId);
         if (treeRes.status < 400) {
@@ -1788,10 +1789,11 @@ async function handlePublicCollectionRequest(
                      url.pathname.startsWith(shortPrefix) ? url.pathname.slice(shortPrefix.length) || "/" :
                      "/";
 
+    const effectiveLabel = ar.labelFilter ?? url.searchParams.get("label") ?? undefined;
     if (url.searchParams.get("full") === "true") {
-      return handleTreeFull(schemaName, treeName, ar.labelFilter ?? url.searchParams.get("label") ?? undefined);
+      return handleTreeFull(schemaName, treeName, effectiveLabel);
     }
-    return handleTreeGet(schemaName, treeName, treePath, accept);
+    return handleTreeGet(schemaName, treeName, treePath, accept, effectiveLabel);
   }
 
   // ── Public collection access ───────────────────────────────────────────────
@@ -2469,7 +2471,7 @@ function shouldServeBinary(accept: string | null): boolean {
   return hasSpecific && !hasJson;
 }
 
-async function handleTreeGet(schemaName: string, treeName: string, treePath: string, accept?: string | null): Promise<Response> {
+async function handleTreeGet(schemaName: string, treeName: string, treePath: string, accept?: string | null, label?: string): Promise<Response> {
   const result = await withTenant(schemaName, async tx => {
     // Exact match at this path in this tree
     const [exact] = await tx<{ document_id: string; assignment_doc_id: string | null }[]>`
@@ -2486,13 +2488,27 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
 
     let doc = null;
     if (exact?.document_id) {
-      const [row] = await tx<{ id: string; collection: string; version: number; data: unknown }[]>`
-        SELECT d.id, d.collection, d.current_version AS version, v.data
-        FROM documents d
-        JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
-        WHERE d.id = ${exact.document_id} AND d.deleted_at IS NULL
-      `;
-      doc = row ?? null;
+      if (label) {
+        // Resolve the document at the labeled version — if the label doesn't
+        // exist on this doc, treat it as if the document isn't there yet
+        // (deployed but not promoted to this label).
+        const [row] = await tx<{ id: string; collection: string; version: number; data: unknown }[]>`
+          SELECT d.id, d.collection, l.version, v.data
+          FROM documents d
+          JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+          JOIN versions v ON v.document_id = d.id AND v.version = l.version
+          WHERE d.id = ${exact.document_id} AND d.deleted_at IS NULL
+        `;
+        doc = row ?? null;
+      } else {
+        const [row] = await tx<{ id: string; collection: string; version: number; data: unknown }[]>`
+          SELECT d.id, d.collection, d.current_version AS version, v.data
+          FROM documents d
+          JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+          WHERE d.id = ${exact.document_id} AND d.deleted_at IS NULL
+        `;
+        doc = row ?? null;
+      }
     }
 
     const pathExists = !!exact;
