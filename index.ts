@@ -881,8 +881,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           <li><a href="/docs" style="color:var(--color-primary);font-weight:600">Docs</a></li>
           <li><a href="/#clients">Libraries</a></li>
           <li><a href="/#pricing">Pricing</a></li>
+          <li><a href="/projects">Projects</a></li>
           <li><a href="/admin">Admin</a></li>
-          <li><a href="#">GitHub</a></li>
         </ul>
       </div>
     </nav>
