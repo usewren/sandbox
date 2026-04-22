@@ -751,6 +751,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         headers: { "Content-Type": "text/html", ...NO_CACHE },
       });
     }
+    // Projects directory — lists all orgs with public permissions
+    if (url.pathname === "/projects" || url.pathname === "/projects.html") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "projects.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
+
     // LLM / crawler discovery files
     if (url.pathname === "/robots.txt") {
       const base = `${url.protocol}//${url.host}`;
@@ -763,7 +770,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const base = `${url.protocol}//${url.host}`;
       const now = new Date().toISOString().split("T")[0];
       return new Response(
-        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
+        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/projects</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
         { headers: { "Content-Type": "application/xml; charset=utf-8" } },
       );
     }
@@ -923,6 +930,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const apiPath = url.pathname.slice(7); // removes "/api/v1"
     const segments = apiPath.replace(/^\//, "").split("/");
     const [collection, id, sub, version, subsub] = segments;
+
+    // /api/v1/projects — public, no auth: list all orgs with principal='*' permissions
+    if (collection === "projects" && !id && req.method === "GET") {
+      return handleListProjects(url);
+    }
 
     // /api/v1/orgs/{slug}/... — context-aware: auth optional
     // llms.txt: serves public context if no session, full context if authenticated
@@ -1665,6 +1677,61 @@ async function handleGetAssetRaw(schemaName: string, collection: string, docId: 
 }
 
 // ── Public collection access (no auth required — gated by principal='*' rules) ──
+
+async function handleListProjects(url: URL): Promise<Response> {
+  // Find all orgs with at least one principal='*' permission, grouped by org.
+  const rows = await sql<{
+    org_id: string; slug: string; name: string; resource: string; access: string;
+    label_filter: string | null;
+  }[]>`
+    SELECT p.org_id, s.slug, u.name, p.resource, p.access, p.label_filter
+    FROM common.permissions p
+    JOIN common.org_slugs s ON s.org_id = p.org_id
+    JOIN "user" u ON u.id = p.org_id
+    WHERE p.principal = '*'
+    ORDER BY u.name, p.resource
+  `;
+
+  // Group by org
+  const byOrg = new Map<string, {
+    name: string; slug: string;
+    collections: { name: string; access: string; labelFilter: string | null }[];
+    trees: { name: string }[];
+  }>();
+  for (const r of rows) {
+    if (!byOrg.has(r.org_id)) {
+      byOrg.set(r.org_id, { name: r.name, slug: r.slug, collections: [], trees: [] });
+    }
+    const org = byOrg.get(r.org_id)!;
+    const [kind, name] = r.resource.split(":");
+    if (kind === "collection") {
+      org.collections.push({ name, access: r.access, labelFilter: r.label_filter });
+    } else if (kind === "tree") {
+      org.trees.push({ name });
+    }
+  }
+
+  const base = `${url.protocol}//${url.host}`;
+  const projects = [...byOrg.values()].map(org => ({
+    name: org.name,
+    slug: org.slug,
+    url: `${base}/api/v1/orgs/${org.slug}`,
+    collections: org.collections.map(c => ({
+      name: c.name,
+      access: c.access,
+      labelFilter: c.labelFilter,
+      url: `${base}/api/v1/orgs/${org.slug}/${c.name}`,
+    })),
+    trees: org.trees.map(t => ({
+      name: t.name,
+      url: `${base}/api/v1/orgs/${org.slug}/tree/${t.name}?full=true`,
+    })),
+  }));
+
+  return Response.json({ projects }, {
+    headers: { "Cache-Control": "public, max-age=60, stale-while-revalidate=300" },
+  });
+}
 
 async function handlePublicCollectionRequest(
   slug: string,
