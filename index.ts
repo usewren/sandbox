@@ -1694,13 +1694,13 @@ async function handleListProjects(url: URL): Promise<Response> {
 
   // Group by org
   const byOrg = new Map<string, {
-    name: string; slug: string;
+    orgId: string; name: string; slug: string;
     collections: { name: string; access: string; labelFilter: string | null }[];
     trees: { name: string }[];
   }>();
   for (const r of rows) {
     if (!byOrg.has(r.org_id)) {
-      byOrg.set(r.org_id, { name: r.name, slug: r.slug, collections: [], trees: [] });
+      byOrg.set(r.org_id, { orgId: r.org_id, name: r.name, slug: r.slug, collections: [], trees: [] });
     }
     const org = byOrg.get(r.org_id)!;
     const [kind, name] = r.resource.split(":");
@@ -1711,21 +1711,42 @@ async function handleListProjects(url: URL): Promise<Response> {
     }
   }
 
+  // For each tree, check if it has an /index.html entry point (makes it a
+  // browsable site/app). Query all tenant schemas in one go per org.
   const base = `${url.protocol}//${url.host}`;
-  const projects = [...byOrg.values()].map(org => ({
-    name: org.name,
-    slug: org.slug,
-    url: `${base}/api/v1/orgs/${org.slug}`,
-    collections: org.collections.map(c => ({
-      name: c.name,
-      access: c.access,
-      labelFilter: c.labelFilter,
-      url: `${base}/api/v1/orgs/${org.slug}/${c.name}`,
-    })),
-    trees: org.trees.map(t => ({
-      name: t.name,
-      url: `${base}/api/v1/orgs/${org.slug}/tree/${t.name}?full=true`,
-    })),
+  const projects = await Promise.all([...byOrg.values()].map(async org => {
+    // Look up entry pages for all trees in this org's schema
+    const schemaName = sanitizeSchemaName(org.orgId);
+    let entryPaths: { tree: string; path: string }[] = [];
+    try {
+      entryPaths = await withTenant(schemaName, async tx =>
+        tx<{ tree: string; path: string }[]>`
+          SELECT tree, path FROM paths
+          WHERE tree = ANY(${org.trees.map(t => t.name)})
+            AND path = '/index.html'
+        `
+      );
+    } catch { /* tenant may not exist */ }
+    const entrySet = new Set(entryPaths.map(e => e.tree));
+
+    return {
+      name: org.name,
+      slug: org.slug,
+      url: `${base}/api/v1/orgs/${org.slug}`,
+      collections: org.collections.map(c => ({
+        name: c.name,
+        access: c.access,
+        labelFilter: c.labelFilter,
+        url: `${base}/api/v1/orgs/${org.slug}/${c.name}`,
+      })),
+      trees: org.trees.map(t => ({
+        name: t.name,
+        url: `${base}/api/v1/orgs/${org.slug}/tree/${t.name}?full=true`,
+        entryUrl: entrySet.has(t.name)
+          ? `${base}/orgs/${org.slug}/tree/${t.name}/index.html`
+          : null,
+      })),
+    };
   }));
 
   return Response.json({ projects }, {
