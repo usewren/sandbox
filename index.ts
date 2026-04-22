@@ -751,6 +751,18 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         headers: { "Content-Type": "text/html", ...NO_CACHE },
       });
     }
+    // Deploy-focused tutorial
+    if (url.pathname === "/tutorial/deploy" || url.pathname === "/tutorial/deploy.html") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "tutorial-deploy.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
+    // A/B variant D — deploy-focused landing
+    if (url.pathname === "/d" || url.pathname === "/d.html") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "deploy.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
     // Projects directory — lists all orgs with public permissions
     if (url.pathname === "/projects" || url.pathname === "/projects.html") {
       return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "projects.html")), {
@@ -770,7 +782,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const base = `${url.protocol}//${url.host}`;
       const now = new Date().toISOString().split("T")[0];
       return new Response(
-        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/projects</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
+        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/deploy</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/d</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/projects</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
         { headers: { "Content-Type": "application/xml; charset=utf-8" } },
       );
     }
