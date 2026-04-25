@@ -2471,16 +2471,21 @@ async function handleTreeFull(schemaName: string, treeName: string, label?: stri
   }), PUBLIC_CACHE_HEADERS);
 }
 
-// Return true when the Accept header prefers a non-JSON content type over JSON.
-// Browsers send e.g. "text/html,*/*;q=0.8" — no explicit application/json → serve binary.
-// API clients that want JSON send "application/json" explicitly → serve JSON.
-// No Accept header or "*/*" only (bare curl) → serve JSON for backwards compat.
+// Return true when the response should be raw file bytes rather than the JSON
+// metadata envelope. The default is raw — callers who want metadata must send
+// `Accept: application/json` explicitly.
+//
+// This matches what every other static-file host does (S3, R2, Vercel, Netlify,
+// jsdelivr, GitHub raw). Without it, `<script src="…/tree/foo.js">`,
+// `<link href="…/tree/foo.css">`, `<img src="…/tree/foo.png">`, and ESM
+// `import './bar.js'` all break because browsers send `Accept: */*` and get
+// the JSON envelope instead of the file content.
 function shouldServeBinary(accept: string | null): boolean {
-  if (!accept) return false;
+  if (!accept) return true;
   const types = accept.split(",").map(p => p.trim().split(";")[0].trim());
   const hasJson = types.some(t => t === "application/json");
-  const hasSpecific = types.some(t => t !== "*/*" && t !== "application/*");
-  return hasSpecific && !hasJson;
+  // Explicit application/json → metadata envelope. Everything else → raw bytes.
+  return !hasJson;
 }
 
 async function handleTreeGet(schemaName: string, treeName: string, treePath: string, accept?: string | null, label?: string): Promise<Response> {
