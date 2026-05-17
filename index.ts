@@ -1103,8 +1103,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Determine required access level from method + sub-route
     let reqAccess: "read" | "write" | "admin" = "read";
-    if (id === "_schema" && sub === "validate") {
-      // Dry-run validation is read-only — it never mutates the schema or docs
+    if (id === "_query" && req.method === "POST") {
+      reqAccess = "read"; // queries are read-only
+    } else if (id === "_materialized") {
+      reqAccess = req.method === "GET" ? "read" : "admin";
+    } else if (id === "_schema" && sub === "validate") {
       reqAccess = "read";
     } else if (id === "_schema" && req.method !== "GET") {
       reqAccess = "admin";
@@ -1149,6 +1152,40 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
+    // Query endpoint: POST /{collection}/_query
+    // Filter + projection + aggregation in one call. Replaces the hand-built
+    // index-doc pattern.
+    if (id === "_query" && !sub && req.method === "POST") {
+      const r = await handleQuery(schemaName, collection, req, colAr);
+      audit(colAr, colResource, true, r.status);
+      return r;
+    }
+
+    // Materialized queries: persisted query results that auto-refresh on write
+    if (id === "_materialized") {
+      if (req.method === "GET" && !sub) {
+        const r = await handleListMaterialized(schemaName, collection);
+        audit(colAr, colResource, true, r.status);
+        return r;
+      }
+      if (req.method === "GET" && sub) {
+        const r = await handleGetMaterialized(schemaName, collection, sub);
+        audit(colAr, colResource, true, r.status);
+        return filterResponse(r, colAr);
+      }
+      if (req.method === "PUT" && sub) {
+        const r = await handleSetMaterialized(schemaName, collection, sub, req, user.userId);
+        audit(colAr, colResource, false, r.status);
+        return r;
+      }
+      if (req.method === "DELETE" && sub) {
+        const r = await handleDeleteMaterialized(schemaName, collection, sub);
+        audit(colAr, colResource, false, r.status);
+        return r;
+      }
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
     // Natural-key routes: GET|PUT|DELETE /{collection}/by-key/{keyValue}
     // Upsert-by-key is the headline — a single transactional call replaces
     // the list-then-find-then-put idiom that every ingestion client
@@ -1169,6 +1206,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         audit(colAr, colResource, false, res.status);
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
+          refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
         }
         return res;
       }
@@ -1177,6 +1215,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         audit(colAr, colResource, false, res.status);
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
+          refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
         }
         return res;
       }
@@ -1213,6 +1252,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       // list URLs since the doc appears in them.
       if (r.status < 400) {
         purgeForCollection(orgId, collection).catch(() => {});
+        refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
       }
       return r;
     }
@@ -1226,6 +1266,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
+        refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
       }
       return r;
     }
@@ -1236,6 +1277,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
+        refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
       }
       return r;
     }
@@ -1296,6 +1338,157 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 // Handlers
 // -------------------------------------------------------
 
+// ── Query helpers ────────────────────────────────────────────────────────────
+
+const SAFE_PATH = /^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$/;
+const SAFE_ARRAY_PATH = /^[a-zA-Z_][a-zA-Z0-9_]*(\[\])?(\.([a-zA-Z_][a-zA-Z0-9_]*)(\[\])?)*$/;
+const MAX_SELECT_FIELDS = 20;
+const MAX_METRICS = 10;
+const MAX_UNNEST_DEPTH = 4;
+const QUERY_TIMEOUT_MS = 5000;
+
+/** Parse and validate ?select= paths (top-level or dot-path, no arrays). */
+function parseSelectPaths(raw: string | null): string[] | null {
+  if (!raw) return null;
+  const paths = raw.split(",").map(p => p.trim()).filter(Boolean);
+  if (paths.length === 0) return null;
+  if (paths.length > MAX_SELECT_FIELDS) throw new Error(`Maximum ${MAX_SELECT_FIELDS} select fields`);
+  for (const p of paths) {
+    if (!SAFE_PATH.test(p)) throw new Error(`Invalid select path: ${p}`);
+  }
+  return paths;
+}
+
+/** Parse paths that may include [] for array unnest (used by _query). */
+function parseArrayPaths(paths: string[]): string[] {
+  for (const p of paths) {
+    if (!SAFE_ARRAY_PATH.test(p)) throw new Error(`Invalid path: ${p}`);
+    const depth = (p.match(/\[\]/g) || []).length;
+    if (depth > MAX_UNNEST_DEPTH) throw new Error(`Path nesting too deep (max ${MAX_UNNEST_DEPTH}): ${p}`);
+  }
+  return paths;
+}
+
+/**
+ * Build a SQL expression for JSONB field projection.
+ * Input: validated paths like ["name", "report.city", "startDate"]
+ * Output: SQL string like `jsonb_build_object('name', v.data->'name', 'report.city', v.data #> '{report,city}', ...)`
+ *
+ * Safety: paths are validated against SAFE_PATH before this function is called.
+ */
+function buildProjectionSql(paths: string[]): string {
+  const pairs = paths.map(p => {
+    const segments = p.split(".");
+    const key = `'${p}'`; // safe: validated against /^[a-zA-Z0-9_.]+$/
+    const val = segments.length === 1
+      ? `v.data->'${segments[0]}'`
+      : `v.data #> '{${segments.join(",")}}'`;
+    return `${key}, ${val}`;
+  });
+  return `jsonb_build_object(${pairs.join(", ")})`;
+}
+
+/**
+ * Compile an array path with [] segments into LATERAL join clauses and a leaf expression.
+ * Input: "report.divisions[].categories[].ranked[].gmsId"
+ * Output: { laterals: [...SQL CROSS JOIN LATERAL clauses], leaf: "_u2.val->>'gmsId'" }
+ */
+function compileArrayPath(path: string): { laterals: string[]; leaf: string; leafJsonb: string } {
+  const segments = path.split(".");
+  const laterals: string[] = [];
+  let currentExpr = "v.data";
+  let aliasCounter = 0;
+  let leafField: string | null = null;
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.endsWith("[]")) {
+      const key = seg.slice(0, -2);
+      const alias = `_u${aliasCounter++}`;
+      const source = currentExpr === "v.data"
+        ? `v.data->'${key}'`
+        : `${currentExpr}->'${key}'`;
+      laterals.push(`CROSS JOIN LATERAL jsonb_array_elements(${source}) AS ${alias}(val)`);
+      currentExpr = `${alias}.val`;
+    } else if (i === segments.length - 1) {
+      // Leaf field after the last array
+      leafField = seg;
+    } else {
+      // Intermediate object traversal (no [])
+      currentExpr = currentExpr === "v.data"
+        ? `v.data->'${seg}'`
+        : `${currentExpr}->'${seg}'`;
+    }
+  }
+
+  const leaf = leafField ? `${currentExpr}->>'${leafField}'` : `${currentExpr}`;
+  const leafJsonb = leafField ? `${currentExpr}->'${leafField}'` : currentExpr;
+  return { laterals, leaf, leafJsonb };
+}
+
+// Whitelist of operators for the where clause compiler
+const WHERE_OPS: Record<string, string> = {
+  ":": "=", "=": "=", "!=": "!=",
+  ">": ">", ">=": ">=", "<": "<", "<=": "<=",
+  "~*": "~*", "!~*": "!~*", "@>": "@>",
+};
+
+/**
+ * Compile a simple filter expression to a parameterized SQL WHERE clause.
+ * Grammar: path operator value, optionally joined by AND / OR.
+ * Returns { sql: string, params: unknown[] }.
+ */
+function compileWhere(where: string): { sql: string; params: unknown[] } {
+  const params: unknown[] = [];
+  // Split on AND/OR while preserving the operator
+  const parts = where.split(/\s+(AND|OR)\s+/i);
+  const sqlParts: string[] = [];
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i].trim();
+    if (part.toUpperCase() === "AND") { sqlParts.push("AND"); continue; }
+    if (part.toUpperCase() === "OR") { sqlParts.push("OR"); continue; }
+
+    // Parse: path operator value
+    // Try multi-char operators first, then single-char
+    let matched = false;
+    for (const op of ["!=", ">=", "<=", "~*", "!~*", "@>", ":", "=", ">", "<"]) {
+      const idx = part.indexOf(op);
+      if (idx > 0) {
+        const path = part.slice(0, idx).trim();
+        const value = part.slice(idx + op.length).trim();
+        if (!SAFE_PATH.test(path)) throw new Error(`Invalid filter path: ${path}`);
+        const sqlOp = WHERE_OPS[op];
+        const segments = path.split(".");
+        const jsonPath = segments.length === 1
+          ? `v.data->>'${segments[0]}'`
+          : `v.data #>> '{${segments.join(",")}}'`;
+
+        if (op === "@>") {
+          // Containment operator: value should be JSON
+          const jsonSegments = segments.length === 1 ? `v.data->'${segments[0]}'` : `v.data #> '{${segments.join(",")}'`;
+          params.push(value);
+          sqlParts.push(`${jsonSegments} @> $${params.length}::jsonb`);
+        } else if ([">", ">=", "<", "<="].includes(op)) {
+          // Numeric comparison
+          params.push(parseFloat(value) || value);
+          sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
+        } else {
+          // String comparison
+          const cleanValue = value.replace(/^['"]|['"]$/g, ""); // strip quotes
+          params.push(cleanValue);
+          sqlParts.push(`${jsonPath} ${sqlOp} $${params.length}`);
+        }
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) throw new Error(`Invalid filter expression: ${part}`);
+  }
+
+  return { sql: sqlParts.join(" "), params };
+}
+
 async function handleList(
   schemaName: string,
   collection: string,
@@ -1308,46 +1501,82 @@ async function handleList(
   // ?label= on the URL takes precedence over the permission label filter
   const effectiveLabel = url.searchParams.get("label") ?? labelFilter;
 
+  // ?select= field projection
+  let selectPaths: string[] | null = null;
+  try {
+    selectPaths = parseSelectPaths(url.searchParams.get("select"));
+  } catch (e) {
+    return Response.json({ error: (e as Error).message }, { status: 400 });
+  }
+
+  // ?where= SQL-level filter
+  let whereClause: { sql: string; params: unknown[] } | null = null;
+  const whereParam = url.searchParams.get("where");
+  if (whereParam) {
+    try {
+      whereClause = compileWhere(whereParam);
+    } catch (e) {
+      return Response.json({ error: (e as Error).message }, { status: 400 });
+    }
+  }
+
+  const dataExpr = selectPaths ? buildProjectionSql(selectPaths) : "v.data";
+
+
   const [items, [{ total }]] = await withTenant(schemaName, async tx => {
     let rows: { id: string; version: number; data: unknown; created_at: Date; updated_at: Date; labels: string[] }[];
     if (effectiveLabel) {
-      // Only return documents that carry this label, at the labelled version
-      rows = await tx<typeof rows>`
-        SELECT d.id, lf.version, v.data, d.created_at, d.updated_at,
-               COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
-        FROM documents d
-        JOIN labels lf ON lf.document_id = d.id AND lf.label = ${effectiveLabel}
-        JOIN versions v ON v.document_id = d.id AND v.version = lf.version
-        LEFT JOIN labels l ON l.document_id = d.id
-        WHERE d.collection = ${collection} AND d.deleted_at IS NULL
-        GROUP BY d.id, lf.version, v.data, d.created_at, d.updated_at
-        ORDER BY d.created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
+      // Params: $1=label, $2=collection, $3=limit, $4=offset, then where params
+      const baseCount = 4;
+      const whereExtra = whereClause ? ` AND (${renum(whereClause.sql, baseCount)})` : "";
+      rows = await tx.unsafe<typeof rows>(
+        `SELECT d.id, lf.version, ${dataExpr} AS data, d.created_at, d.updated_at,
+                COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
+         FROM documents d
+         JOIN labels lf ON lf.document_id = d.id AND lf.label = $1
+         JOIN versions v ON v.document_id = d.id AND v.version = lf.version
+         LEFT JOIN labels l ON l.document_id = d.id
+         WHERE d.collection = $2 AND d.deleted_at IS NULL${whereExtra}
+         GROUP BY d.id, lf.version, v.data, d.created_at, d.updated_at
+         ORDER BY d.created_at DESC
+         LIMIT $3 OFFSET $4`,
+        [effectiveLabel, collection, limit, offset, ...(whereClause?.params ?? [])],
+      );
     } else {
-      rows = await tx<typeof rows>`
-        SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at,
-               COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
-        FROM documents d
-        JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
-        LEFT JOIN labels l ON l.document_id = d.id
-        WHERE d.collection = ${collection} AND d.deleted_at IS NULL
-        GROUP BY d.id, d.current_version, v.data, d.created_at, d.updated_at
-        ORDER BY d.created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
+      // Params: $1=collection, $2=limit, $3=offset, then where params
+      const baseCount = 3;
+      const whereExtra = whereClause ? ` AND (${renum(whereClause.sql, baseCount)})` : "";
+      rows = await tx.unsafe<typeof rows>(
+        `SELECT d.id, d.current_version AS version, ${dataExpr} AS data, d.created_at, d.updated_at,
+                COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
+         FROM documents d
+         JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+         LEFT JOIN labels l ON l.document_id = d.id
+         WHERE d.collection = $1 AND d.deleted_at IS NULL${whereExtra}
+         GROUP BY d.id, d.current_version, v.data, d.created_at, d.updated_at
+         ORDER BY d.created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [collection, limit, offset, ...(whereClause?.params ?? [])],
+      );
     }
+    // Count query — same where clause, different base param count
+    const countBaseParams = effectiveLabel ? 2 : 1;
+    const countWhere = whereClause ? ` AND (${renum(whereClause.sql, countBaseParams)})` : "";
+    const countParams = effectiveLabel ? [effectiveLabel, collection] : [collection];
     const count = effectiveLabel
-      ? await tx<{ total: string }[]>`
-          SELECT COUNT(*)::text AS total
-          FROM documents d
-          JOIN labels lf ON lf.document_id = d.id AND lf.label = ${effectiveLabel}
-          WHERE d.collection = ${collection} AND d.deleted_at IS NULL
-        `
-      : await tx<{ total: string }[]>`
-          SELECT COUNT(*)::text AS total FROM documents
-          WHERE collection = ${collection} AND deleted_at IS NULL
-        `;
+      ? await tx.unsafe<{ total: string }[]>(
+          `SELECT COUNT(*)::text AS total FROM documents d
+           JOIN labels lf ON lf.document_id = d.id AND lf.label = $1
+           JOIN versions v ON v.document_id = d.id AND v.version = lf.version
+           WHERE d.collection = $2 AND d.deleted_at IS NULL${countWhere}`,
+          [...countParams, ...(whereClause?.params ?? [])],
+        )
+      : await tx.unsafe<{ total: string }[]>(
+          `SELECT COUNT(*)::text AS total FROM documents d
+           JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+           WHERE d.collection = $1 AND d.deleted_at IS NULL${countWhere}`,
+          [...countParams, ...(whereClause?.params ?? [])],
+        );
     return [rows, count];
   });
 
@@ -1356,6 +1585,321 @@ async function handleList(
     items: items.map(r => ({ id: r.id, version: r.version, data: r.data, createdAt: r.created_at, updatedAt: r.updated_at, labels: r.labels })),
     total: parseInt(total),
   });
+}
+
+// ── Query API: POST /{collection}/_query ─────────────────────────────────────
+
+interface QueryRequest {
+  where?: string;
+  select?: string[];
+  aggregate?: {
+    groupBy?: string[];
+    metrics?: Record<string, Record<string, string>>;
+  };
+  label?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+async function handleQuery(
+  schemaName: string,
+  collection: string,
+  req: Request,
+  ar: AccessResult,
+): Promise<Response> {
+  let body: QueryRequest;
+  try {
+    body = await req.json() as QueryRequest;
+  } catch {
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  // Validate select paths
+  let selectPaths: string[] | null = null;
+  if (body.select) {
+    try {
+      if (body.select.length > MAX_SELECT_FIELDS) throw new Error(`Maximum ${MAX_SELECT_FIELDS} select fields`);
+      for (const p of body.select) {
+        if (!SAFE_PATH.test(p) && !SAFE_ARRAY_PATH.test(p)) throw new Error(`Invalid select path: ${p}`);
+      }
+      selectPaths = body.select;
+    } catch (e) {
+      return Response.json({ error: (e as Error).message }, { status: 400 });
+    }
+  }
+
+  // Validate aggregate
+  if (body.aggregate?.metrics) {
+    const metricCount = Object.keys(body.aggregate.metrics).length;
+    if (metricCount > MAX_METRICS) {
+      return Response.json({ error: `Maximum ${MAX_METRICS} metrics` }, { status: 400 });
+    }
+    try {
+      for (const [, def] of Object.entries(body.aggregate.metrics)) {
+        const path = def.count ?? def.countDistinct ?? def.sum ?? def.min ?? def.max ?? def.avg;
+        if (path) parseArrayPaths([path]);
+        if (def.by) parseArrayPaths([def.by]);
+      }
+      if (body.aggregate.groupBy) {
+        for (const g of body.aggregate.groupBy) {
+          if (g.startsWith("$")) continue; // pseudo-paths like $documentId
+          if (!SAFE_PATH.test(g) && !SAFE_ARRAY_PATH.test(g)) throw new Error(`Invalid groupBy path: ${g}`);
+        }
+      }
+    } catch (e) {
+      return Response.json({ error: (e as Error).message }, { status: 400 });
+    }
+  }
+
+  const effectiveLabel = ar.labelFilter ?? body.label;
+  const limit = Math.min(Math.max(body.limit ?? 100, 1), 1000);
+
+  // Compile the where clause
+  let whereClause: { sql: string; params: unknown[] } | null = null;
+  if (body.where) {
+    try { whereClause = compileWhere(body.where); }
+    catch (e) { return Response.json({ error: (e as Error).message }, { status: 400 }); }
+  }
+
+  // Cursor decoding — uses document id only (unique, avoids timestamp precision issues)
+  let cursorParams: unknown[] = [];
+  if (body.cursor) {
+    try {
+      const c = JSON.parse(Buffer.from(body.cursor, "base64url").toString());
+      cursorParams = [c.id];
+    } catch {
+      return Response.json({ error: "Invalid cursor" }, { status: 400 });
+    }
+  }
+
+  try {
+    const result = await withTenant(schemaName, async tx => {
+      await tx.unsafe(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}'`);
+
+      // ── Non-aggregate mode: return projected documents ──
+      if (!body.aggregate) {
+        const dataExpr = selectPaths ? buildProjectionSql(selectPaths) : "v.data";
+
+        // Build param list
+        const params: unknown[] = [];
+        let labelJoin = "";
+        let versionJoin: string;
+        if (effectiveLabel) {
+          params.push(effectiveLabel); // $1
+          labelJoin = `JOIN labels lf ON lf.document_id = d.id AND lf.label = $1`;
+          versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = lf.version`;
+        } else {
+          versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = d.current_version`;
+        }
+        params.push(collection); // $2 or $1
+        const collParam = `$${params.length}`;
+
+        // Where clause
+        const baseCount = params.length;
+        let extraWhere = "";
+        if (whereClause) {
+          extraWhere = ` AND (${renum(whereClause.sql, baseCount)})`;
+          params.push(...whereClause.params);
+        }
+
+        // Cursor (id-based for timestamp-precision safety)
+        if (cursorParams.length) {
+          params.push(...cursorParams);
+          const idParam = `$${params.length}`;
+          extraWhere += ` AND d.id < ${idParam}`;
+        }
+
+        params.push(limit + 1); // over-fetch by 1 for cursor
+        const limitParam = `$${params.length}`;
+
+        const sql = `
+          SELECT d.id, ${effectiveLabel ? "lf.version" : "d.current_version AS version"},
+                 ${dataExpr} AS data, d.created_at, d.updated_at
+          FROM documents d
+          ${labelJoin}
+          ${versionJoin}
+          WHERE d.collection = ${collParam} AND d.deleted_at IS NULL${extraWhere}
+          ORDER BY d.created_at DESC, d.id DESC
+          LIMIT ${limitParam}`;
+
+        const rows = await tx.unsafe<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date }[]>(sql, params);
+
+        const hasMore = rows.length > limit;
+        const items = (hasMore ? rows.slice(0, limit) : rows).map(r => ({
+          id: r.id, version: r.version, data: r.data,
+          createdAt: r.created_at, updatedAt: r.updated_at,
+        }));
+
+        const nextCursor = hasMore
+          ? Buffer.from(JSON.stringify({ id: items[items.length - 1].id })).toString("base64url")
+          : null;
+
+        return { items, cursor: nextCursor };
+      }
+
+      // ── Aggregate mode ──
+      const agg = body.aggregate;
+      const metrics = agg.metrics ?? {};
+      const groupBy = agg.groupBy ?? ["$documentId"];
+
+      // Build the base CTE: join documents + versions, apply label + where
+      const params: unknown[] = [];
+      let labelJoin = "";
+      let versionJoin: string;
+      if (effectiveLabel) {
+        params.push(effectiveLabel);
+        labelJoin = `JOIN labels lf ON lf.document_id = d.id AND lf.label = $1`;
+        versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = lf.version`;
+      } else {
+        versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = d.current_version`;
+      }
+      params.push(collection);
+      const collParam = `$${params.length}`;
+
+      const baseCount = params.length;
+      let extraWhere = "";
+      if (whereClause) {
+        extraWhere = ` AND (${renum(whereClause.sql, baseCount)})`;
+        params.push(...whereClause.params);
+      }
+
+      // Collect all array paths that need LATERAL unnesting
+      const allLaterals: string[] = [];
+      const metricExprs: string[] = [];
+      const metricNames: string[] = [];
+      let lateralIdx = 0;
+
+      for (const [name, def] of Object.entries(metrics)) {
+        const op = Object.keys(def).find(k => k !== "by") as string;
+        const path = def[op];
+        if (!path) continue;
+
+        const compiled = compileArrayPath(path);
+        // Merge laterals (deduplicate by checking if already added)
+        for (const lat of compiled.laterals) {
+          if (!allLaterals.includes(lat)) allLaterals.push(lat);
+        }
+
+        const leaf = compiled.leaf;
+        switch (op) {
+          case "count":        metricExprs.push(`COUNT(${leaf}) AS "${name}"`); break;
+          case "countDistinct": metricExprs.push(`COUNT(DISTINCT ${leaf}) AS "${name}"`); break;
+          case "sum":          metricExprs.push(`SUM((${leaf})::numeric) AS "${name}"`); break;
+          case "min":          metricExprs.push(`MIN(${leaf}) AS "${name}"`); break;
+          case "max":          metricExprs.push(`MAX(${leaf}) AS "${name}"`); break;
+          case "avg":          metricExprs.push(`AVG((${leaf})::numeric) AS "${name}"`); break;
+        }
+        metricNames.push(name);
+      }
+
+      // Build groupBy expressions
+      const groupExprs: string[] = [];
+      const selectGroupExprs: string[] = [];
+      for (const g of groupBy) {
+        if (g === "$documentId") {
+          groupExprs.push("d.id");
+          selectGroupExprs.push("d.id AS doc_id");
+        } else if (g === "$path") {
+          // LEFT JOIN paths for $path grouping
+          groupExprs.push("p.path");
+          selectGroupExprs.push("p.path AS doc_path");
+        } else if (g === "$collection") {
+          groupExprs.push("d.collection");
+          selectGroupExprs.push("d.collection");
+        } else {
+          // JSON field path
+          const segments = g.split(".");
+          const expr = segments.length === 1
+            ? `v.data->>'${segments[0]}'`
+            : `v.data #>> '{${segments.join(",")}}'`;
+          groupExprs.push(expr);
+          selectGroupExprs.push(`${expr} AS "${g}"`);
+        }
+      }
+
+      const needsPathJoin = groupBy.includes("$path");
+      const pathJoin = needsPathJoin ? "LEFT JOIN paths p ON p.document_id = d.id" : "";
+
+      // Also add select projection fields if present
+      if (selectPaths) {
+        for (const sp of selectPaths) {
+          const segments = sp.split(".");
+          const expr = segments.length === 1
+            ? `v.data->>'${segments[0]}'`
+            : `v.data #>> '{${segments.join(",")}}'`;
+          if (!groupExprs.includes(expr)) {
+            groupExprs.push(expr);
+            selectGroupExprs.push(`${expr} AS "${sp}"`);
+          }
+        }
+      }
+
+      params.push(limit);
+      const limitParam = `$${params.length}`;
+
+      const sql = `
+        SELECT ${[...selectGroupExprs, ...metricExprs].join(", ")}
+        FROM documents d
+        ${labelJoin}
+        ${versionJoin}
+        ${pathJoin}
+        ${allLaterals.join("\n        ")}
+        WHERE d.collection = ${collParam} AND d.deleted_at IS NULL${extraWhere}
+        GROUP BY ${groupExprs.join(", ")}
+        ORDER BY ${groupExprs[0]} ASC
+        LIMIT ${limitParam}`;
+
+      const rows = await tx.unsafe<Record<string, unknown>[]>(sql, params);
+
+      return {
+        rows: rows.map(r => {
+          const key: Record<string, unknown> = {};
+          for (const g of groupBy) {
+            if (g === "$documentId") key.$documentId = r.doc_id;
+            else if (g === "$path") key.$path = r.doc_path;
+            else if (g === "$collection") key.$collection = r.collection;
+            else key[g] = r[g];
+          }
+          // Include select fields in the row
+          if (selectPaths) {
+            for (const sp of selectPaths) {
+              key[sp] = r[sp];
+            }
+          }
+          const metricValues: Record<string, unknown> = {};
+          for (const name of metricNames) {
+            const val = r[name];
+            metricValues[name] = typeof val === "string" ? parseFloat(val) || val : val;
+          }
+          return { key, ...metricValues };
+        }),
+      };
+    });
+
+    // Apply permission filterExpr post-query if needed
+    if (ar.filterExpr && ar.filterLang && result.items) {
+      result.items = await Promise.all(
+        result.items.map(async (item: { data: unknown }) => ({
+          ...item,
+          data: await applyDataFilter(item.data, ar.filterLang!, ar.filterExpr!),
+        }))
+      );
+    }
+
+    return Response.json(result);
+  } catch (e) {
+    const msg = (e as Error).message ?? String(e);
+    if (msg.includes("statement timeout")) {
+      return Response.json({ error: "Query timed out (max 5s). Try narrowing the filter or adding indexes." }, { status: 408 });
+    }
+    console.error("[query]", msg);
+    return Response.json({ error: "Query failed: " + msg }, { status: 500 });
+  }
+}
+
+// Helper: offset $N placeholders (used by handleQuery and handleList)
+function renum(sql: string, offset: number): string {
+  return sql.replace(/\$(\d+)/g, (_, n) => `$${parseInt(n) + offset}`);
 }
 
 async function getCollectionType(schemaName: string, collection: string): Promise<"json" | "binary"> {
@@ -2311,8 +2855,8 @@ async function handleDocumentPaths(schemaName: string, collection: string, id: s
 
 async function handleGetSchema(schemaName: string, collection: string): Promise<Response> {
   const rows = await withTenant(schemaName, async tx =>
-    tx<{ schema: unknown; display_name: string | null; collection_type: string; list_columns: string[] | null; natural_key: string | null; updated_at: Date }[]>`
-      SELECT schema, display_name, collection_type, list_columns, natural_key, updated_at FROM collection_schemas WHERE collection = ${collection}
+    tx<{ schema: unknown; display_name: string | null; collection_type: string; list_columns: string[] | null; natural_key: string | null; indexes: unknown; updated_at: Date }[]>`
+      SELECT schema, display_name, collection_type, list_columns, natural_key, COALESCE(indexes, '[]'::jsonb) AS indexes, updated_at FROM collection_schemas WHERE collection = ${collection}
     `
   );
   if (rows.length === 0) return Response.json({ error: "Not found" }, { status: 404 });
@@ -2323,19 +2867,95 @@ async function handleGetSchema(schemaName: string, collection: string): Promise<
     displayName:    rows[0].display_name ?? null,
     listColumns:    rows[0].list_columns ?? null,
     naturalKey:     rows[0].natural_key ?? null,
+    indexes:        rows[0].indexes ?? [],
     updatedAt:      rows[0].updated_at,
   });
+}
+
+// Index declaration types and helpers
+interface IndexDeclaration {
+  path: string;
+  kind: "btree" | "gin" | "trigram";
+}
+
+const VALID_INDEX_KINDS = new Set(["btree", "gin", "trigram"]);
+const MAX_INDEXES = 10;
+
+function validateIndexDeclarations(raw: unknown): IndexDeclaration[] {
+  if (!Array.isArray(raw)) throw new Error("indexes must be an array");
+  if (raw.length > MAX_INDEXES) throw new Error(`Maximum ${MAX_INDEXES} indexes per collection`);
+  return raw.map((item: unknown) => {
+    const i = item as Record<string, unknown>;
+    if (!i.path || typeof i.path !== "string") throw new Error("Each index needs a path");
+    if (!i.kind || !VALID_INDEX_KINDS.has(i.kind as string)) throw new Error(`Invalid index kind: ${i.kind}. Must be btree, gin, or trigram`);
+    if (!SAFE_PATH.test(i.path) && !SAFE_ARRAY_PATH.test(i.path)) throw new Error(`Invalid index path: ${i.path}`);
+    return { path: i.path as string, kind: i.kind as IndexDeclaration["kind"] };
+  });
+}
+
+function indexName(collection: string, idx: IndexDeclaration): string {
+  // Create a deterministic, safe index name from collection + path + kind
+  const hash = collection.replace(/[^a-z0-9]/gi, "_") + "_" +
+    idx.path.replace(/[^a-z0-9]/gi, "_") + "_" + idx.kind;
+  return `idx_q_${hash}`.slice(0, 63); // Postgres name limit
+}
+
+function buildIndexDDL(collection: string, idx: IndexDeclaration, name: string): string {
+  const segments = idx.path.replace(/\[\]/g, "").split(".");
+  const jsonExpr = segments.length === 1
+    ? `(data->>'${segments[0]}')`
+    : `(data #>> '{${segments.join(",")}}')`;
+  const jsonbExpr = segments.length === 1
+    ? `(data->'${segments[0]}')`
+    : `(data #> '{${segments.join(",")}}')`;
+
+  // Simple indexes on the versions table — no partial WHERE (avoids subquery issues)
+  switch (idx.kind) {
+    case "btree":
+      return `CREATE INDEX IF NOT EXISTS "${name}" ON versions (${jsonExpr})`;
+    case "gin":
+      return `CREATE INDEX IF NOT EXISTS "${name}" ON versions USING GIN (${jsonbExpr} jsonb_path_ops)`;
+    case "trigram":
+      return `CREATE INDEX IF NOT EXISTS "${name}" ON versions USING GIN (${jsonExpr} gin_trgm_ops)`;
+  }
+}
+
+async function reconcileIndexes(
+  schemaName: string,
+  collection: string,
+  current: IndexDeclaration[],
+  desired: IndexDeclaration[],
+): Promise<void> {
+  const toCreate = desired.filter(d => !current.some(c => c.path === d.path && c.kind === d.kind));
+  const toDrop = current.filter(c => !desired.some(d => d.path === c.path && d.kind === c.kind));
+
+  for (const idx of toDrop) {
+    const name = indexName(collection, idx);
+    try { await sql.unsafe(`DROP INDEX IF EXISTS ${schemaName}.${name}`); }
+    catch (e) { console.error(`[index] failed to drop ${name}:`, e); }
+  }
+  for (const idx of toCreate) {
+    const name = indexName(collection, idx);
+    const ddl = buildIndexDDL(collection, idx, name);
+    try {
+      await sql.unsafe(`SET search_path TO ${schemaName}, common, public`);
+      if (idx.kind === "trigram") {
+        await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+      }
+      await sql.unsafe(ddl);
+    } catch (e) { console.error(`[index] failed to create ${name}:`, String(e).slice(0, 200)); }
+  }
 }
 
 async function handleSetSchema(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
   const body = await req.json() as Record<string, unknown>;
 
-  // Accept either a plain JSON Schema or a wrapper { schema?, displayName?, collectionType?, listColumns?, naturalKey? }
-  const isWrapper = body && typeof body === "object" && ("schema" in body || "collectionType" in body || "displayName" in body || "listColumns" in body || "naturalKey" in body);
+  // Accept either a plain JSON Schema or a wrapper { schema?, displayName?, collectionType?, listColumns?, naturalKey?, indexes? }
+  const isWrapper = body && typeof body === "object" && ("schema" in body || "collectionType" in body || "displayName" in body || "listColumns" in body || "naturalKey" in body || "indexes" in body);
   const collectionType: string =
     (isWrapper && typeof body.collectionType === "string") ? body.collectionType : "json";
   const schema = collectionType === "binary"
-    ? {}   // binary collections don't need a JSON Schema
+    ? {}
     : (isWrapper ? body.schema : body) ?? {};
   const displayName: string | null =
     (isWrapper && typeof body.displayName === "string") ? body.displayName : null;
@@ -2343,35 +2963,58 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
     (isWrapper && Array.isArray(body.listColumns) && body.listColumns.length > 0)
       ? (body.listColumns as string[]).filter(c => typeof c === "string" && c.trim())
       : null;
-  // Natural key: the top-level field name in document data whose value
-  // becomes the addressable identity. Explicit null or empty string clears it.
   const naturalKey: string | null =
     (isWrapper && typeof body.naturalKey === "string" && body.naturalKey.trim())
       ? body.naturalKey.trim()
       : null;
+
+  // Index declarations
+  let indexes: IndexDeclaration[] = [];
+  if (isWrapper && "indexes" in body) {
+    try { indexes = validateIndexDeclarations(body.indexes); }
+    catch (e) { return Response.json({ error: (e as Error).message }, { status: 400 }); }
+  }
 
   if (collectionType !== "binary") {
     try { ajv.compile(schema as object); }
     catch (e) { return Response.json({ error: "Invalid JSON Schema", details: String(e) }, { status: 422 }); }
   }
 
+  // Get current indexes before upsert (for reconciliation)
+  let currentIndexes: IndexDeclaration[] = [];
+  if (isWrapper && "indexes" in body) {
+    try {
+      const rows = await withTenant(schemaName, async tx =>
+        tx<{ indexes: IndexDeclaration[] }[]>`SELECT COALESCE(indexes, '[]'::jsonb) AS indexes FROM collection_schemas WHERE collection = ${collection}`
+      );
+      currentIndexes = rows[0]?.indexes ?? [];
+    } catch { /* collection doesn't exist yet */ }
+  }
+
   await withTenant(schemaName, async tx => {
     await tx`
-      INSERT INTO collection_schemas (collection, schema, display_name, collection_type, list_columns, natural_key, created_by)
-      VALUES (${collection}, ${tx.json(schema)}, ${displayName}, ${collectionType}, ${listColumns}, ${naturalKey}, ${userId})
+      INSERT INTO collection_schemas (collection, schema, display_name, collection_type, list_columns, natural_key, indexes, created_by)
+      VALUES (${collection}, ${tx.json(schema)}, ${displayName}, ${collectionType}, ${listColumns}, ${naturalKey}, ${tx.json(indexes)}, ${userId})
       ON CONFLICT (collection) DO UPDATE
         SET schema          = EXCLUDED.schema,
             display_name    = EXCLUDED.display_name,
             collection_type = EXCLUDED.collection_type,
             list_columns    = EXCLUDED.list_columns,
             natural_key     = EXCLUDED.natural_key,
+            indexes         = EXCLUDED.indexes,
             updated_at      = NOW()
     `;
   });
-  // Invalidate the in-memory natural-key config cache for this collection
-  // since the schema just changed.
+
+  // Reconcile Postgres indexes outside the transaction (CREATE INDEX CONCURRENTLY can't run inside one)
+  if (isWrapper && "indexes" in body) {
+    reconcileIndexes(schemaName, collection, currentIndexes, indexes).catch(e => {
+      console.error("[index] reconciliation failed:", e);
+    });
+  }
+
   naturalKeyCache.delete(`${schemaName}:${collection}`);
-  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns, naturalKey });
+  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns, naturalKey, indexes });
 }
 
 async function handleDeleteSchema(schemaName: string, collection: string): Promise<Response> {
@@ -2382,6 +3025,235 @@ async function handleDeleteSchema(schemaName: string, collection: string): Promi
   );
   if (rows.length === 0) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ collection, deleted: true });
+}
+
+// ── Materialized queries ─────────────────────────────────────────────────────
+
+const MAX_MATERIALIZED_PER_COLLECTION = 5;
+
+async function handleListMaterialized(schemaName: string, collection: string): Promise<Response> {
+  const rows = await withTenant(schemaName, async tx =>
+    tx<{ name: string; refresh_on: string; result_doc_id: string | null; created_at: Date; updated_at: Date }[]>`
+      SELECT name, refresh_on, result_doc_id, created_at, updated_at
+      FROM materialized_queries WHERE collection = ${collection} ORDER BY name
+    `
+  );
+  return Response.json({
+    collection,
+    materialized: rows.map(r => ({
+      name: r.name, refreshOn: r.refresh_on, resultDocId: r.result_doc_id,
+      createdAt: r.created_at, updatedAt: r.updated_at,
+    })),
+  });
+}
+
+async function handleGetMaterialized(schemaName: string, collection: string, name: string): Promise<Response> {
+  const mq = await withTenant(schemaName, async tx => {
+    const rows = await tx<{ result_doc_id: string | null }[]>`
+      SELECT result_doc_id FROM materialized_queries WHERE collection = ${collection} AND name = ${name}
+    `;
+    return rows[0] ?? null;
+  });
+  if (!mq) return Response.json({ error: "Not found" }, { status: 404 });
+  if (!mq.result_doc_id) return Response.json({ error: "Materialized query has no result yet" }, { status: 404 });
+
+  // Read the result document
+  const doc = await withTenant(schemaName, async tx => {
+    const rows = await tx<{ id: string; version: number; data: unknown; created_at: Date; updated_at: Date }[]>`
+      SELECT d.id, d.current_version AS version, v.data, d.created_at, d.updated_at
+      FROM documents d
+      JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+      WHERE d.id = ${mq.result_doc_id} AND d.deleted_at IS NULL
+    `;
+    return rows[0] ?? null;
+  });
+  if (!doc) return Response.json({ error: "Result document not found" }, { status: 404 });
+
+  return Response.json({
+    collection, name,
+    result: { id: doc.id, version: doc.version, data: doc.data, createdAt: doc.created_at, updatedAt: doc.updated_at },
+  });
+}
+
+async function handleSetMaterialized(
+  schemaName: string, collection: string, name: string, req: Request, userId: string,
+): Promise<Response> {
+  const body = await req.json() as { query: QueryRequest; refreshOn?: string };
+  if (!body.query) return Response.json({ error: "query is required" }, { status: 400 });
+  const refreshOn = body.refreshOn ?? "write";
+  if (!["write", "manual"].includes(refreshOn)) {
+    return Response.json({ error: "refreshOn must be 'write' or 'manual'" }, { status: 400 });
+  }
+  if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(name)) {
+    return Response.json({ error: "Invalid materialized query name" }, { status: 400 });
+  }
+
+  // Check limit
+  const existing = await withTenant(schemaName, async tx =>
+    tx<{ count: string }[]>`SELECT COUNT(*)::text AS count FROM materialized_queries WHERE collection = ${collection}`
+  );
+  if (parseInt(existing[0]?.count ?? "0") >= MAX_MATERIALIZED_PER_COLLECTION) {
+    const mq = await withTenant(schemaName, async tx =>
+      tx<{ id: string }[]>`SELECT id FROM materialized_queries WHERE collection = ${collection} AND name = ${name}`
+    );
+    if (!mq.length) {
+      return Response.json({ error: `Maximum ${MAX_MATERIALIZED_PER_COLLECTION} materialized queries per collection` }, { status: 400 });
+    }
+  }
+
+  // Create or reuse the result document
+  let resultDocId: string;
+  const mqRow = await withTenant(schemaName, async tx => {
+    const rows = await tx<{ result_doc_id: string | null }[]>`
+      SELECT result_doc_id FROM materialized_queries WHERE collection = ${collection} AND name = ${name}
+    `;
+    return rows[0] ?? null;
+  });
+
+  if (mqRow?.result_doc_id) {
+    resultDocId = mqRow.result_doc_id;
+  } else {
+    // Create a placeholder document in a synthetic collection
+    const syntheticCollection = `${collection}/_materialized`;
+    const doc = await withTenant(schemaName, async tx => {
+      const [row] = await tx<{ id: string }[]>`
+        INSERT INTO documents (collection, current_version, created_by)
+        VALUES (${syntheticCollection}, 0, ${userId})
+        RETURNING id
+      `;
+      return row;
+    });
+    resultDocId = doc.id;
+  }
+
+  // Upsert the materialized query definition
+  await withTenant(schemaName, async tx => {
+    await tx`
+      INSERT INTO materialized_queries (collection, name, query, refresh_on, result_doc_id, created_by)
+      VALUES (${collection}, ${name}, ${tx.json(body.query)}, ${refreshOn}, ${resultDocId}, ${userId})
+      ON CONFLICT (collection, name) DO UPDATE
+        SET query = EXCLUDED.query,
+            refresh_on = EXCLUDED.refresh_on,
+            result_doc_id = COALESCE(materialized_queries.result_doc_id, EXCLUDED.result_doc_id),
+            updated_at = NOW()
+    `;
+  });
+
+  // Execute the query immediately to populate the first result
+  refreshMaterializedQuery(schemaName, collection, name, userId).catch(e => {
+    console.error(`[materialized] initial refresh of ${collection}/${name} failed:`, e);
+  });
+
+  return Response.json({ collection, name, refreshOn, resultDocId }, { status: 200 });
+}
+
+async function handleDeleteMaterialized(schemaName: string, collection: string, name: string): Promise<Response> {
+  const rows = await withTenant(schemaName, async tx =>
+    tx<{ id: string }[]>`
+      DELETE FROM materialized_queries WHERE collection = ${collection} AND name = ${name} RETURNING id
+    `
+  );
+  if (rows.length === 0) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ collection, name, deleted: true });
+}
+
+/**
+ * Execute a materialized query's definition and store the result as a new version
+ * of its result document.
+ */
+async function refreshMaterializedQuery(
+  schemaName: string, sourceCollection: string, name: string, userId: string,
+): Promise<void> {
+  const mq = await withTenant(schemaName, async tx => {
+    const rows = await tx<{ query: QueryRequest; result_doc_id: string }[]>`
+      SELECT query, result_doc_id FROM materialized_queries
+      WHERE collection = ${sourceCollection} AND name = ${name} AND result_doc_id IS NOT NULL
+    `;
+    return rows[0] ?? null;
+  });
+  if (!mq) return;
+
+  // Execute the query using the same engine as handleQuery but without permissions
+  // (materialized queries run as a system operation)
+  const queryResult = await withTenant(schemaName, async tx => {
+    await tx.unsafe(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}'`);
+    const q = mq.query;
+    const effectiveLabel = q.label;
+    const limit = Math.min(q.limit ?? 10000, 10000);
+    const selectPaths = q.select ?? null;
+    const dataExpr = selectPaths ? buildProjectionSql(selectPaths) : "v.data";
+
+    // Simple projection query (aggregation in materialized queries follows the same SQL patterns)
+    const params: unknown[] = [];
+    let labelJoin = "";
+    let versionJoin: string;
+    if (effectiveLabel) {
+      params.push(effectiveLabel);
+      labelJoin = `JOIN labels lf ON lf.document_id = d.id AND lf.label = $1`;
+      versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = lf.version`;
+    } else {
+      versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = d.current_version`;
+    }
+    params.push(sourceCollection);
+    const collParam = `$${params.length}`;
+
+    let extraWhere = "";
+    if (q.where) {
+      const wc = compileWhere(q.where);
+      extraWhere = ` AND (${renum(wc.sql, params.length)})`;
+      params.push(...wc.params);
+    }
+
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+
+    const sqlStr = `
+      SELECT d.id, ${effectiveLabel ? "lf.version" : "d.current_version AS version"},
+             ${dataExpr} AS data
+      FROM documents d ${labelJoin} ${versionJoin}
+      WHERE d.collection = ${collParam} AND d.deleted_at IS NULL${extraWhere}
+      ORDER BY d.created_at DESC
+      LIMIT ${limitParam}`;
+
+    return tx.unsafe<{ id: string; version: number; data: unknown }[]>(sqlStr, params);
+  });
+
+  // Store the result as a new version of the result document
+  const resultData = { items: queryResult.map(r => ({ id: r.id, version: r.version, data: r.data })), refreshedAt: new Date().toISOString() };
+  await withTenant(schemaName, async tx => {
+    const [doc] = await tx<{ current_version: number }[]>`
+      SELECT current_version FROM documents WHERE id = ${mq.result_doc_id}
+    `;
+    const newVersion = (doc?.current_version ?? 0) + 1;
+    await tx`
+      INSERT INTO versions (document_id, version, data, created_by)
+      VALUES (${mq.result_doc_id}, ${newVersion}, ${tx.json(resultData)}, ${userId})
+    `;
+    await tx`
+      UPDATE documents SET current_version = ${newVersion}, updated_at = NOW()
+      WHERE id = ${mq.result_doc_id}
+    `;
+  });
+}
+
+/**
+ * Fire-and-forget: refresh all materialized queries for a collection after a write.
+ */
+async function refreshMaterializedForCollection(
+  schemaName: string, collection: string, userId: string,
+): Promise<void> {
+  const mqs = await withTenant(schemaName, async tx =>
+    tx<{ name: string }[]>`
+      SELECT name FROM materialized_queries WHERE collection = ${collection} AND refresh_on = 'write'
+    `
+  );
+  for (const mq of mqs) {
+    try {
+      await refreshMaterializedQuery(schemaName, collection, mq.name, userId);
+    } catch (e) {
+      console.error(`[materialized] refresh of ${collection}/${mq.name} failed:`, e);
+    }
+  }
 }
 
 async function handleListCollections(schemaName: string): Promise<Response> {
