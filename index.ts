@@ -928,7 +928,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         const collection = rest[0];
         const id = rest[1];
         const subSeg = rest[2];
-        return handlePublicCollectionRequest(slug, collection, id, subSeg, url, req.headers.get("accept"));
+        return handlePublicCollectionRequest(slug, collection, id, subSeg, url, req.headers.get("accept"), req);
       }
       return Response.json({ error: "Not found" }, { status: 404 });
     }
@@ -952,10 +952,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // llms.txt: serves public context if no session, full context if authenticated
     // collection routes: public access gated by principal='*' permission rules
     if (collection === "orgs" && id) {
-      if (req.method !== "GET") return Response.json({ error: "Method not allowed" }, { status: 405 });
+      // Allow GET + POST (POST is needed for public _query)
+      if (req.method !== "GET" && req.method !== "POST") return Response.json({ error: "Method not allowed" }, { status: 405 });
       const optionalUser = await requireSession(req); // null = unauthenticated
       if (sub === "llms.txt") return handleOrgLlmsTxt(id, url, optionalUser);
-      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url, req.headers.get("accept"));
+      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url, req.headers.get("accept"), req);
       return Response.json({ error: "Not found" }, { status: 404 });
     }
 
@@ -2336,6 +2337,7 @@ async function handlePublicCollectionRequest(
   sub: string | undefined,
   url: URL,
   accept?: string | null,
+  req?: Request,
 ): Promise<Response> {
   // Resolve org from slug
   const slugRows = await sql<{ org_id: string }[]>`
@@ -2374,6 +2376,26 @@ async function handlePublicCollectionRequest(
   const resource = `collection:${collection}`;
   const ar = await checkAccess(orgId, "", "*", resource, "read");
   if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
+
+  // POST /orgs/{slug}/{collection}/_query — public anonymous query.
+  // Same query engine as the authenticated endpoint, gated by the principal='*'
+  // read rule. labelFilter/filterExpr from the permission apply automatically.
+  if (id === "_query" && !sub && req?.method === "POST") {
+    const r = await handleQuery(schemaName, collection, req, ar);
+    return withHeaders(r, PUBLIC_CACHE_HEADERS);
+  }
+
+  // GET /orgs/{slug}/{collection}/_materialized/{name} — public materialized result.
+  if (id === "_materialized" && sub && req?.method === "GET") {
+    const r = await handleGetMaterialized(schemaName, collection, sub);
+    return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
+  }
+
+  // GET /orgs/{slug}/{collection}/_materialized — list materialized queries.
+  if (id === "_materialized" && !sub && req?.method === "GET") {
+    const r = await handleListMaterialized(schemaName, collection);
+    return withHeaders(r, PUBLIC_CACHE_HEADERS);
+  }
 
   // GET /orgs/{slug}/{collection}/by-key/{keyValue} — public natural-key lookup.
   // Read-only; public mutations are never allowed regardless of how the rule
