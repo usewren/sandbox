@@ -1917,7 +1917,14 @@ async function handleQuery(
           const metricValues: Record<string, unknown> = {};
           for (const name of metricNames) {
             const val = r[name];
-            metricValues[name] = typeof val === "string" ? parseFloat(val) || val : val;
+            // Only coerce to number if the entire string is numeric (count/sum/avg results).
+            // min/max on strings must stay as strings.
+            if (typeof val === "string") {
+              const num = Number(val);
+              metricValues[name] = !isNaN(num) && String(num) === val.trim() ? num : val;
+            } else {
+              metricValues[name] = val;
+            }
           }
           return { key, ...metricValues };
         }),
@@ -3242,53 +3249,17 @@ async function refreshMaterializedQuery(
   });
   if (!mq) return;
 
-  // Execute the query using the same engine as handleQuery but without permissions
-  // (materialized queries run as a system operation)
-  const queryResult = await withTenant(schemaName, async tx => {
-    await tx.unsafe(`SET LOCAL statement_timeout = '${QUERY_TIMEOUT_MS}'`);
-    const q = mq.query;
-    const effectiveLabel = q.label;
-    const limit = Math.min(q.limit ?? 10000, 10000);
-    const selectPaths = q.select ?? null;
-    const dataExpr = selectPaths ? buildProjectionSql(selectPaths) : "v.data";
-
-    // Simple projection query (aggregation in materialized queries follows the same SQL patterns)
-    const params: unknown[] = [];
-    let labelJoin = "";
-    let versionJoin: string;
-    if (effectiveLabel) {
-      params.push(effectiveLabel);
-      labelJoin = `JOIN labels lf ON lf.document_id = d.id AND lf.label = $1`;
-      versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = lf.version`;
-    } else {
-      versionJoin = `JOIN versions v ON v.document_id = d.id AND v.version = d.current_version`;
-    }
-    params.push(sourceCollection);
-    const collParam = `$${params.length}`;
-
-    let extraWhere = "";
-    if (q.where) {
-      const wc = compileWhere(q.where);
-      extraWhere = ` AND (${renum(wc.sql, params.length)})`;
-      params.push(...wc.params);
-    }
-
-    params.push(limit);
-    const limitParam = `$${params.length}`;
-
-    const sqlStr = `
-      SELECT d.id, ${effectiveLabel ? "lf.version" : "d.current_version AS version"},
-             ${dataExpr} AS data
-      FROM documents d ${labelJoin} ${versionJoin}
-      WHERE d.collection = ${collParam} AND d.deleted_at IS NULL${extraWhere}
-      ORDER BY d.created_at DESC
-      LIMIT ${limitParam}`;
-
-    return tx.unsafe<{ id: string; version: number; data: unknown }[]>(sqlStr, params);
+  // Execute the query using the same engine as handleQuery — reuse it by
+  // constructing a synthetic POST request. This ensures aggregate, where,
+  // select all work identically to the live _query endpoint.
+  const fakeReq = new Request("http://localhost/_query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...mq.query, limit: Math.min(mq.query.limit ?? 10000, 10000) }),
   });
-
-  // Store the result as a new version of the result document
-  const resultData = { items: queryResult.map(r => ({ id: r.id, version: r.version, data: r.data })), refreshedAt: new Date().toISOString() };
+  const noPermFilter: AccessResult = { allowed: true, auditReads: false, auditWrites: false };
+  const queryResponse = await handleQuery(schemaName, sourceCollection, fakeReq, noPermFilter);
+  const resultData = { ...(await queryResponse.json() as Record<string, unknown>), refreshedAt: new Date().toISOString() };
   await withTenant(schemaName, async tx => {
     const [doc] = await tx<{ current_version: number }[]>`
       SELECT current_version FROM documents WHERE id = ${mq.result_doc_id}
