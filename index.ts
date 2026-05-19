@@ -1104,7 +1104,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Determine required access level from method + sub-route
     let reqAccess: "read" | "write" | "admin" = "read";
-    if (id === "_query" && req.method === "POST") {
+    if (id === "_query" && (req.method === "POST" || req.method === "GET")) {
       reqAccess = "read"; // queries are read-only
     } else if (id === "_materialized") {
       reqAccess = req.method === "GET" ? "read" : "admin";
@@ -1156,7 +1156,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Query endpoint: POST /{collection}/_query
     // Filter + projection + aggregation in one call. Replaces the hand-built
     // index-doc pattern.
-    if (id === "_query" && !sub && req.method === "POST") {
+    if (id === "_query" && !sub && (req.method === "POST" || req.method === "GET")) {
       const r = await handleQuery(schemaName, collection, req, colAr);
       audit(colAr, colResource, true, r.status);
       return r;
@@ -1620,10 +1620,39 @@ async function handleQuery(
   ar: AccessResult,
 ): Promise<Response> {
   let body: QueryRequest;
-  try {
-    body = await req.json() as QueryRequest;
-  } catch {
-    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+
+  if (req.method === "GET") {
+    // GET: parse from URL params — supports ?q=<base64url JSON> or individual params
+    const url = new URL(req.url);
+    const qParam = url.searchParams.get("q");
+    if (qParam) {
+      try {
+        body = JSON.parse(Buffer.from(qParam, "base64url").toString()) as QueryRequest;
+      } catch {
+        return Response.json({ error: "Invalid ?q= parameter (expected base64url-encoded JSON)" }, { status: 400 });
+      }
+    } else {
+      // Individual params: ?select=a,b&where=x:y&label=published&limit=10
+      body = {};
+      const sel = url.searchParams.get("select");
+      if (sel) body.select = sel.split(",").map(s => s.trim());
+      const where = url.searchParams.get("where");
+      if (where) body.where = where;
+      const label = url.searchParams.get("label");
+      if (label) body.label = label;
+      const limit = url.searchParams.get("limit");
+      if (limit) body.limit = parseInt(limit);
+      const cursor = url.searchParams.get("cursor");
+      if (cursor) body.cursor = cursor;
+      // Aggregate via ?q= only — too complex for individual params
+    }
+  } else {
+    // POST: parse from JSON body
+    try {
+      body = await req.json() as QueryRequest;
+    } catch {
+      return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
   }
 
   // Validate select paths
@@ -2380,7 +2409,7 @@ async function handlePublicCollectionRequest(
   // POST /orgs/{slug}/{collection}/_query — public anonymous query.
   // Same query engine as the authenticated endpoint, gated by the principal='*'
   // read rule. labelFilter/filterExpr from the permission apply automatically.
-  if (id === "_query" && !sub && req?.method === "POST") {
+  if (id === "_query" && !sub && (req?.method === "POST" || req?.method === "GET")) {
     const r = await handleQuery(schemaName, collection, req, ar);
     return withHeaders(r, PUBLIC_CACHE_HEADERS);
   }
