@@ -1457,27 +1457,38 @@ function compileWhere(where: string): { sql: string; params: unknown[] } {
       if (idx > 0) {
         const path = part.slice(0, idx).trim();
         const value = part.slice(idx + op.length).trim();
-        if (!SAFE_PATH.test(path)) throw new Error(`Invalid filter path: ${path}`);
+        // Accept both simple paths and array-unnest paths
+        if (!SAFE_PATH.test(path) && !SAFE_ARRAY_PATH.test(path)) throw new Error(`Invalid filter path: ${path}`);
         const sqlOp = WHERE_OPS[op];
-        const segments = path.split(".");
-        const jsonPath = segments.length === 1
-          ? `v.data->>'${segments[0]}'`
-          : `v.data #>> '{${segments.join(",")}}'`;
 
-        if (op === "@>") {
-          // Containment operator: value should be JSON
-          const jsonSegments = segments.length === 1 ? `v.data->'${segments[0]}'` : `v.data #> '{${segments.join(",")}'`;
-          params.push(value);
-          sqlParts.push(`${jsonSegments} @> $${params.length}::jsonb`);
-        } else if ([">", ">=", "<", "<="].includes(op)) {
-          // Numeric comparison
-          params.push(parseFloat(value) || value);
-          sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
-        } else {
-          // String comparison
-          const cleanValue = value.replace(/^['"]|['"]$/g, ""); // strip quotes
+        // Array paths with [] → EXISTS subquery with LATERAL unnest
+        if (path.includes("[]")) {
+          const compiled = compileArrayPath(path);
+          const cleanValue = value.replace(/^['"]|['"]$/g, "");
           params.push(cleanValue);
-          sqlParts.push(`${jsonPath} ${sqlOp} $${params.length}`);
+          const existsSql = `EXISTS (SELECT 1 FROM documents _fd
+            JOIN versions _fv ON _fv.document_id = _fd.id AND _fv.version = _fd.current_version
+            ${compiled.laterals.join("\n            ")}
+            WHERE _fd.id = d.id AND ${compiled.leaf} ${sqlOp} $${params.length})`;
+          sqlParts.push(existsSql);
+        } else {
+          const segments = path.split(".");
+          const jsonPath = segments.length === 1
+            ? `v.data->>'${segments[0]}'`
+            : `v.data #>> '{${segments.join(",")}}'`;
+
+          if (op === "@>") {
+            const jsonSegments = segments.length === 1 ? `v.data->'${segments[0]}'` : `v.data #> '{${segments.join(",")}'`;
+            params.push(value);
+            sqlParts.push(`${jsonSegments} @> $${params.length}::jsonb`);
+          } else if ([">", ">=", "<", "<="].includes(op)) {
+            params.push(parseFloat(value) || value);
+            sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
+          } else {
+            const cleanValue = value.replace(/^['"]|['"]$/g, "");
+            params.push(cleanValue);
+            sqlParts.push(`${jsonPath} ${sqlOp} $${params.length}`);
+          }
         }
         matched = true;
         break;
@@ -1792,7 +1803,7 @@ async function handleQuery(
         metricNames.push(name);
       }
 
-      // Build groupBy expressions
+      // Build groupBy expressions — array paths with [] get LATERAL joins
       const groupExprs: string[] = [];
       const selectGroupExprs: string[] = [];
       for (const g of groupBy) {
@@ -1800,14 +1811,21 @@ async function handleQuery(
           groupExprs.push("d.id");
           selectGroupExprs.push("d.id AS doc_id");
         } else if (g === "$path") {
-          // LEFT JOIN paths for $path grouping
           groupExprs.push("p.path");
           selectGroupExprs.push("p.path AS doc_path");
         } else if (g === "$collection") {
           groupExprs.push("d.collection");
           selectGroupExprs.push("d.collection");
+        } else if (g.includes("[]")) {
+          // Array path — compile LATERAL joins and use the leaf as the group key
+          const compiled = compileArrayPath(g);
+          for (const lat of compiled.laterals) {
+            if (!allLaterals.includes(lat)) allLaterals.push(lat);
+          }
+          groupExprs.push(compiled.leaf);
+          selectGroupExprs.push(`${compiled.leaf} AS "${g}"`);
         } else {
-          // JSON field path
+          // Simple JSON field path (no arrays)
           const segments = g.split(".");
           const expr = segments.length === 1
             ? `v.data->>'${segments[0]}'`
