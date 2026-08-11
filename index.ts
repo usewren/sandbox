@@ -2566,9 +2566,17 @@ interface RefPointer {
   treeName?: string;
   treePath?: string;
   treeLimit?: number;
+  // Query ref fields
+  isQuery?: boolean;
+  queryCollection?: string;
+  querySelect?: string[];
+  queryWhere?: string;
+  queryQ?: unknown; // full query body (for aggregation)
+  queryLimit?: number;
+  queryLabel?: string;
 }
 
-function isRef(val: unknown): val is { $ref: string; $id?: string; $key?: string; $path?: string; $limit?: number } {
+function isRef(val: unknown): val is Record<string, unknown> {
   return val !== null && typeof val === "object" && "$ref" in (val as Record<string, unknown>)
     && typeof (val as Record<string, unknown>).$ref === "string";
 }
@@ -2577,17 +2585,33 @@ function isRef(val: unknown): val is { $ref: string; $id?: string; $key?: string
 function collectRefs(data: unknown, path: (string | number)[] = []): RefPointer[] {
   if (!data || typeof data !== "object") return [];
   if (isRef(data)) {
-    const ref = data as { $ref: string; $id?: string; $key?: string; $path?: string; $limit?: number };
+    const ref = data as Record<string, unknown>;
+    const refStr = ref.$ref as string;
+
     // Tree reference: $ref starts with "tree:"
-    if (ref.$ref.startsWith("tree:")) {
-      const treeName = ref.$ref.slice(5);
+    if (refStr.startsWith("tree:")) {
+      const treeName = refStr.slice(5);
       return [{
-        path: [...path], collection: ref.$ref, isTree: true, treeName,
-        treePath: ref.$path ?? "/",
-        treeLimit: Math.min(Math.max(ref.$limit ?? DEFAULT_TREE_REF_LIMIT, 1), MAX_TREE_REF_LIMIT),
+        path: [...path], collection: refStr, isTree: true, treeName,
+        treePath: (ref.$path as string) ?? "/",
+        treeLimit: Math.min(Math.max((ref.$limit as number) ?? DEFAULT_TREE_REF_LIMIT, 1), MAX_TREE_REF_LIMIT),
       }];
     }
-    return [{ path: [...path], collection: ref.$ref, id: ref.$id, key: ref.$key }];
+
+    // Query reference: $ref starts with "query:"
+    if (refStr.startsWith("query:")) {
+      const queryCollection = refStr.slice(6);
+      return [{
+        path: [...path], collection: refStr, isQuery: true, queryCollection,
+        querySelect: Array.isArray(ref.$select) ? ref.$select as string[] : undefined,
+        queryWhere: typeof ref.$where === "string" ? ref.$where : undefined,
+        queryQ: ref.$q,
+        queryLimit: Math.min(Math.max((ref.$limit as number) ?? 20, 1), 200),
+        queryLabel: typeof ref.$label === "string" ? ref.$label : undefined,
+      }];
+    }
+
+    return [{ path: [...path], collection: refStr, id: ref.$id as string, key: ref.$key as string }];
   }
   const refs: RefPointer[] = [];
   if (Array.isArray(data)) {
@@ -2635,19 +2659,23 @@ async function resolveDocRefs(
     // Cap refs per level to prevent abuse
     const capped = refs.slice(0, MAX_REFS_PER_LEVEL);
 
-    // Split into tree refs and document refs
+    // Split into tree refs, query refs, and document refs
     const treeRefs: RefPointer[] = [];
+    const queryRefs: RefPointer[] = [];
     const docRefs: RefPointer[] = [];
     for (const ref of capped) {
       const seenKey = ref.isTree
         ? `${ref.collection}:${ref.treePath}`
-        : (ref.id ? `${ref.collection}:${ref.id}` : `${ref.collection}:key:${ref.key}`);
+        : ref.isQuery
+          ? `${ref.collection}:${ref.queryWhere ?? ""}:${JSON.stringify(ref.queryQ ?? "")}`
+          : (ref.id ? `${ref.collection}:${ref.id}` : `${ref.collection}:key:${ref.key}`);
       if (seen.has(seenKey)) {
-        setAtPath(current, ref.path, { $circular: true, $ref: ref.collection, $id: ref.id, $key: ref.key });
+        setAtPath(current, ref.path, { $circular: true, $ref: ref.collection });
         continue;
       }
       seen.add(seenKey);
       if (ref.isTree) treeRefs.push(ref);
+      else if (ref.isQuery) queryRefs.push(ref);
       else docRefs.push(ref);
     }
 
@@ -2685,6 +2713,36 @@ async function resolveDocRefs(
         `;
       });
       setAtPath(current, ref.path, nodes.map(n => ({ path: n.path, documentId: n.document_id, data: n.data })));
+    }
+
+    // ── Resolve query refs ──
+    // Each query ref executes a _query call and inlines the result (items or rows).
+    for (const ref of queryRefs) {
+      const collection = ref.queryCollection!;
+      const queryBody: Record<string, unknown> = {};
+      if (ref.queryQ) {
+        // Full query body (aggregation etc.)
+        Object.assign(queryBody, ref.queryQ as Record<string, unknown>);
+      }
+      if (ref.querySelect) queryBody.select = ref.querySelect;
+      if (ref.queryWhere) queryBody.where = ref.queryWhere;
+      if (ref.queryLabel || label) queryBody.label = ref.queryLabel ?? label;
+      queryBody.limit = ref.queryLimit ?? 20;
+
+      try {
+        const fakeReq = new Request("http://localhost/_query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(queryBody),
+        });
+        const noPermFilter: AccessResult = { allowed: true, auditReads: false, auditWrites: false };
+        const queryResponse = await handleQuery(schemaName, collection, fakeReq, noPermFilter);
+        const result = await queryResponse.json() as Record<string, unknown>;
+        // Inline either rows (aggregate) or items (projection) — or the full result if neither
+        setAtPath(current, ref.path, result.rows ?? result.items ?? result);
+      } catch (e) {
+        setAtPath(current, ref.path, { $ref: ref.collection, $error: String(e) });
+      }
     }
 
     // ── Resolve document refs ──
