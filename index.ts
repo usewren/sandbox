@@ -685,6 +685,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
 
     // WREN logo — served from public directory (no auth required)
+    // wren.js — client-side web components library for declarative data binding
+    if (url.pathname === "/wren.js") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "wren.js")), {
+        headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "public, max-age=3600" },
+      });
+    }
+
     if (url.pathname === "/wren-logo.svg") {
       return new Response(Bun.file(join(import.meta.dir, "public", "wren-logo.svg")), {
         headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=3600" },
@@ -920,6 +927,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const [slug, ...rest] = parts;
       if (slug && rest.length > 0) {
         const sub = rest[0];
+        if (sub === "wren.js") {
+          return new Response(Bun.file(join(import.meta.dir, "public", "wren.js")), {
+            headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "public, max-age=3600" },
+          });
+        }
         if (sub === "llms.txt") {
           const optionalUser = await requireSession(req);
           return handleOrgLlmsTxt(slug, url, optionalUser);
