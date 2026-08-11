@@ -1141,7 +1141,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Route: GET /{collection}
     if (req.method === "GET" && !id) {
-      const res = await handleList(schemaName, collection, url, user.userId, colAr.labelFilter);
+      let res = await handleList(schemaName, collection, url, user.userId, colAr.labelFilter);
+      res = await withRefResolution(res, schemaName, url, colAr.labelFilter);
       audit(colAr, colResource, true, res.status);
       return filterResponse(res, colAr);
     }
@@ -1210,7 +1211,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         const effectiveUrl = effectiveLabel
           ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
           : url;
-        const r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+        let r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+        r = await withRefResolution(r, schemaName, url, effectiveLabel);
         audit(colAr, colResource, true, r.status);
         return filterResponse(r, colAr);
       }
@@ -1244,12 +1246,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Route: GET /{collection}/{id}
     if (req.method === "GET" && id && !sub) {
-      // If permission has a label filter, use it (overrides explicit ?label= only if not set by user)
       const effectiveLabel = colAr.labelFilter ?? url.searchParams.get("label") ?? undefined;
       const effectiveUrl = effectiveLabel
         ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
         : url;
-      const r = await handleGet(schemaName, collection, id, effectiveUrl);
+      let r = await handleGet(schemaName, collection, id, effectiveUrl);
+      r = await withRefResolution(r, schemaName, url, effectiveLabel);
       audit(colAr, colResource, true, r.status);
       return filterResponse(r, colAr);
     }
@@ -2454,12 +2456,12 @@ async function handlePublicCollectionRequest(
     const effectiveUrl = effectiveLabel
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
-    const r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+    let r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+    r = await withRefResolution(r, schemaName, url, effectiveLabel);
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
   // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset.
-  // handleGetAssetRaw already emits the public cache policy + Vary: Accept.
   if (id && sub === "raw") {
     return handleGetAssetRaw(schemaName, collection, id, url);
   }
@@ -2470,12 +2472,14 @@ async function handlePublicCollectionRequest(
     const effectiveUrl = effectiveLabel
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
-    const r = await handleGet(schemaName, collection, id, effectiveUrl);
+    let r = await handleGet(schemaName, collection, id, effectiveUrl);
+    r = await withRefResolution(r, schemaName, url, effectiveLabel);
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
   // GET /orgs/{slug}/{collection} — list documents
-  const r = await handleList(schemaName, collection, url, "", ar.labelFilter);
+  let r = await handleList(schemaName, collection, url, "", ar.labelFilter);
+  r = await withRefResolution(r, schemaName, url, ar.labelFilter);
   return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
 }
 
@@ -2532,6 +2536,213 @@ async function handleCreate(schemaName: string, collection: string, req: Request
     }
     throw err;
   }
+}
+
+// ── $ref resolution ──────────────────────────────────────────────────────────
+//
+// Documents can contain references to other documents:
+//   { "author": { "$ref": "authors", "$id": "uuid" } }
+//   { "category": { "$ref": "categories", "$key": "news" } }
+//
+// When ?depth=N is set (default 0 = no resolution), references are resolved
+// server-side by batch-fetching referenced docs and inlining their data.
+// Loop detection prevents circular references from causing infinite recursion.
+
+const MAX_REF_DEPTH = 5;
+const MAX_REFS_PER_LEVEL = 50;
+
+interface RefPointer {
+  path: (string | number)[];
+  collection: string;
+  id?: string;
+  key?: string;
+}
+
+function isRef(val: unknown): val is { $ref: string; $id?: string; $key?: string } {
+  return val !== null && typeof val === "object" && "$ref" in (val as Record<string, unknown>)
+    && typeof (val as Record<string, unknown>).$ref === "string";
+}
+
+/** Single-pass scan: collect all $ref objects and their JSON paths. */
+function collectRefs(data: unknown, path: (string | number)[] = []): RefPointer[] {
+  if (!data || typeof data !== "object") return [];
+  if (isRef(data)) {
+    const ref = data as { $ref: string; $id?: string; $key?: string };
+    return [{ path: [...path], collection: ref.$ref, id: ref.$id, key: ref.$key }];
+  }
+  const refs: RefPointer[] = [];
+  if (Array.isArray(data)) {
+    for (let i = 0; i < data.length; i++) {
+      refs.push(...collectRefs(data[i], [...path, i]));
+    }
+  } else {
+    for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+      refs.push(...collectRefs(v, [...path, k]));
+    }
+  }
+  return refs;
+}
+
+/** Set a value at a JSON path inside a mutable object. */
+function setAtPath(obj: unknown, path: (string | number)[], value: unknown): void {
+  let current = obj as Record<string | number, unknown>;
+  for (let i = 0; i < path.length - 1; i++) {
+    current = current[path[i]] as Record<string | number, unknown>;
+  }
+  current[path[path.length - 1]] = value;
+}
+
+/**
+ * Resolve all $ref objects in a document's data, up to maxDepth levels.
+ * Uses batch fetching: all refs at one depth level are resolved in a single
+ * SQL query per collection. Returns a new data object with refs replaced.
+ */
+async function resolveDocRefs(
+  schemaName: string,
+  data: unknown,
+  maxDepth: number,
+  label?: string,
+): Promise<unknown> {
+  if (maxDepth <= 0) return data;
+
+  // Deep clone so we can mutate
+  let current = JSON.parse(JSON.stringify(data));
+  const seen = new Set<string>(); // loop detection: "collection:id" or "collection:key:val"
+
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const refs = collectRefs(current);
+    if (refs.length === 0) break;
+
+    // Cap refs per level to prevent abuse
+    const capped = refs.slice(0, MAX_REFS_PER_LEVEL);
+
+    // Group by collection for batch fetching
+    const byCollection = new Map<string, RefPointer[]>();
+    for (const ref of capped) {
+      const seenKey = ref.id ? `${ref.collection}:${ref.id}` : `${ref.collection}:key:${ref.key}`;
+      if (seen.has(seenKey)) {
+        // Circular reference — replace with marker
+        setAtPath(current, ref.path, { $circular: true, $ref: ref.collection, $id: ref.id, $key: ref.key });
+        continue;
+      }
+      seen.add(seenKey);
+      if (!byCollection.has(ref.collection)) byCollection.set(ref.collection, []);
+      byCollection.get(ref.collection)!.push(ref);
+    }
+
+    // Batch-fetch each collection's refs in one query
+    for (const [collection, colRefs] of byCollection) {
+      const idRefs = colRefs.filter(r => r.id);
+      const keyRefs = colRefs.filter(r => r.key);
+
+      const resolved = new Map<string, unknown>(); // lookup key → data
+
+      if (idRefs.length > 0) {
+        const ids = idRefs.map(r => r.id!);
+        const rows = await withTenant(schemaName, async tx => {
+          if (label) {
+            return tx<{ id: string; data: unknown }[]>`
+              SELECT d.id, v.data FROM documents d
+              JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+              JOIN versions v ON v.document_id = d.id AND v.version = l.version
+              WHERE d.id = ANY(${ids}) AND d.collection = ${collection} AND d.deleted_at IS NULL
+            `;
+          }
+          return tx<{ id: string; data: unknown }[]>`
+            SELECT d.id, v.data FROM documents d
+            JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+            WHERE d.id = ANY(${ids}) AND d.collection = ${collection} AND d.deleted_at IS NULL
+          `;
+        });
+        for (const row of rows) resolved.set(`id:${row.id}`, row.data);
+      }
+
+      if (keyRefs.length > 0) {
+        const keys = keyRefs.map(r => r.key!);
+        const rows = await withTenant(schemaName, async tx => {
+          if (label) {
+            return tx<{ natural_key: string; data: unknown }[]>`
+              SELECT d.natural_key, v.data FROM documents d
+              JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+              JOIN versions v ON v.document_id = d.id AND v.version = l.version
+              WHERE d.natural_key = ANY(${keys}) AND d.collection = ${collection} AND d.deleted_at IS NULL
+            `;
+          }
+          return tx<{ natural_key: string; data: unknown }[]>`
+            SELECT d.natural_key, v.data FROM documents d
+            JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+            WHERE d.natural_key = ANY(${keys}) AND d.collection = ${collection} AND d.deleted_at IS NULL
+          `;
+        });
+        for (const row of rows) resolved.set(`key:${row.natural_key}`, row.data);
+      }
+
+      // Replace refs with resolved data
+      for (const ref of colRefs) {
+        const lookupKey = ref.id ? `id:${ref.id}` : `key:${ref.key}`;
+        const data = resolved.get(lookupKey);
+        if (data !== undefined) {
+          setAtPath(current, ref.path, data);
+        } else {
+          // Referenced doc not found — leave a marker
+          setAtPath(current, ref.path, { $ref: ref.collection, $id: ref.id, $key: ref.key, $notFound: true });
+        }
+      }
+    }
+  }
+
+  return current;
+}
+
+/**
+ * Wrap a Response to resolve $ref objects if ?depth= is set.
+ * Streams the response using chunked transfer encoding.
+ */
+async function withRefResolution(
+  res: Response,
+  schemaName: string,
+  url: URL,
+  label?: string,
+): Promise<Response> {
+  const depthParam = url.searchParams.get("depth");
+  if (!depthParam) return res;
+
+  const depth = Math.min(Math.max(parseInt(depthParam) || 0, 0), MAX_REF_DEPTH);
+  if (depth === 0) return res;
+
+  const body = await res.json() as Record<string, unknown>;
+
+  // Resolve refs in the data field (single doc) or in each item's data (list)
+  if (body.data && typeof body.data === "object") {
+    body.data = await resolveDocRefs(schemaName, body.data, depth, label);
+  }
+  if (Array.isArray(body.items)) {
+    body.items = await Promise.all(
+      (body.items as { data: unknown }[]).map(async item => ({
+        ...item,
+        data: await resolveDocRefs(schemaName, item.data, depth, label),
+      }))
+    );
+  }
+
+  // Stream the resolved response
+  const json = JSON.stringify(body);
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      // Stream in chunks for large resolved payloads
+      const CHUNK_SIZE = 16384;
+      for (let i = 0; i < json.length; i += CHUNK_SIZE) {
+        controller.enqueue(encoder.encode(json.slice(i, i + CHUNK_SIZE)));
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    status: res.status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Transfer-Encoding": "chunked" },
+  });
 }
 
 async function handleGet(schemaName: string, collection: string, id: string, url: URL): Promise<Response> {
