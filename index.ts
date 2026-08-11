@@ -2540,25 +2540,35 @@ async function handleCreate(schemaName: string, collection: string, req: Request
 
 // ── $ref resolution ──────────────────────────────────────────────────────────
 //
-// Documents can contain references to other documents:
+// Documents can contain references to other documents or tree paths:
 //   { "author": { "$ref": "authors", "$id": "uuid" } }
 //   { "category": { "$ref": "categories", "$key": "news" } }
+//   { "nav": { "$ref": "tree:site", "$path": "/", "$limit": 10 } }
+//   { "events": { "$ref": "tree:events", "$path": "/2026", "$limit": 5 } }
 //
 // When ?depth=N is set (default 0 = no resolution), references are resolved
 // server-side by batch-fetching referenced docs and inlining their data.
+// Tree refs return an array of { path, documentId, data } nodes.
 // Loop detection prevents circular references from causing infinite recursion.
 
 const MAX_REF_DEPTH = 5;
 const MAX_REFS_PER_LEVEL = 50;
+const DEFAULT_TREE_REF_LIMIT = 20;
+const MAX_TREE_REF_LIMIT = 100;
 
 interface RefPointer {
   path: (string | number)[];
   collection: string;
   id?: string;
   key?: string;
+  // Tree ref fields
+  isTree?: boolean;
+  treeName?: string;
+  treePath?: string;
+  treeLimit?: number;
 }
 
-function isRef(val: unknown): val is { $ref: string; $id?: string; $key?: string } {
+function isRef(val: unknown): val is { $ref: string; $id?: string; $key?: string; $path?: string; $limit?: number } {
   return val !== null && typeof val === "object" && "$ref" in (val as Record<string, unknown>)
     && typeof (val as Record<string, unknown>).$ref === "string";
 }
@@ -2567,7 +2577,16 @@ function isRef(val: unknown): val is { $ref: string; $id?: string; $key?: string
 function collectRefs(data: unknown, path: (string | number)[] = []): RefPointer[] {
   if (!data || typeof data !== "object") return [];
   if (isRef(data)) {
-    const ref = data as { $ref: string; $id?: string; $key?: string };
+    const ref = data as { $ref: string; $id?: string; $key?: string; $path?: string; $limit?: number };
+    // Tree reference: $ref starts with "tree:"
+    if (ref.$ref.startsWith("tree:")) {
+      const treeName = ref.$ref.slice(5);
+      return [{
+        path: [...path], collection: ref.$ref, isTree: true, treeName,
+        treePath: ref.$path ?? "/",
+        treeLimit: Math.min(Math.max(ref.$limit ?? DEFAULT_TREE_REF_LIMIT, 1), MAX_TREE_REF_LIMIT),
+      }];
+    }
     return [{ path: [...path], collection: ref.$ref, id: ref.$id, key: ref.$key }];
   }
   const refs: RefPointer[] = [];
@@ -2616,26 +2635,71 @@ async function resolveDocRefs(
     // Cap refs per level to prevent abuse
     const capped = refs.slice(0, MAX_REFS_PER_LEVEL);
 
-    // Group by collection for batch fetching
-    const byCollection = new Map<string, RefPointer[]>();
+    // Split into tree refs and document refs
+    const treeRefs: RefPointer[] = [];
+    const docRefs: RefPointer[] = [];
     for (const ref of capped) {
-      const seenKey = ref.id ? `${ref.collection}:${ref.id}` : `${ref.collection}:key:${ref.key}`;
+      const seenKey = ref.isTree
+        ? `${ref.collection}:${ref.treePath}`
+        : (ref.id ? `${ref.collection}:${ref.id}` : `${ref.collection}:key:${ref.key}`);
       if (seen.has(seenKey)) {
-        // Circular reference — replace with marker
         setAtPath(current, ref.path, { $circular: true, $ref: ref.collection, $id: ref.id, $key: ref.key });
         continue;
       }
       seen.add(seenKey);
+      if (ref.isTree) treeRefs.push(ref);
+      else docRefs.push(ref);
+    }
+
+    // ── Resolve tree refs ──
+    // Each tree ref becomes an array of { path, documentId, data } nodes.
+    for (const ref of treeRefs) {
+      const treeName = ref.treeName!;
+      const treePath = ref.treePath ?? "/";
+      const limit = ref.treeLimit ?? DEFAULT_TREE_REF_LIMIT;
+
+      const nodes = await withTenant(schemaName, async tx => {
+        const prefix = treePath === "/" ? "/%" : treePath.replace(/\/$/, "") + "/%";
+        if (label) {
+          return tx<{ path: string; document_id: string; data: unknown }[]>`
+            SELECT p.path, p.document_id, v.data
+            FROM paths p
+            JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
+            JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+            JOIN versions v ON v.document_id = d.id AND v.version = l.version
+            WHERE p.tree = ${treeName}
+              AND (p.path = ${treePath} OR p.path LIKE ${prefix})
+            ORDER BY p.path
+            LIMIT ${limit}
+          `;
+        }
+        return tx<{ path: string; document_id: string; data: unknown }[]>`
+          SELECT p.path, p.document_id, v.data
+          FROM paths p
+          JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
+          JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+          WHERE p.tree = ${treeName}
+            AND (p.path = ${treePath} OR p.path LIKE ${prefix})
+          ORDER BY p.path
+          LIMIT ${limit}
+        `;
+      });
+      setAtPath(current, ref.path, nodes.map(n => ({ path: n.path, documentId: n.document_id, data: n.data })));
+    }
+
+    // ── Resolve document refs ──
+    // Group by collection for batch fetching
+    const byCollection = new Map<string, RefPointer[]>();
+    for (const ref of docRefs) {
       if (!byCollection.has(ref.collection)) byCollection.set(ref.collection, []);
       byCollection.get(ref.collection)!.push(ref);
     }
 
-    // Batch-fetch each collection's refs in one query
     for (const [collection, colRefs] of byCollection) {
       const idRefs = colRefs.filter(r => r.id);
       const keyRefs = colRefs.filter(r => r.key);
 
-      const resolved = new Map<string, unknown>(); // lookup key → data
+      const resolved = new Map<string, unknown>();
 
       if (idRefs.length > 0) {
         const ids = idRefs.map(r => r.id!);
@@ -2677,14 +2741,12 @@ async function resolveDocRefs(
         for (const row of rows) resolved.set(`key:${row.natural_key}`, row.data);
       }
 
-      // Replace refs with resolved data
       for (const ref of colRefs) {
         const lookupKey = ref.id ? `id:${ref.id}` : `key:${ref.key}`;
         const data = resolved.get(lookupKey);
         if (data !== undefined) {
           setAtPath(current, ref.path, data);
         } else {
-          // Referenced doc not found — leave a marker
           setAtPath(current, ref.path, { $ref: ref.collection, $id: ref.id, $key: ref.key, $notFound: true });
         }
       }
