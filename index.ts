@@ -158,6 +158,17 @@ async function flushRequestStats(): Promise<void> {
 
 setInterval(flushRequestStats, 3_600_000); // flush every hour
 
+// Webhook constants (must be before setInterval references)
+const WEBHOOK_BATCH_WINDOW_MS = Number(process.env.WEBHOOK_BATCH_WINDOW_MS ?? "5000");
+const WEBHOOK_MAX_RETRIES = 5;
+const WEBHOOK_DISABLE_THRESHOLD = 10;
+const WEBHOOK_MAX_PER_ORG = 10;
+const pendingWebhookBatches = new Map<string, { orgId: string; events: { type: string; payload: unknown }[] }>();
+
+setInterval(processWebhookBatches, WEBHOOK_BATCH_WINDOW_MS);
+setInterval(purgeOldWebhookData, 86_400_000);
+recoverPendingWebhookBatches().catch(e => console.error("[webhook] recovery failed:", e));
+
 // -------------------------------------------------------
 // Tenant helpers
 // -------------------------------------------------------
@@ -462,6 +473,12 @@ function corsHeaders(origin: string | null, host: string | null): Record<string,
 async function sha256hex(data: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data));
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 function generateApiKey(): string {
@@ -1032,6 +1049,17 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
+    // Webhook management routes — /api/v1/webhooks[/:id[/deliveries|/replay]]
+    if (collection === "webhooks") {
+      if (req.method === "GET"    && !id)                        return handleListWebhooks(user.userId, user.sessionId);
+      if (req.method === "POST"   && !id)                        return handleCreateWebhook(req, user.userId, user.sessionId);
+      if (req.method === "PUT"    && id && !sub)                 return handleUpdateWebhook(id, req, user.userId, user.sessionId);
+      if (req.method === "DELETE" && id && !sub)                 return handleDeleteWebhook(id, user.userId, user.sessionId);
+      if (req.method === "GET"    && id && sub === "deliveries") return handleGetWebhookDeliveries(id, user.userId, user.sessionId);
+      if (req.method === "POST"   && id && sub === "replay")     return handleReplayWebhook(id, req, user.userId, user.sessionId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
     // Resolve org — split into orgId + schemaName so access checks can use orgId
     const orgId = await resolveUserOrgId(user.userId, user.sessionId, user.keyOrgId);
     const schemaName = await ensureTenant(orgId);
@@ -1098,12 +1126,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId, orgId);
         if (treeRes.status < 400) {
           purgeForTreePath(orgId, treeName, treePath).catch(() => {});
+          emitWebhookEvent(orgId, "tree.assigned", { tree: treeName, path: treePath }).catch(() => {});
         }
       }
       else if (req.method === "DELETE") {
         treeRes = await handleTreeDelete(schemaName, treeName, treePath, user.userId);
         if (treeRes.status < 400) {
           purgeForTreePath(orgId, treeName, treePath).catch(() => {});
+          emitWebhookEvent(orgId, "tree.removed", { tree: treeName, path: treePath }).catch(() => {});
         }
       }
       else return Response.json({ error: "Method not allowed" }, { status: 405 });
@@ -1220,6 +1250,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
           refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+          emitWebhookEvent(orgId, "document.updated", { collection, id: docId, key: keyValue }).catch(() => {});
         }
         return res;
       }
@@ -1229,6 +1260,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
           refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+          emitWebhookEvent(orgId, "document.deleted", { collection, id: docId, key: keyValue }).catch(() => {});
         }
         return res;
       }
@@ -1266,6 +1298,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (r.status < 400) {
         purgeForCollection(orgId, collection).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+        emitWebhookEvent(orgId, "document.created", { collection }).catch(() => {});
       }
       return r;
     }
@@ -1280,6 +1313,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+        emitWebhookEvent(orgId, "document.updated", { collection, id }).catch(() => {});
       }
       return r;
     }
@@ -1291,6 +1325,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+        emitWebhookEvent(orgId, "document.deleted", { collection, id }).catch(() => {});
       }
       return r;
     }
@@ -1322,6 +1357,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
+        emitWebhookEvent(orgId, "document.updated", { collection, id, rollback: true }).catch(() => {});
       }
       return r;
     }
@@ -1330,9 +1366,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (req.method === "POST" && id && sub === "labels") {
       const r = await handleLabel(schemaName, collection, id, req, user.userId);
       audit(colAr, colResource, false, r.status);
-      // Label changes affect ?label=foo responses
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
+        emitWebhookEvent(orgId, "label.set", { collection, id }).catch(() => {});
       }
       return r;
     }
@@ -4625,6 +4661,315 @@ async function handleDeletePermission(permId: string, userId: string, sessionId:
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ id: permId, deleted: true });
+}
+
+// ── Webhooks ─────────────────────────────────────────────────────────────────
+
+function webhookBatchKey(orgId: string): string {
+  return `${orgId}:${Math.floor(Date.now() / WEBHOOK_BATCH_WINDOW_MS)}`;
+}
+
+async function emitWebhookEvent(orgId: string, eventType: string, payload: object): Promise<void> {
+  const key = webhookBatchKey(orgId);
+
+  // Persist to Postgres for crash recovery
+  await sql`
+    INSERT INTO common.webhook_events (org_id, event_type, payload, batch_key)
+    VALUES (${orgId}, ${eventType}, ${sql.json(payload)}, ${key})
+  `.catch(e => console.error("[webhook] persist failed:", e));
+
+  // Buffer in memory
+  let batch = pendingWebhookBatches.get(key);
+  if (!batch) {
+    batch = { orgId, events: [] };
+    pendingWebhookBatches.set(key, batch);
+  }
+  batch.events.push({ type: eventType, payload });
+}
+
+async function signPayload(body: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function deliverBatch(orgId: string, batchKey: string, events: { type: string; payload: unknown }[]): Promise<void> {
+  const webhooks = await sql<{ id: string; url: string; secret: string; events: string[] }[]>`
+    SELECT id, url, secret, events FROM common.webhooks WHERE org_id = ${orgId} AND enabled = true
+  `;
+
+  for (const wh of webhooks) {
+    // Filter events this webhook subscribes to (empty = all)
+    const matched = wh.events.length === 0
+      ? events
+      : events.filter(e => wh.events.includes(e.type));
+    if (matched.length === 0) continue;
+
+    const body = JSON.stringify({
+      batchKey,
+      events: matched,
+      deliveredAt: new Date().toISOString(),
+    });
+    const signature = await signPayload(body, wh.secret);
+
+    // Retry with exponential backoff
+    let succeeded = false;
+    for (let attempt = 1; attempt <= WEBHOOK_MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(wh.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Wren-Signature": signature,
+            "X-Wren-Delivery": batchKey,
+          },
+          body,
+          signal: AbortSignal.timeout(10_000),
+        });
+
+        await sql`
+          INSERT INTO common.webhook_deliveries (webhook_id, batch_key, event_count, attempt, status_code)
+          VALUES (${wh.id}, ${batchKey}, ${matched.length}, ${attempt}, ${res.status})
+        `.catch(() => {});
+
+        if (res.ok) {
+          await sql`UPDATE common.webhooks SET consec_failures = 0 WHERE id = ${wh.id}`.catch(() => {});
+          succeeded = true;
+          break;
+        }
+      } catch (err) {
+        await sql`
+          INSERT INTO common.webhook_deliveries (webhook_id, batch_key, event_count, attempt, error)
+          VALUES (${wh.id}, ${batchKey}, ${matched.length}, ${attempt}, ${String(err).slice(0, 500)})
+        `.catch(() => {});
+      }
+
+      // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+      if (attempt < WEBHOOK_MAX_RETRIES) {
+        await Bun.sleep(1000 * Math.pow(2, attempt - 1));
+      }
+    }
+
+    if (!succeeded) {
+      const [row] = await sql<{ consec_failures: number }[]>`
+        UPDATE common.webhooks SET consec_failures = consec_failures + 1, updated_at = NOW()
+        WHERE id = ${wh.id} RETURNING consec_failures
+      `.catch(() => [{ consec_failures: 0 }]);
+      if (row.consec_failures >= WEBHOOK_DISABLE_THRESHOLD) {
+        await sql`UPDATE common.webhooks SET enabled = false, updated_at = NOW() WHERE id = ${wh.id}`.catch(() => {});
+        console.warn(`[webhook] auto-disabled ${wh.id} after ${WEBHOOK_DISABLE_THRESHOLD} consecutive failures`);
+      }
+    }
+  }
+}
+
+async function processWebhookBatches(): Promise<void> {
+  const cutoff = Date.now() - WEBHOOK_BATCH_WINDOW_MS;
+  const readyKeys: string[] = [];
+  for (const [key] of pendingWebhookBatches) {
+    const bucket = parseInt(key.split(":").pop()!);
+    if (bucket * WEBHOOK_BATCH_WINDOW_MS < cutoff) readyKeys.push(key);
+  }
+
+  for (const key of readyKeys) {
+    const batch = pendingWebhookBatches.get(key)!;
+    pendingWebhookBatches.delete(key);
+    deliverBatch(batch.orgId, key, batch.events).catch(e => {
+      console.error("[webhook] delivery failed:", e);
+    });
+  }
+}
+
+async function recoverPendingWebhookBatches(): Promise<void> {
+  // Find batches that were persisted but never delivered
+  const rows = await sql<{ batch_key: string; org_id: string }[]>`
+    SELECT DISTINCT we.batch_key, we.org_id
+    FROM common.webhook_events we
+    WHERE we.created_at > NOW() - INTERVAL '1 hour'
+      AND NOT EXISTS (
+        SELECT 1 FROM common.webhook_deliveries wd
+        WHERE wd.batch_key = we.batch_key AND wd.status_code BETWEEN 200 AND 299
+      )
+  `.catch(() => []);
+
+  for (const row of rows) {
+    if (!pendingWebhookBatches.has(row.batch_key)) {
+      const events = await sql<{ event_type: string; payload: unknown }[]>`
+        SELECT event_type, payload FROM common.webhook_events
+        WHERE batch_key = ${row.batch_key} ORDER BY id
+      `.catch(() => []);
+      if (events.length > 0) {
+        pendingWebhookBatches.set(row.batch_key, {
+          orgId: row.org_id,
+          events: events.map(e => ({ type: e.event_type, payload: e.payload })),
+        });
+      }
+    }
+  }
+}
+
+async function purgeOldWebhookData(): Promise<void> {
+  await sql`DELETE FROM common.webhook_events WHERE created_at < NOW() - INTERVAL '7 days'`.catch(() => {});
+  await sql`DELETE FROM common.webhook_deliveries WHERE delivered_at < NOW() - INTERVAL '30 days'`.catch(() => {});
+}
+
+// ── Webhook CRUD handlers ────────────────────────────────────────────────────
+
+async function handleListWebhooks(userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  const rows = await sql<{
+    id: string; url: string; events: string[]; enabled: boolean;
+    consec_failures: number; created_at: Date; updated_at: Date;
+  }[]>`
+    SELECT id, url, events, enabled, consec_failures, created_at, updated_at
+    FROM common.webhooks WHERE org_id = ${orgId} ORDER BY created_at
+  `;
+  return Response.json({
+    webhooks: rows.map(r => ({
+      id: r.id, url: r.url, events: r.events, enabled: r.enabled,
+      consecFailures: r.consec_failures, createdAt: r.created_at, updatedAt: r.updated_at,
+    })),
+  });
+}
+
+async function handleCreateWebhook(req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  // Check limit
+  const [{ count }] = await sql<{ count: string }[]>`
+    SELECT COUNT(*)::text AS count FROM common.webhooks WHERE org_id = ${orgId}
+  `;
+  if (parseInt(count) >= WEBHOOK_MAX_PER_ORG) {
+    return Response.json({ error: `Maximum ${WEBHOOK_MAX_PER_ORG} webhooks per org` }, { status: 400 });
+  }
+
+  const body = await req.json() as { url?: string; events?: string[] };
+  if (!body.url) return Response.json({ error: "url is required" }, { status: 400 });
+
+  try { new URL(body.url); } catch {
+    return Response.json({ error: "Invalid URL" }, { status: 400 });
+  }
+
+  const secret = randomHex(32);
+  const events = Array.isArray(body.events) ? body.events.filter(e => typeof e === "string") : [];
+
+  const [row] = await sql<{ id: string; created_at: Date }[]>`
+    INSERT INTO common.webhooks (org_id, url, secret, events)
+    VALUES (${orgId}, ${body.url}, ${secret}, ${events})
+    RETURNING id, created_at
+  `;
+
+  return Response.json({
+    id: row.id, url: body.url, events, secret, enabled: true,
+    consecFailures: 0, createdAt: row.created_at,
+  }, { status: 201 });
+}
+
+async function handleUpdateWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  const body = await req.json() as { url?: string; events?: string[]; enabled?: boolean };
+
+  const sets: string[] = ["updated_at = NOW()"];
+  const params: unknown[] = [];
+  if (body.url !== undefined) {
+    try { new URL(body.url); } catch { return Response.json({ error: "Invalid URL" }, { status: 400 }); }
+    params.push(body.url); sets.push(`url = $${params.length}`);
+  }
+  if (body.events !== undefined) {
+    params.push(body.events); sets.push(`events = $${params.length}`);
+  }
+  if (body.enabled !== undefined) {
+    params.push(body.enabled); sets.push(`enabled = $${params.length}`);
+    if (body.enabled) { sets.push("consec_failures = 0"); } // re-enable resets failures
+  }
+
+  params.push(webhookId, orgId);
+  const rows = await sql.unsafe<{ id: string }[]>(
+    `UPDATE common.webhooks SET ${sets.join(", ")} WHERE id = $${params.length - 1} AND org_id = $${params.length} RETURNING id`,
+    params,
+  );
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ id: webhookId, updated: true });
+}
+
+async function handleDeleteWebhook(webhookId: string, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  const rows = await sql<{ id: string }[]>`
+    DELETE FROM common.webhooks WHERE id = ${webhookId} AND org_id = ${orgId} RETURNING id
+  `;
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ id: webhookId, deleted: true });
+}
+
+async function handleGetWebhookDeliveries(webhookId: string, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  // Verify webhook belongs to this org
+  const [wh] = await sql<{ id: string }[]>`SELECT id FROM common.webhooks WHERE id = ${webhookId} AND org_id = ${orgId}`;
+  if (!wh) return Response.json({ error: "Not found" }, { status: 404 });
+
+  const rows = await sql<{
+    id: string; batch_key: string; event_count: number; attempt: number;
+    status_code: number | null; error: string | null; delivered_at: Date;
+  }[]>`
+    SELECT id, batch_key, event_count, attempt, status_code, error, delivered_at
+    FROM common.webhook_deliveries WHERE webhook_id = ${webhookId}
+    ORDER BY delivered_at DESC LIMIT 100
+  `;
+
+  return Response.json({
+    deliveries: rows.map(r => ({
+      id: r.id, batchKey: r.batch_key, eventCount: r.event_count, attempt: r.attempt,
+      statusCode: r.status_code, error: r.error, deliveredAt: r.delivered_at,
+    })),
+  });
+}
+
+async function handleReplayWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+
+  const [wh] = await sql<{ id: string }[]>`SELECT id FROM common.webhooks WHERE id = ${webhookId} AND org_id = ${orgId}`;
+  if (!wh) return Response.json({ error: "Not found" }, { status: 404 });
+
+  const body = await req.json() as { since?: string; until?: string };
+  if (!body.since) return Response.json({ error: "since is required (ISO date)" }, { status: 400 });
+
+  const since = new Date(body.since);
+  const until = body.until ? new Date(body.until) : new Date();
+
+  // Re-enqueue matching events with a new batch key
+  const events = await sql<{ event_type: string; payload: unknown }[]>`
+    SELECT event_type, payload FROM common.webhook_events
+    WHERE org_id = ${orgId} AND created_at >= ${since} AND created_at <= ${until}
+    ORDER BY id
+  `;
+
+  if (events.length === 0) return Response.json({ replayed: 0 });
+
+  const replayKey = `${orgId}:replay:${Date.now()}`;
+  pendingWebhookBatches.set(replayKey, {
+    orgId,
+    events: events.map(e => ({ type: e.event_type, payload: e.payload })),
+  });
+
+  return Response.json({ replayed: events.length, batchKey: replayKey });
 }
 
 // -------------------------------------------------------
