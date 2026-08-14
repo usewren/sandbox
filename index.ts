@@ -2432,8 +2432,32 @@ async function handlePublicCollectionRequest(
 
   const schemaName = sanitizeSchemaName(orgId);
 
+  // ── Alias resolution ──
+  // Check if the collection/tree name is actually an alias on a permission rule.
+  // If so, resolve it to the real resource name. Aliases only work for principal='*' rules.
+  let resolvedCollection = collection;
+  if (collection !== "tree" && collection !== "wren.js" && collection !== "llms.txt") {
+    const aliasRow = await sql<{ resource: string }[]>`
+      SELECT resource FROM common.permissions
+      WHERE org_id = ${orgId} AND alias = ${collection} AND principal = '*'
+      LIMIT 1
+    `.catch(() => []);
+    if (aliasRow.length > 0) {
+      // Alias found — extract the real name from "collection:xxx" or "tree:xxx"
+      const [kind, realName] = aliasRow[0].resource.split(":");
+      if (kind === "tree") {
+        // Redirect to tree handler with the real tree name
+        resolvedCollection = "tree";
+        id = realName;
+        sub = sub; // preserve existing sub segments
+      } else {
+        resolvedCollection = realName;
+      }
+    }
+  }
+
   // ── Public tree access: GET /orgs/{slug}/tree/{treeName}[/{...path}] ──────
-  if (collection === "tree") {
+  if (resolvedCollection === "tree") {
     const treeName = id;
     if (!treeName) return Response.json({ error: "Tree name required" }, { status: 400 });
 
@@ -2457,61 +2481,52 @@ async function handlePublicCollectionRequest(
   }
 
   // ── Public collection access ───────────────────────────────────────────────
-  const resource = `collection:${collection}`;
+  const resource = `collection:${resolvedCollection}`;
   const ar = await checkAccess(orgId, "", "*", resource, "read");
   if (!ar.allowed) return Response.json({ error: "Forbidden" }, { status: 403 });
 
   // POST /orgs/{slug}/{collection}/_query — public anonymous query.
-  // Same query engine as the authenticated endpoint, gated by the principal='*'
-  // read rule. labelFilter/filterExpr from the permission apply automatically.
   if (id === "_query" && !sub && (req?.method === "POST" || req?.method === "GET")) {
-    const r = await handleQuery(schemaName, collection, req, ar);
+    const r = await handleQuery(schemaName, resolvedCollection, req, ar);
     return withHeaders(r, PUBLIC_CACHE_HEADERS);
   }
 
   // GET /orgs/{slug}/{collection}/_materialized/{name} — public materialized result.
   if (id === "_materialized" && sub && req?.method === "GET") {
-    const r = await handleGetMaterialized(schemaName, collection, sub);
+    const r = await handleGetMaterialized(schemaName, resolvedCollection, sub);
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
-  // GET /orgs/{slug}/{collection}/_materialized — list materialized queries.
   if (id === "_materialized" && !sub && req?.method === "GET") {
-    const r = await handleListMaterialized(schemaName, collection);
+    const r = await handleListMaterialized(schemaName, resolvedCollection);
     return withHeaders(r, PUBLIC_CACHE_HEADERS);
   }
 
-  // GET /orgs/{slug}/{collection}/by-key/{keyValue} — public natural-key lookup.
-  // Read-only; public mutations are never allowed regardless of how the rule
-  // is configured (write/admin on principal=* is nonsensical here).
   if (id === "by-key" && sub) {
     const keyValue = decodeURIComponent(sub);
     const effectiveLabel = ar.labelFilter ?? url.searchParams.get("label") ?? undefined;
     const effectiveUrl = effectiveLabel
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
-    const r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
+    const r = await handleGetByKey(schemaName, resolvedCollection, keyValue, effectiveUrl);
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
-  // GET /orgs/{slug}/{collection}/{id}/raw — serve binary asset.
-  // handleGetAssetRaw already emits the public cache policy + Vary: Accept.
   if (id && sub === "raw") {
-    return handleGetAssetRaw(schemaName, collection, id, url);
+    return handleGetAssetRaw(schemaName, resolvedCollection, id, url);
   }
 
-  // GET /orgs/{slug}/{collection}/{id} — get JSON document
   if (id && !sub) {
     const effectiveLabel = ar.labelFilter ?? url.searchParams.get("label") ?? undefined;
     const effectiveUrl = effectiveLabel
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
-    const r = await handleGet(schemaName, collection, id, effectiveUrl);
+    const r = await handleGet(schemaName, resolvedCollection, id, effectiveUrl);
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
   // GET /orgs/{slug}/{collection} — list documents
-  const r = await handleList(schemaName, collection, url, "", ar.labelFilter);
+  const r = await handleList(schemaName, resolvedCollection, url, "", ar.labelFilter);
   return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
 }
 
@@ -4543,10 +4558,10 @@ async function handleListPermissions(userId: string, sessionId: string | null): 
   const rows = await sql<{
     id: string; principal: string; resource: string; access: string;
     label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
-    audit_reads: boolean; audit_writes: boolean; created_at: Date;
+    audit_reads: boolean; audit_writes: boolean; alias: string | null; created_at: Date;
   }[]>`
     SELECT id, principal, resource, access, label_filter, filter_lang, filter_expr,
-           audit_reads, audit_writes, created_at
+           audit_reads, audit_writes, alias, created_at
     FROM common.permissions
     WHERE org_id = ${orgId}
     ORDER BY created_at DESC
@@ -4563,6 +4578,7 @@ async function handleListPermissions(userId: string, sessionId: string | null): 
       filterExpr: r.filter_expr,
       auditReads: r.audit_reads,
       auditWrites: r.audit_writes,
+      alias: r.alias,
       createdAt: r.created_at,
     })),
   });
@@ -4576,11 +4592,12 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
   const body = await req.json() as {
     principal?: string; resource?: string; access?: string;
     labelFilter?: string; filterLang?: string; filterExpr?: string;
-    auditReads?: boolean; auditWrites?: boolean;
+    auditReads?: boolean; auditWrites?: boolean; alias?: string;
   };
 
   const { principal, resource, access = "read", labelFilter = null, filterLang = null, filterExpr = null,
           auditReads = false, auditWrites = false } = body;
+  const alias = typeof body.alias === "string" && body.alias.trim() ? body.alias.trim() : null;
 
   if (!principal) return Response.json({ error: "principal is required" }, { status: 400 });
   if (!resource)  return Response.json({ error: "resource is required" }, { status: 400 });
@@ -4591,25 +4608,35 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
   if (filterExpr && !filterLang)
     return Response.json({ error: "filterLang is required when filterExpr is set" }, { status: 400 });
 
+  // Validate alias: no reserved keywords, no _ prefix, alphanumeric + hyphens only
+  if (alias) {
+    if (!/^[a-z][a-z0-9-]*$/.test(alias))
+      return Response.json({ error: "Alias must be lowercase alphanumeric with hyphens, starting with a letter" }, { status: 400 });
+    const reserved = new Set(["tree", "keys", "org", "me", "webhooks", "permissions", "members", "invites", "collections", "projects", "health", "docs", "admin"]);
+    if (reserved.has(alias) || alias.startsWith("_"))
+      return Response.json({ error: `Alias "${alias}" is reserved` }, { status: 400 });
+  }
+
   const [row] = await sql<{ id: string; created_at: Date }[]>`
     INSERT INTO common.permissions
-      (org_id, principal, resource, access, label_filter, filter_lang, filter_expr, audit_reads, audit_writes)
+      (org_id, principal, resource, access, label_filter, filter_lang, filter_expr, audit_reads, audit_writes, alias)
     VALUES
       (${orgId}, ${principal}, ${resource}, ${access}, ${labelFilter}, ${filterLang}, ${filterExpr},
-       ${auditReads}, ${auditWrites})
+       ${auditReads}, ${auditWrites}, ${alias})
     ON CONFLICT (principal, resource) DO UPDATE
       SET access       = EXCLUDED.access,
           label_filter = EXCLUDED.label_filter,
           filter_lang  = EXCLUDED.filter_lang,
           filter_expr  = EXCLUDED.filter_expr,
           audit_reads  = EXCLUDED.audit_reads,
-          audit_writes = EXCLUDED.audit_writes
+          audit_writes = EXCLUDED.audit_writes,
+          alias        = EXCLUDED.alias
     RETURNING id, created_at
   `;
 
   return Response.json({
     id: row.id, principal, resource, access, labelFilter, filterLang, filterExpr,
-    auditReads, auditWrites, createdAt: row.created_at,
+    auditReads, auditWrites, alias, createdAt: row.created_at,
   }, { status: 201 });
 }
 
