@@ -10,7 +10,10 @@ services:
       BETTER_AUTH_URL: http://localhost:4000
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-change-me-in-production}
       CACHE_PURGE_BACKEND: ${CACHE_PURGE_BACKEND:-noop}
+      WREN_LOG_DIR: /data
       NODE_ENV: production
+    volumes:
+      - wren_data:/data
     depends_on:
       db:
         condition: service_healthy
@@ -33,3 +36,4 @@ services:
 
 volumes:
   db_data:
+  wren_data:

@@ -1,6 +1,6 @@
 import postgres, { type Sql } from "postgres";
 import { parse as parseYaml } from "yaml";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, renameSync, readdirSync, unlinkSync, appendFileSync, mkdirSync } from "fs";
 import { join, extname } from "path";
 import { auth } from "auth";
 import { setupCommon, createTenant, listTenants, migrateAllTenants, sanitizeSchemaName } from "db/runner";
@@ -8,6 +8,80 @@ import Ajv from "ajv";
 import { json as jqJson } from "jq-wasm";
 import jmespath from "jmespath";
 import jsonata from "jsonata";
+
+// ── Crash-resilient logging ──────────────────────────────────────────────────
+// Ring buffer: keeps the last 5 minutes of logs on disk. On startup, preserves
+// the previous run's log as a crash log for debugging.
+
+const LOG_DIR = process.env.WREN_LOG_DIR ?? "/data";
+const LOG_FILE = join(LOG_DIR, "wren.log");
+const LOG_RING_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_CRASH_LOGS = 3;
+
+// In-memory ring buffer — flushed to disk every second
+const logRing: { ts: number; msg: string }[] = [];
+
+function wlog(msg: string) {
+  const now = Date.now();
+  const line = `[${new Date(now).toISOString()}] ${msg}`;
+  logRing.push({ ts: now, msg: line });
+  // Trim entries older than 5 minutes
+  const cutoff = now - LOG_RING_MS;
+  while (logRing.length > 0 && logRing[0].ts < cutoff) logRing.shift();
+  // Also write to stdout
+  console.log(msg);
+}
+
+function flushLogRing() {
+  if (logRing.length === 0) return;
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    const content = logRing.map(e => e.msg).join("\n") + "\n";
+    writeFileSync(LOG_FILE, content);
+  } catch { /* disk might not be writable in all environments */ }
+}
+
+function preserveCrashLog() {
+  try {
+    if (!existsSync(LOG_FILE)) return;
+    const stat = Bun.file(LOG_FILE);
+    if (stat.size === 0) return;
+
+    mkdirSync(LOG_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const crashFile = join(LOG_DIR, `wren-crash-${ts}.log`);
+    renameSync(LOG_FILE, crashFile);
+    console.log(`[boot] Preserved previous log as ${crashFile}`);
+
+    // Keep only the last N crash logs
+    const crashLogs = readdirSync(LOG_DIR)
+      .filter(f => f.startsWith("wren-crash-") && f.endsWith(".log"))
+      .sort()
+      .reverse();
+    for (const old of crashLogs.slice(MAX_CRASH_LOGS)) {
+      try { unlinkSync(join(LOG_DIR, old)); } catch { /* ignore */ }
+    }
+  } catch { /* first run, no log dir, etc. */ }
+}
+
+// Preserve crash log from previous run before anything else
+preserveCrashLog();
+
+// Flush ring buffer to disk every second
+setInterval(flushLogRing, 1000);
+
+// Catch unhandled errors — log them before dying
+process.on("uncaughtException", (err) => {
+  wlog(`FATAL uncaughtException: ${err.stack ?? err.message ?? err}`);
+  flushLogRing();
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  wlog(`FATAL unhandledRejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+  flushLogRing();
+  process.exit(1);
+});
 
 const ajv = new Ajv({ allErrors: true });
 
@@ -165,9 +239,24 @@ const WEBHOOK_DISABLE_THRESHOLD = 10;
 const WEBHOOK_MAX_PER_ORG = 10;
 const pendingWebhookBatches = new Map<string, { orgId: string; events: { type: string; payload: unknown }[] }>();
 
-setInterval(processWebhookBatches, WEBHOOK_BATCH_WINDOW_MS);
-setInterval(purgeOldWebhookData, 86_400_000);
-recoverPendingWebhookBatches().catch(e => console.error("[webhook] recovery failed:", e));
+// Guard: don't overlap batch processing (delivery retries can take 30s+)
+let webhookProcessing = false;
+setInterval(async () => {
+  if (webhookProcessing) return;
+  webhookProcessing = true;
+  try { await processWebhookBatches(); }
+  catch (e) { wlog(`[webhook] batch processing error: ${e}`); }
+  finally { webhookProcessing = false; }
+}, WEBHOOK_BATCH_WINDOW_MS);
+
+setInterval(() => {
+  purgeOldWebhookData().catch(e => wlog(`[webhook] purge error: ${e}`));
+}, 86_400_000);
+
+// Delay recovery until after the server is listening (DB might not be ready yet)
+setTimeout(() => {
+  recoverPendingWebhookBatches().catch(e => wlog(`[webhook] recovery failed: ${e}`));
+}, 5000);
 
 // -------------------------------------------------------
 // Tenant helpers
@@ -5354,5 +5443,5 @@ function computeDiff(before: Record<string, unknown>, after: Record<string, unkn
 
 export default server;
 
-console.log(`Wren listening on http://localhost:${server.port}`);
-console.log(`API docs available at http://localhost:${server.port}/docs`);
+wlog(`Wren listening on http://localhost:${server.port}`);
+wlog(`API docs available at http://localhost:${server.port}/docs`);
