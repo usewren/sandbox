@@ -2,6 +2,29 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## 0.6.0 — 2026-10-04
+
+### Security
+- **Permission rules are unique per org.** Rules were unique on `(principal, resource)` across all orgs, so two orgs with a same-named tree or collection could collide; creating a rule in one org could fail or touch the other's. Now unique on `(org_id, principal, resource)`.
+- **Invites only work for the invited email address.**
+
+### Added
+- **Groups.** Every org gets *Editors* (write everything) and *Viewers* (read everything); create your own. Invite people straight into groups. Rules can name `group:<id>`; the most specific resource wins, then personal over group, then the highest access.
+- **API keys act as their creator** in the key's org, unless the key has `key:<id>` rules of its own (which then narrow it). Members manage their own keys; admins all.
+- **Org-admin impersonation** ("View as"): an admin sees the org as one member, inside that org only, with a banner. Every change made that way records `impersonated_by` on the version, label and path, and in the access log. Keys, permissions, invites, members, groups, webhooks, org settings and connected apps are blocked while impersonating.
+- **Public data over MCP.** `/mcp` without a key is open, read-only, to every org's public data (`list_public`, `public_*` tools); keyed sessions get the public tools too.
+- **"Sign in with WREN" for MCP clients.** `/mcp/login`: OAuth 2.1 with PKCE and dynamic client registration. WREN always shows its consent page, where the user picks the org; the client then acts as that user there. Tokens are MCP-only.
+- **Connected apps:** `GET/DELETE /api/v1/connected-apps[/{clientId}]` and *Settings → Connected apps* list and revoke MCP sign-ins; revoking stops the app immediately.
+- **Landing-page experiment:** `/` serves one of `/a`–`/e` per visitor (`WREN_LANDING_VARIANTS`); anonymous counts per variant; results at `/stats/landing` for `WREN_OPERATORS`. New AI-first variant at `/e`.
+- Docs: homepage section on AI agents and teamwork, concepts section on people/groups/agents, self-hosting configuration reference in `llms-full.txt`.
+
+### Changed
+- An API key with no `key:` rules of its own now has its creator's access in the key's org. Before, such a key was denied everywhere except in its creator's own org. A key whose creator has left the org gets nothing.
+
+### Upgrade notes
+- Migrations `011`–`013` run on start (groups, impersonation audit columns, OAuth tables, landing counts). Existing members aren't added to any group, so their access is unchanged; the org owner keeps full access. Each org's *Editors* and *Viewers* groups are created the first time an admin opens the groups list or sends an invite.
+- Set `WREN_OPERATORS` to see `/stats/landing`; set `WREN_LANDING_VARIANTS=c` to keep the previous homepage for everyone.
+
 ## 0.5.0 — 2026-10-04
 
 ### Security
