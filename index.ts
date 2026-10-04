@@ -9,6 +9,13 @@ import { json as jqJson } from "jq-wasm";
 import jmespath from "jmespath";
 import jsonata from "jsonata";
 import { handleMcp } from "./mcp";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+// Per-request context. Set when an org admin's session impersonates a member, so
+// every tenant transaction stamps its writes with the impersonating admin (see
+// withTenant) and the request is audit-logged with both identities.
+type RequestContext = { impersonatedBy?: string; audit?: { orgId: string; targetId: string } };
+const requestContext = new AsyncLocalStorage<RequestContext>();
 
 const WREN_VERSION = "0.5.0";
 // Set at image build time: docker build --build-arg WREN_BUILD=$(git rev-parse --short HEAD) …
@@ -321,6 +328,10 @@ async function resolveUserOrg(userId: string, sessionId: string | null, keyOrgId
 async function withTenant<T>(schemaName: string, fn: (tx: Sql) => Promise<T>): Promise<T> {
   return sql.begin(async tx => {
     await tx.unsafe(`SET LOCAL search_path TO ${schemaName}, common, public`);
+    // Impersonated request: column defaults on versions/labels/paths record the admin
+    // (tenant migration 012). Transaction-local, passed as a parameter.
+    const impersonatedBy = requestContext.getStore()?.impersonatedBy;
+    if (impersonatedBy) await tx`SELECT set_config('wren.impersonated_by', ${impersonatedBy}, true)`;
     return fn(tx as unknown as Sql);
   });
 }
@@ -622,7 +633,12 @@ function generateInviteToken(): string {
   return "inv_" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-type SessionUser = { userId: string; name: string; email: string; sessionId: string | null; keyId?: string; keyOrgId?: string };
+// keyOrgId pins the org for the request: the key's org, or the org an admin is
+// impersonating in. `impersonator` is set while an admin acts as this user.
+type SessionUser = {
+  userId: string; name: string; email: string; sessionId: string | null; keyId?: string; keyOrgId?: string;
+  impersonator?: { userId: string; name: string; email: string; expiresAt: Date };
+};
 
 async function checkApiKey(req: Request): Promise<SessionUser | null> {
   const header = req.headers.get("Authorization") ?? "";
@@ -649,6 +665,23 @@ async function requireSession(req: Request): Promise<SessionUser | null> {
   if (apiKey) return apiKey;
   const session = await auth.api.getSession({ headers: req.headers });
   if (!session) return null;
+
+  // An org admin's session may be impersonating a member of that org: the request
+  // then acts as the member, pinned to that org (never the member's own or other orgs).
+  const [imp] = await sql<{ org_id: string; target_user_id: string; expires_at: Date; name: string; email: string }[]>`
+    SELECT i.org_id, i.target_user_id, i.expires_at, u.name, u.email
+    FROM common.impersonations i JOIN "user" u ON u.id = i.target_user_id
+    WHERE i.session_id = ${session.session.id} AND i.ended_at IS NULL AND i.expires_at > NOW()
+  `;
+  if (imp) {
+    const ctx = requestContext.getStore();
+    if (ctx) { ctx.impersonatedBy = session.user.id; ctx.audit = { orgId: imp.org_id, targetId: imp.target_user_id }; }
+    return {
+      userId: imp.target_user_id, name: imp.name, email: imp.email,
+      sessionId: session.session.id, keyOrgId: imp.org_id,
+      impersonator: { userId: session.user.id, name: session.user.name, email: session.user.email, expiresAt: imp.expires_at },
+    };
+  }
   return { userId: session.user.id, name: session.user.name, email: session.user.email, sessionId: session.session.id };
 }
 
@@ -692,7 +725,12 @@ async function checkAccess(
   const [type] = resource.split(":");
   const categoryWild = `${type}:*`;
 
-  // Query the most-specific matching permission rule
+  const principals = await effectivePrincipals(orgId, userId, principal);
+  if (!principals.length) return { allowed: false, auditReads: false, auditWrites: false };
+
+  // Most specific resource first; at equal specificity a personal (member/key) rule
+  // beats a group rule, so an individual exception wins; among groups the highest
+  // access wins (a person in Viewers and Editors can write).
   const rows = await sql<{
     id: string; access: string;
     label_filter: string | null;
@@ -705,13 +743,15 @@ async function checkAccess(
     SELECT id, access, label_filter, filter_lang, filter_expr, audit_reads, audit_writes, resource
     FROM common.permissions
     WHERE org_id = ${orgId}
-      AND principal = ${principal}
+      AND principal = ANY(${principals})
       AND resource = ANY(ARRAY[${resource}, ${categoryWild}, '*'])
     ORDER BY CASE resource
         WHEN ${resource}      THEN 0
         WHEN ${categoryWild}  THEN 1
         ELSE 2
-      END
+      END,
+      CASE WHEN principal LIKE 'group:%' THEN 1 ELSE 0 END,
+      CASE access WHEN 'admin' THEN 3 WHEN 'write' THEN 2 WHEN 'read' THEN 1 ELSE 0 END DESC
     LIMIT 1
   `;
 
@@ -744,6 +784,32 @@ async function checkAccess(
     auditWrites: rule.audit_writes,
     permissionId: rule.id,
   };
+}
+
+// Principals whose permission rules apply to a caller in an org:
+//   '*'                      → just '*' (public reads)
+//   member:<uid>             → that member + their groups in the org
+//   key:<id> with own rules  → just the key (rules on a key narrow it)
+//   key:<id> without rules   → acts as the person who created it (member + groups)
+// Callers who aren't (or no longer are) members of the org get nothing, so a
+// removed member's old keys stop working. The owner is handled before this.
+async function effectivePrincipals(orgId: string, userId: string, principal: string): Promise<string[]> {
+  if (principal === "*" || !userId) return [principal];
+  const member = await sql<{ x: number }[]>`
+    SELECT 1 AS x FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${userId}
+  `;
+  if (!member.length) return [];
+  if (principal.startsWith("key:")) {
+    const own = await sql<{ x: number }[]>`
+      SELECT 1 AS x FROM common.permissions WHERE org_id = ${orgId} AND principal = ${principal} LIMIT 1
+    `;
+    if (own.length) return [principal];
+  }
+  const groups = await sql<{ id: string }[]>`
+    SELECT g.id FROM common.groups g JOIN common.group_members gm ON gm.group_id = g.id
+    WHERE g.org_id = ${orgId} AND gm.user_id = ${userId}
+  `;
+  return [`member:${userId}`, ...groups.map(g => `group:${g.id}`)];
 }
 
 function logAccess(
@@ -803,7 +869,12 @@ const server = Bun.serve({
       ? new Request(req.url, { method: "GET", headers: req.headers })
       : req;
 
-    let res = await handleRequest(effectiveReq, url);
+    const ctx: RequestContext = {};
+    let res = await requestContext.run(ctx, () => handleRequest(effectiveReq, url));
+    // Every request made while impersonating is audit-logged with both identities
+    if (ctx.audit && ctx.impersonatedBy) {
+      logAccess(ctx.audit.orgId, `member:${ctx.audit.targetId}`, `impersonated-by:${ctx.impersonatedBy}`, req.method, url.pathname, res.status);
+    }
     if (isHead) {
       // Per RFC 7231: HEAD returns the same headers as GET but no body.
       // Preserve the Content-Length the GET response would have reported
@@ -1167,6 +1238,18 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const user = await requireSession(req);
     if (!user) return unauthorized();
 
+    // Impersonation status / end — /api/v1/impersonation
+    if (collection === "impersonation" && !id) {
+      if (req.method === "GET")    return Response.json({ impersonating: impersonationInfo(user) });
+      if (req.method === "DELETE") return handleEndImpersonation(user);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    // While impersonating, the admin acts as the member on data only: no org
+    // management, and nothing that would reveal the member's other orgs.
+    if (user.impersonator && ["keys", "permissions", "invites", "members", "groups", "webhooks", "org"].includes(collection)) {
+      return Response.json({ error: "Not available while impersonating. End impersonation first." }, { status: 403 });
+    }
+
     // Identity & scope — /api/v1/me
     if (collection === "me" && !id) {
       if (req.method === "GET") return handleGetMe(user);
@@ -1210,7 +1293,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Member management routes — /api/v1/members[/:memberId]
     if (collection === "members") {
       if (req.method === "GET"    && !id) return handleListMembers(user.userId, user.sessionId, user.keyOrgId);
-      if (req.method === "DELETE" && id)  return handleRemoveMember(id, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && id && !sub)  return handleRemoveMember(id, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && id && sub === "impersonate") return handleStartImpersonation(id, user);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Groups — /api/v1/groups[/:id[/members/:userId]]
+    if (collection === "groups") {
+      const memberId = segments[3];
+      if (req.method === "GET"    && !id)           return handleListGroups(user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && !id)           return handleCreateGroup(req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "PUT"    && id && !sub)    return handleUpdateGroup(id, req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && id && !sub)    return handleDeleteGroup(id, user.userId, user.sessionId, user.keyOrgId);
+      if (id && sub === "members" && memberId && (req.method === "PUT" || req.method === "DELETE"))
+        return handleGroupMember(id, memberId, req.method === "PUT", user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -3426,16 +3522,17 @@ async function handleVersionList(schemaName: string, collection: string, id: str
     `;
     if (!doc) return null;
 
-    const rows = await tx<{ version: number; created_at: Date; created_by: string; labels: string[] }[]>`
-      SELECT v.version, v.created_at, v.created_by,
+    const rows = await tx<{ version: number; created_at: Date; created_by: string; impersonated_by: string | null; labels: string[] }[]>`
+      SELECT v.version, v.created_at, v.created_by, v.impersonated_by,
              COALESCE(array_agg(l.label ORDER BY l.label) FILTER (WHERE l.label IS NOT NULL), '{}') AS labels
       FROM versions v
       LEFT JOIN labels l ON l.document_id = v.document_id AND l.version = v.version
       WHERE v.document_id = ${id}
-      GROUP BY v.version, v.created_at, v.created_by
+      GROUP BY v.version, v.created_at, v.created_by, v.impersonated_by
       ORDER BY v.version ASC
     `;
-    return rows.map(r => ({ version: r.version, createdAt: r.created_at, createdBy: r.created_by, labels: r.labels }));
+    // impersonatedBy: the org admin who made this change while acting as createdBy
+    return rows.map(r => ({ version: r.version, createdAt: r.created_at, createdBy: r.created_by, impersonatedBy: r.impersonated_by, labels: r.labels }));
   });
 
   if (!versions) return Response.json({ error: "Not found" }, { status: 404 });
@@ -4291,8 +4388,9 @@ async function handleTreeDelete(schemaName: string, treeName: string, treePath: 
 
 async function handleListApiKeys(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
-  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
-  if (guard) return guard;
+  if (!(await isOrgMember(userId, orgId))) return Response.json({ error: "Forbidden" }, { status: 403 });
+  // Admins see every key in the org; members see their own
+  const admin = await isOrgAdminOrOwner(userId, orgId);
 
   const keys = await sql<{
     id: string; name: string; key_prefix: string;
@@ -4300,7 +4398,7 @@ async function handleListApiKeys(userId: string, sessionId: string | null, keyOr
   }[]>`
     SELECT id, name, key_prefix, created_at, last_used_at, revoked_at
     FROM common.api_keys
-    WHERE org_id = ${orgId} AND revoked_at IS NULL
+    WHERE org_id = ${orgId} AND revoked_at IS NULL AND (${admin} OR user_id = ${userId})
     ORDER BY created_at DESC
   `;
   return Response.json({
@@ -4317,8 +4415,9 @@ async function handleListApiKeys(userId: string, sessionId: string | null, keyOr
 
 async function handleCreateApiKey(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
-  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
-  if (guard) return guard;
+  // Any member may create keys: a key acts as its creator in this org (their groups
+  // and rules; key:<id> rules can narrow it further), so it grants nothing extra.
+  if (!(await isOrgMember(userId, orgId))) return Response.json({ error: "Forbidden" }, { status: 403 });
 
   const body = await req.json() as { name?: string };
   const name = body.name?.trim();
@@ -4346,13 +4445,14 @@ async function handleCreateApiKey(req: Request, userId: string, sessionId: strin
 
 async function handleRevokeApiKey(keyId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
-  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
-  if (guard) return guard;
+  if (!(await isOrgMember(userId, orgId))) return Response.json({ error: "Forbidden" }, { status: 403 });
+  // Admins may revoke any key in the org; members only their own
+  const admin = await isOrgAdminOrOwner(userId, orgId);
 
   const rows = await sql<{ id: string }[]>`
     UPDATE common.api_keys
     SET revoked_at = NOW()
-    WHERE id = ${keyId} AND org_id = ${orgId} AND revoked_at IS NULL
+    WHERE id = ${keyId} AND org_id = ${orgId} AND revoked_at IS NULL AND (${admin} OR user_id = ${userId})
     RETURNING id
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
@@ -4407,14 +4507,20 @@ async function handleGetMe(user: SessionUser): Promise<Response> {
   // Lets an API-keyed caller self-audit its scope without needing admin access to
   // read the full /api/permissions list.
   const principal = principalFor(user);
+  // Same principals the access check uses (own + groups, or a narrowed key), plus public rules
+  const principals = isOwnOrg ? [principal] : await effectivePrincipals(orgId, user.userId, principal);
   const permRows = await sql<{
     id: string; principal: string; resource: string; access: string;
     label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
   }[]>`
     SELECT id, principal, resource, access, label_filter, filter_lang, filter_expr
     FROM common.permissions
-    WHERE org_id = ${orgId} AND principal IN (${principal}, '*')
+    WHERE org_id = ${orgId} AND principal = ANY(${[...principals, "*"]})
     ORDER BY created_at DESC
+  `;
+  const groups = await sql<{ id: string; name: string }[]>`
+    SELECT g.id, g.name FROM common.groups g JOIN common.group_members gm ON gm.group_id = g.id
+    WHERE g.org_id = ${orgId} AND gm.user_id = ${user.userId} ORDER BY g.name
   `;
 
   return Response.json({
@@ -4422,6 +4528,8 @@ async function handleGetMe(user: SessionUser): Promise<Response> {
     authMethod: user.keyId ? "api_key" : "session",
     user: { id: user.userId, name: user.name, email: user.email },
     org: { id: orgId, name: orgName, slug: orgSlug, role },
+    groups,
+    impersonating: impersonationInfo(user),
     apiKey,
     permissions: permRows.map(r => ({
       id: r.id,
@@ -5003,18 +5111,23 @@ async function handleCreateInvite(req: Request, userId: string, sessionId: strin
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
-  const body = await req.json() as { email?: string; role?: string };
+  const body = await req.json() as { email?: string; role?: string; groupIds?: unknown };
   const email = body.email?.trim().toLowerCase();
   const role = body.role ?? "member";
   if (!email) return Response.json({ error: "email is required" }, { status: 400 });
+  // role = what they may manage (admin: invites, keys, rules, groups); groups = which data
+  if (!["member", "admin"].includes(role)) return Response.json({ error: "role must be member or admin" }, { status: 400 });
+  await ensureDefaultGroups(orgId);
+  const groupIds = await validGroupIds(orgId, body.groupIds);
+  if (groupIds === null) return Response.json({ error: "groupIds must be ids of this org's groups" }, { status: 400 });
 
   const rawToken = generateInviteToken();
   const tokenHash = await sha256hex(rawToken);
   const tokenPrefix = rawToken.slice(0, 8);
 
   const [invite] = await sql<{ id: string; created_at: Date; expires_at: Date }[]>`
-    INSERT INTO common.invites (org_id, email, token_hash, token_prefix, role, invited_by)
-    VALUES (${orgId}, ${email}, ${tokenHash}, ${tokenPrefix}, ${role}, ${userId})
+    INSERT INTO common.invites (org_id, email, token_hash, token_prefix, role, invited_by, group_ids)
+    VALUES (${orgId}, ${email}, ${tokenHash}, ${tokenPrefix}, ${role}, ${userId}, ${groupIds})
     RETURNING id, created_at, expires_at
   `;
 
@@ -5033,6 +5146,7 @@ async function handleCreateInvite(req: Request, userId: string, sessionId: strin
     id: invite.id,
     email,
     role,
+    groupIds,
     // false when no mail transport is configured (MAIL_TRANSPORT=log): share acceptUrl yourself
     emailSent,
     acceptUrl,
@@ -5091,10 +5205,10 @@ async function handleAcceptInviteById(inviteId: string, user: SessionUser): Prom
   }
 
   const [invite] = await sql<{
-    id: string; org_id: string; email: string; role: string;
+    id: string; org_id: string; email: string; role: string; group_ids: string[];
     expires_at: Date; accepted_at: Date | null; revoked_at: Date | null;
   }[]>`
-    SELECT id, org_id, email, role, expires_at, accepted_at, revoked_at
+    SELECT id, org_id, email, role, group_ids, expires_at, accepted_at, revoked_at
     FROM common.invites WHERE id = ${inviteId}
   `;
   if (!invite)            return Response.json({ error: "Invite not found" }, { status: 404 });
@@ -5112,6 +5226,7 @@ async function handleAcceptInviteById(inviteId: string, user: SessionUser): Prom
     VALUES (${invite.org_id}, ${user.userId}, ${invite.role})
     ON CONFLICT (org_id, user_id) DO UPDATE SET role = ${invite.role}
   `;
+  await joinInviteGroups(invite.org_id, user.userId, invite.group_ids);
   await sql`UPDATE common.invites SET accepted_at = NOW() WHERE id = ${invite.id}`;
 
   return Response.json({ accepted: true, orgId: invite.org_id });
@@ -5139,10 +5254,10 @@ async function handleAcceptInvite(req: Request, userId: string): Promise<Respons
 
   const tokenHash = await sha256hex(token);
   const [invite] = await sql<{
-    id: string; org_id: string; email: string; role: string;
+    id: string; org_id: string; email: string; role: string; group_ids: string[];
     expires_at: Date; accepted_at: Date | null; revoked_at: Date | null;
   }[]>`
-    SELECT id, org_id, email, role, expires_at, accepted_at, revoked_at
+    SELECT id, org_id, email, role, group_ids, expires_at, accepted_at, revoked_at
     FROM common.invites WHERE token_hash = ${tokenHash}
   `;
   if (!invite)             return Response.json({ error: "Invalid invite token" }, { status: 404 });
@@ -5168,9 +5283,190 @@ async function handleAcceptInvite(req: Request, userId: string): Promise<Respons
     VALUES (${invite.org_id}, ${userId}, ${invite.role})
     ON CONFLICT (org_id, user_id) DO UPDATE SET role = ${invite.role}
   `;
+  await joinInviteGroups(invite.org_id, userId, invite.group_ids);
   await sql`UPDATE common.invites SET accepted_at = NOW() WHERE id = ${invite.id}`;
 
   return Response.json({ accepted: true, orgId: invite.org_id });
+}
+
+// -------------------------------------------------------
+// Group handlers
+// -------------------------------------------------------
+// Groups hold people; permission rules name a group as principal 'group:<id>'.
+// Every org starts with two: Editors (write on everything) and Viewers (read).
+
+async function isOrgMember(userId: string, orgId: string): Promise<boolean> {
+  if (userId === orgId) return true;
+  return (await sql`SELECT 1 FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${userId}`).length > 0;
+}
+
+async function ensureDefaultGroups(orgId: string): Promise<void> {
+  const existing = await sql`SELECT 1 FROM common.groups WHERE org_id = ${orgId} LIMIT 1`;
+  if (existing.length) return;
+  for (const [name, description, access] of [
+    ["Editors", "Read and write all collections and trees", "write"],
+    ["Viewers", "Read all collections and trees", "read"],
+  ] as const) {
+    const [g] = await sql<{ id: string }[]>`
+      INSERT INTO common.groups (org_id, name, description) VALUES (${orgId}, ${name}, ${description})
+      ON CONFLICT (org_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING id
+    `;
+    await sql`
+      INSERT INTO common.permissions (org_id, principal, resource, access)
+      VALUES (${orgId}, ${"group:" + g.id}, '*', ${access})
+      ON CONFLICT (org_id, principal, resource) DO NOTHING
+    `;
+  }
+}
+
+async function handleListGroups(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+  await ensureDefaultGroups(orgId);
+  const groups = await sql<{ id: string; name: string; description: string | null; created_at: Date }[]>`
+    SELECT id, name, description, created_at FROM common.groups WHERE org_id = ${orgId} ORDER BY name
+  `;
+  const members = await sql<{ group_id: string; user_id: string; name: string; email: string }[]>`
+    SELECT gm.group_id, gm.user_id, u.name, u.email
+    FROM common.group_members gm JOIN common.groups g ON g.id = gm.group_id JOIN "user" u ON u.id = gm.user_id
+    WHERE g.org_id = ${orgId} ORDER BY u.name
+  `;
+  const rules = await sql<{ principal: string; id: string; resource: string; access: string; label_filter: string | null }[]>`
+    SELECT principal, id, resource, access, label_filter FROM common.permissions
+    WHERE org_id = ${orgId} AND principal LIKE 'group:%' ORDER BY resource
+  `;
+  return Response.json({
+    groups: groups.map(g => ({
+      id: g.id, name: g.name, description: g.description, createdAt: g.created_at,
+      members: members.filter(m => m.group_id === g.id).map(m => ({ userId: m.user_id, name: m.name, email: m.email })),
+      rules: rules.filter(r => r.principal === `group:${g.id}`)
+        .map(r => ({ id: r.id, resource: r.resource, access: r.access, labelFilter: r.label_filter })),
+    })),
+  });
+}
+
+async function handleCreateGroup(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+  const body = await req.json().catch(() => ({})) as { name?: string; description?: string; access?: string };
+  const name = body.name?.trim();
+  if (!name) return Response.json({ error: "name is required" }, { status: 400 });
+  if (body.access && !["none", "read", "write", "admin"].includes(body.access))
+    return Response.json({ error: "access must be none|read|write|admin" }, { status: 400 });
+  const rows = await sql<{ id: string }[]>`
+    INSERT INTO common.groups (org_id, name, description) VALUES (${orgId}, ${name}, ${body.description ?? null})
+    ON CONFLICT (org_id, name) DO NOTHING RETURNING id
+  `;
+  if (!rows.length) return Response.json({ error: "A group with that name already exists" }, { status: 409 });
+  // Convenience: an org-wide rule in one step; finer rules via POST /api/v1/permissions
+  if (body.access) {
+    await sql`
+      INSERT INTO common.permissions (org_id, principal, resource, access)
+      VALUES (${orgId}, ${"group:" + rows[0].id}, '*', ${body.access})
+    `;
+  }
+  return Response.json({ id: rows[0].id, name, description: body.description ?? null }, { status: 201 });
+}
+
+async function handleUpdateGroup(groupId: string, req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+  const body = await req.json().catch(() => ({})) as { name?: string; description?: string };
+  const rows = await sql<{ id: string }[]>`
+    UPDATE common.groups SET name = COALESCE(${body.name?.trim() || null}, name),
+      description = COALESCE(${body.description ?? null}, description)
+    WHERE id = ${groupId} AND org_id = ${orgId} RETURNING id
+  `.catch(() => null);
+  if (rows === null) return Response.json({ error: "A group with that name already exists" }, { status: 409 });
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ id: groupId, updated: true });
+}
+
+async function handleDeleteGroup(groupId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+  const rows = await sql<{ id: string }[]>`DELETE FROM common.groups WHERE id = ${groupId} AND org_id = ${orgId} RETURNING id`;
+  if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  await sql`DELETE FROM common.permissions WHERE org_id = ${orgId} AND principal = ${"group:" + groupId}`;
+  return Response.json({ id: groupId, deleted: true });
+}
+
+async function handleGroupMember(groupId: string, memberId: string, add: boolean, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
+  if (guard) return guard;
+  const g = await sql`SELECT 1 FROM common.groups WHERE id = ${groupId} AND org_id = ${orgId}`;
+  if (!g.length) return Response.json({ error: "Not found" }, { status: 404 });
+  if (add) {
+    if (!(await isOrgMember(memberId, orgId)) || memberId === orgId)
+      return Response.json({ error: "Only members of this org can be added to its groups" }, { status: 400 });
+    await sql`INSERT INTO common.group_members (group_id, user_id) VALUES (${groupId}, ${memberId}) ON CONFLICT DO NOTHING`;
+  } else {
+    await sql`DELETE FROM common.group_members WHERE group_id = ${groupId} AND user_id = ${memberId}`;
+  }
+  return Response.json({ groupId, userId: memberId, member: add });
+}
+
+// Groups named by an invite must belong to the inviting org.
+async function validGroupIds(orgId: string, ids: unknown): Promise<string[] | null> {
+  if (ids === undefined || ids === null) return [];
+  if (!Array.isArray(ids) || !ids.every(x => typeof x === "string")) return null;
+  if (!ids.length) return [];
+  const rows = await sql<{ id: string }[]>`SELECT id FROM common.groups WHERE org_id = ${orgId} AND id = ANY(${ids})`;
+  return rows.length === new Set(ids).size ? rows.map(r => r.id) : null;
+}
+
+async function joinInviteGroups(orgId: string, userId: string, groupIds: string[]): Promise<void> {
+  if (!groupIds?.length) return;
+  await sql`
+    INSERT INTO common.group_members (group_id, user_id)
+    SELECT id, ${userId} FROM common.groups WHERE org_id = ${orgId} AND id = ANY(${groupIds})
+    ON CONFLICT DO NOTHING
+  `;
+}
+
+// -------------------------------------------------------
+// Impersonation (org admins "view as" a member of their org)
+// -------------------------------------------------------
+
+const IMPERSONATION_MINUTES = 60;
+
+function impersonationInfo(user: SessionUser) {
+  return user.impersonator
+    ? { as: { userId: user.userId, name: user.name, email: user.email }, by: { userId: user.impersonator.userId, name: user.impersonator.name, email: user.impersonator.email }, orgId: user.keyOrgId, expiresAt: user.impersonator.expiresAt }
+    : null;
+}
+
+async function handleStartImpersonation(targetId: string, user: SessionUser): Promise<Response> {
+  // Browser sessions only: an API key can't impersonate
+  if (!user.sessionId || user.keyId) return Response.json({ error: "Impersonation needs a signed-in session, not an API key" }, { status: 403 });
+  const orgId = await resolveUserOrgId(user.userId, user.sessionId, user.keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(user.userId, orgId);
+  if (guard) return guard;
+  if (targetId === user.userId) return Response.json({ error: "You can't impersonate yourself" }, { status: 400 });
+  if (targetId === orgId) return Response.json({ error: "The org owner can't be impersonated" }, { status: 403 });
+  if (!(await isOrgMember(targetId, orgId))) return Response.json({ error: "Not a member of this org" }, { status: 404 });
+
+  await sql`UPDATE common.impersonations SET ended_at = NOW() WHERE session_id = ${user.sessionId} AND ended_at IS NULL`;
+  const [row] = await sql<{ id: string; expires_at: Date }[]>`
+    INSERT INTO common.impersonations (session_id, org_id, admin_user_id, target_user_id, expires_at)
+    VALUES (${user.sessionId}, ${orgId}, ${user.userId}, ${targetId}, NOW() + ${IMPERSONATION_MINUTES + " minutes"}::interval)
+    RETURNING id, expires_at
+  `;
+  const [t] = await sql<{ name: string; email: string }[]>`SELECT name, email FROM "user" WHERE id = ${targetId}`;
+  logAccess(orgId, `member:${user.userId}`, `impersonation-start:${targetId}`, "POST", `/api/v1/members/${targetId}/impersonate`, 200);
+  return Response.json({ impersonationId: row.id, as: { userId: targetId, name: t?.name, email: t?.email }, orgId, expiresAt: row.expires_at });
+}
+
+async function handleEndImpersonation(user: SessionUser): Promise<Response> {
+  if (!user.impersonator || !user.sessionId) return Response.json({ ended: false, reason: "not impersonating" });
+  await sql`UPDATE common.impersonations SET ended_at = NOW() WHERE session_id = ${user.sessionId} AND ended_at IS NULL`;
+  logAccess(user.keyOrgId ?? "", `member:${user.impersonator.userId}`, `impersonation-end:${user.userId}`, "DELETE", "/api/v1/impersonation", 200);
+  return Response.json({ ended: true });
 }
 
 // -------------------------------------------------------
@@ -5189,6 +5485,10 @@ async function handleListMembers(userId: string, sessionId: string | null, keyOr
     WHERE m.org_id = ${orgId}
     ORDER BY m.joined_at ASC
   `;
+  const memberGroups = await sql<{ user_id: string; id: string; name: string }[]>`
+    SELECT gm.user_id, g.id, g.name FROM common.group_members gm JOIN common.groups g ON g.id = gm.group_id
+    WHERE g.org_id = ${orgId} ORDER BY g.name
+  `;
   return Response.json({
     members: members.map(m => ({
       userId: m.user_id,
@@ -5196,6 +5496,7 @@ async function handleListMembers(userId: string, sessionId: string | null, keyOr
       joinedAt: m.joined_at,
       name: m.name,
       email: m.email,
+      groups: memberGroups.filter(g => g.user_id === m.user_id).map(g => ({ id: g.id, name: g.name })),
     })),
   });
 }
@@ -5214,6 +5515,12 @@ async function handleRemoveMember(memberId: string, userId: string, sessionId: s
     RETURNING user_id
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
+  // Leaving the org also leaves its groups and ends any impersonation of them
+  await sql`
+    DELETE FROM common.group_members gm USING common.groups g
+    WHERE gm.group_id = g.id AND g.org_id = ${orgId} AND gm.user_id = ${memberId}
+  `;
+  await sql`UPDATE common.impersonations SET ended_at = NOW() WHERE org_id = ${orgId} AND target_user_id = ${memberId} AND ended_at IS NULL`;
   return Response.json({ userId: memberId, removed: true });
 }
 
@@ -5286,6 +5593,12 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
 
   if (!principal) return Response.json({ error: "principal is required" }, { status: 400 });
   if (!resource)  return Response.json({ error: "resource is required" }, { status: 400 });
+  if (!/^(\*|member:.+|key:.+|group:.+)$/.test(principal))
+    return Response.json({ error: "principal must be *, member:<userId>, key:<keyId> or group:<groupId>" }, { status: 400 });
+  if (principal.startsWith("group:")) {
+    const g = await sql`SELECT 1 FROM common.groups WHERE id = ${principal.slice(6)} AND org_id = ${orgId}`;
+    if (!g.length) return Response.json({ error: "Unknown group for this org" }, { status: 400 });
+  }
   if (!["none", "read", "write", "admin"].includes(access))
     return Response.json({ error: "access must be none|read|write|admin" }, { status: 400 });
   if (filterLang && !["jq", "jmespath", "jsonata"].includes(filterLang))
@@ -5308,7 +5621,7 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
     VALUES
       (${orgId}, ${principal}, ${resource}, ${access}, ${labelFilter}, ${filterLang}, ${filterExpr},
        ${auditReads}, ${auditWrites}, ${alias})
-    ON CONFLICT (principal, resource) DO UPDATE
+    ON CONFLICT (org_id, principal, resource) DO UPDATE
       SET access       = EXCLUDED.access,
           label_filter = EXCLUDED.label_filter,
           filter_lang  = EXCLUDED.filter_lang,
