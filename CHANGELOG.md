@@ -5,6 +5,13 @@ All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 ## Unreleased
 
 ### Security
+- **`?depth=` could reveal private documents.** `$ref` resolution looked up referenced documents in any collection or tree of the org without an access check, so a public document referencing a private one showed the private data to anyone. References now follow the reader's own rules (including label filters); one they can't read resolves to `{ "$ref": "…", "$forbidden": true }`.
+- **Members could read every collection through `llms.txt`.** An org's `llms.txt` treated every member (and narrowed keys) like the owner. Each reader now sees only what their own rules allow; only the owner's own session sees everything, and a key from another org gets the public view.
+- **The owner's API keys couldn't be narrowed.** The owner bypass ran before a key's own `key:` rules, so a read-only owner key could still write. Key rules now narrow the owner's keys too.
+- **Label filters were bypassed by version history.** A reader whose rule only shows `published` could read any version and diff. Under a label-filtered rule the version list, versions and diffs return 403; under a rule with a data filter, diffs do.
+- **Webhook address check bypassed with IPv6 forms of internal addresses** (`[::ffff:127.0.0.1]`, NAT64, 6to4). IPv6 addresses are now parsed fully and embedded IPv4 addresses checked.
+- `/api/v1/projects` no longer lists collections that a public `none` rule closes.
+- Cookie-based `/api/auth` POSTs from untrusted origins are refused (403), so another site can't sign a visitor in or out.
 - **Webhooks can't reach private addresses.** Any org owner could register a webhook pointing at the server's own network (the database, other containers, `169.254.169.254`), and the delivery log's status codes showed what answered. URLs must now be `http(s)` and resolve to public addresses, checked on save and before every delivery; redirects aren't followed. Internal receivers can be allowed by host name with `WREN_WEBHOOK_ALLOW_HOSTS`.
 
 ### Added
@@ -14,6 +21,21 @@ All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 ### Fixed
 - **Webhooks come from the same change feed**, so payloads are complete: `document.created` now includes the document `id` (documented but missing), every document event carries `version`, `label.set` says which label moved and to which version, and `schema.updated` (documented, never sent) is sent. New type `label.removed`. A rollback is reported as `document.updated` (the old `rollback: true` flag is gone).
 - Orgs without webhooks no longer store an event row for every write.
+- **Index declarations created nothing, and could leave a connection pointed at a tenant.** Declared indexes ran `SET search_path` on one pooled connection and the DDL on another, so `CREATE INDEX` failed (only logged) and the setting stayed on that pooled connection. They now run in one transaction with `SET LOCAL`.
+- **Public `llms.txt` listed unreleased tree paths.** For a tree whose public rule shows only `published`, the Trees section now lists only released pages; it also names each page's collection instead of `_paths`.
+- Old versions and diffs of a deleted document are no longer readable (the version list already returned 404).
+- `?where=`: the documented `!~*` operator works (it was read as `~*`), values containing `:` or `=` no longer cut the path short, and `@>` containment matches (the JSON value was encoded twice; nested paths returned 500).
+- `_query` cursor paging visits every document once (it sorted by time but paged by random id).
+- `avg` (and every `count`/`sum`) metric is a number, not a string like `"2024.5000000000000000"`.
+- A rollback refreshes materialized queries like any other write.
+- `$ref`: the same document referenced twice resolves both times; only a reference to one of its own ancestors is `$circular`.
+- Tree reads: `_` and `%` in a path match themselves instead of acting as wildcards.
+- Replaying a webhook delivers the events (they were queued forever), and only to that webhook (not every webhook of the org).
+- Removed members can't read the org's usage.
+- A tree alias serves the requested path (it always served the root); a duplicate alias is a 409 (was a 500).
+- Moving an existing label or path while impersonating records the impersonating admin.
+- Rules: a filter expression that doesn't compile is refused when the rule is saved (it used to turn every read into null). Invites: the address must be an email.
+- A request body that isn't valid JSON is a 400 everywhere (was a 500); assigning an unknown document to a tree path is a 404 (was a 500). Unexpected errors return a JSON 500 with CORS headers.
 
 ## 0.6.0 — 2026-10-04
 

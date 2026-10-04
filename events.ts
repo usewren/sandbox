@@ -81,6 +81,8 @@ export async function startEvents(sql: Sql, onChange: (orgId: string, change: Ch
       const orgId = await orgFor(String(m.s));
       if (!orgId) return;
       const change = fromNotify(m);
+      // Internal collections (e.g. _paths, which records tree assignments) aren't data
+      if (change.collection?.startsWith("_")) return;
       const stored = { seq: ++seq, change };
       let buf = buffers.get(orgId);
       if (!buf) { buf = []; buffers.set(orgId, buf); }

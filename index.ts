@@ -686,19 +686,21 @@ function isPublicPath(pathname: string): boolean {
   return pathname.startsWith("/orgs/") || pathname.startsWith("/api/v1/orgs/") || pathname === "/api/v1/projects";
 }
 
+/** Origins that may use the session cookie: configured ones, and the server's own site. */
+function isTrustedOrigin(origin: string | null, host: string | null): boolean {
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+  // Same-site: if the Origin's host matches the request Host header, always allow.
+  // This covers Cloudflare Tunnel and any reverse proxy without needing env vars.
+  try { return !!host && new URL(origin).host === host; } catch { return false; }
+}
+
 function corsHeaders(origin: string | null, host: string | null, pathname: string): Record<string, string> {
   const base = {
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Accept, Cookie, Authorization",
   };
-  let trusted = false;
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    trusted = true;
-  } else if (origin && host) {
-    // Same-site: if the Origin's host matches the request Host header, always allow.
-    // This covers Cloudflare Tunnel and any reverse proxy without needing env vars.
-    try { if (new URL(origin).host === host) trusted = true; } catch {}
-  }
+  const trusted = isTrustedOrigin(origin, host);
   // Public routes: always "*" regardless of Origin, so a CDN-cached response is valid
   // for every site. Same-origin pages don't need CORS at all.
   if (isPublicPath(pathname)) return { ...base, "Access-Control-Allow-Origin": "*" };
@@ -829,8 +831,9 @@ async function checkAccess(
   resource: string,
   requiredAccess: "read" | "write" | "admin",
 ): Promise<AccessResult> {
-  // Org owners bypass all permission checks
-  if (userId === orgId) {
+  // Org owners bypass all permission checks — except through a key that has rules of
+  // its own: those narrow it, for the owner's keys as for anyone's.
+  if (userId === orgId && !(principal.startsWith("key:") && await keyHasOwnRules(orgId, principal))) {
     return { allowed: true, auditReads: false, auditWrites: false };
   }
 
@@ -898,25 +901,29 @@ async function checkAccess(
   };
 }
 
+/** Whether a key has rules of its own in this org (which narrow it). */
+async function keyHasOwnRules(orgId: string, principal: string): Promise<boolean> {
+  const own = await sql<{ x: number }[]>`
+    SELECT 1 AS x FROM common.permissions WHERE org_id = ${orgId} AND principal = ${principal} LIMIT 1
+  `;
+  return own.length > 0;
+}
+
 // Principals whose permission rules apply to a caller in an org:
 //   '*'                      → just '*' (public reads)
 //   member:<uid>             → that member + their groups in the org
 //   key:<id> with own rules  → just the key (rules on a key narrow it)
 //   key:<id> without rules   → acts as the person who created it (member + groups)
+// (The owner's own keys only get here when they have rules of their own.)
 // Callers who aren't (or no longer are) members of the org get nothing, so a
-// removed member's old keys stop working. The owner is handled before this.
+// removed member's old keys stop working. The owner always counts as a member.
 async function effectivePrincipals(orgId: string, userId: string, principal: string): Promise<string[]> {
   if (principal === "*" || !userId) return [principal];
-  const member = await sql<{ x: number }[]>`
+  const member = userId === orgId || (await sql<{ x: number }[]>`
     SELECT 1 AS x FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${userId}
-  `;
-  if (!member.length) return [];
-  if (principal.startsWith("key:")) {
-    const own = await sql<{ x: number }[]>`
-      SELECT 1 AS x FROM common.permissions WHERE org_id = ${orgId} AND principal = ${principal} LIMIT 1
-    `;
-    if (own.length) return [principal];
-  }
+  `).length > 0;
+  if (!member) return [];
+  if (principal.startsWith("key:") && await keyHasOwnRules(orgId, principal)) return [principal];
   const groups = await sql<{ id: string }[]>`
     SELECT g.id FROM common.groups g JOIN common.group_members gm ON gm.group_id = g.id
     WHERE g.org_id = ${orgId} AND gm.user_id = ${userId}
@@ -936,6 +943,23 @@ function logAccess(
     INSERT INTO common.access_log (org_id, principal, resource, method, path, status)
     VALUES (${orgId}, ${principal}, ${resource}, ${method}, ${path}, ${status})
   `.catch(() => {});
+}
+
+/** Why a filter expression can't be used, or null. Checked when a rule is saved, so a
+ *  typo doesn't silently turn every read under the rule into null. */
+async function filterExprError(lang: string, expr: string): Promise<string | null> {
+  try {
+    if (lang === "jmespath") jmespath.compile(expr);
+    else if (lang === "jsonata") jsonata(expr);
+    else if (lang === "jq") {
+      // jq has no separate compile step: run it on {} and only count compile errors
+      try { await jqJson({}, expr); }
+      catch (e) { if (/compile|syntax/i.test(String(e))) throw e; }
+    }
+    return null;
+  } catch (e) {
+    return `filterExpr is not valid ${lang}: ${String((e as Error)?.message ?? e).slice(0, 200)}`;
+  }
 }
 
 async function applyDataFilter(data: unknown, lang: string, expr: string): Promise<unknown> {
@@ -982,7 +1006,7 @@ const server = Bun.serve({
       : req;
 
     const ctx: RequestContext = {};
-    let res = await requestContext.run(ctx, () => handleRequest(effectiveReq, url));
+    let res = await requestContext.run(ctx, () => handleRequest(effectiveReq, url)).catch(errorResponse);
     // Every request made while impersonating is audit-logged with both identities
     if (ctx.audit && ctx.impersonatedBy) {
       logAccess(ctx.audit.orgId, `member:${ctx.audit.targetId}`, `impersonated-by:${ctx.impersonatedBy}`, req.method, url.pathname, res.status);
@@ -1014,6 +1038,25 @@ const server = Bun.serve({
     return res;
   },
 });
+
+/** Escape LIKE wildcards so "_" and "%" in a path match themselves. */
+function likeEscape(s: string): string {
+  return s.replace(/[\\%_]/g, "\\$&");
+}
+
+/** Thrown from deep inside a handler (e.g. a transaction) to answer with this status. */
+class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+
+// Errors no handler turned into a response. A body that isn't valid JSON (from
+// `await req.json()` in any handler) is the client's mistake; anything else is ours.
+function errorResponse(err: unknown): Response {
+  if (err instanceof HttpError) return Response.json({ error: err.message }, { status: err.status });
+  if (err instanceof SyntaxError) return Response.json({ error: "Request body is not valid JSON" }, { status: 400 });
+  console.error("[unhandled]", err);
+  return Response.json({ error: "Internal server error" }, { status: 500 });
+}
 
 async function handleRequest(req: Request, url: URL): Promise<Response> {
 
@@ -1222,6 +1265,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     if (url.pathname.startsWith("/api/auth")) {
+      // Cookie-based auth actions (sign-in, sign-out, password change…) only from our own
+      // site or configured origins, so another site can't trigger them in a visitor's
+      // browser. OAuth token and client registration don't use cookies; apps call them.
+      const origin = req.headers.get("origin");
+      if (req.method === "POST" && origin && !isTrustedOrigin(origin, req.headers.get("host"))
+          && url.pathname !== "/api/auth/mcp/token" && url.pathname !== "/api/auth/mcp/register") {
+        return Response.json({ error: "Origin not allowed" }, { status: 403 });
+      }
       const proto = req.headers.get("x-forwarded-proto");
       const authReq = proto === "https" && !req.url.startsWith("https://")
         ? new Request(req.url.replace(/^http:/, "https:"), {
@@ -1638,7 +1689,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Route: GET /{collection}
     if (req.method === "GET" && !id) {
       let res = await handleList(schemaName, collection, url, user.userId, colAr.labelFilter);
-      res = await withRefResolution(res, schemaName, url, colAr.labelFilter);
+      res = await withRefResolution(res, schemaName, url, colAr.labelFilter, resource => checkAccess(orgId, user.userId, principal, resource, "read"));
       audit(colAr, colResource, true, res.status);
       return filterResponse(res, colAr);
     }
@@ -1708,7 +1759,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
           : url;
         let r = await handleGetByKey(schemaName, collection, keyValue, effectiveUrl);
-        r = await withRefResolution(r, schemaName, url, effectiveLabel);
+        r = await withRefResolution(r, schemaName, url, effectiveLabel, resource => checkAccess(orgId, user.userId, principal, resource, "read"));
         audit(colAr, colResource, true, r.status);
         return filterResponse(r, colAr);
       }
@@ -1747,7 +1798,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
         : url;
       let r = await handleGet(schemaName, collection, id, effectiveUrl);
-      r = await withRefResolution(r, schemaName, url, effectiveLabel);
+      r = await withRefResolution(r, schemaName, url, effectiveLabel, resource => checkAccess(orgId, user.userId, principal, resource, "read"));
       audit(colAr, colResource, true, r.status);
       return filterResponse(r, colAr);
     }
@@ -1800,8 +1851,18 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return r;
     }
 
+    // History would show versions a label-filtered rule hides, and a diff shows data a
+    // data filter would remove: neither is available under such a rule.
+    const historyDenied = (showsData: boolean) => colAr.labelFilter
+      ? Response.json({ error: `This rule only shows the "${colAr.labelFilter}" version` }, { status: 403 })
+      : showsData && colAr.filterExpr
+        ? Response.json({ error: "Diffs aren't available under a rule with a data filter" }, { status: 403 })
+        : null;
+
     // Route: GET /{collection}/{id}/versions
     if (req.method === "GET" && id && sub === "versions" && !version) {
+      const denied = historyDenied(false);
+      if (denied) return denied;
       const r = await handleVersionList(schemaName, collection, id);
       audit(colAr, colResource, true, r.status);
       return r;
@@ -1809,6 +1870,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Route: GET /{collection}/{id}/versions/{v}
     if (req.method === "GET" && id && sub === "versions" && version) {
+      const denied = historyDenied(false);
+      if (denied) return denied;
       const r = await handleVersionGet(schemaName, collection, id, version);
       audit(colAr, colResource, true, r.status);
       return filterResponse(r, colAr);
@@ -1820,6 +1883,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
+        refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
       }
       return r;
     }
@@ -1836,6 +1900,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Route: GET /{collection}/{id}/diff
     if (req.method === "GET" && id && sub === "diff") {
+      const denied = historyDenied(true);
+      if (denied) return denied;
       const r = await handleDiff(schemaName, collection, id, url);
       audit(colAr, colResource, true, r.status);
       return r;
@@ -1959,50 +2025,55 @@ function compileWhere(where: string): { sql: string; params: unknown[] } {
     if (part.toUpperCase() === "AND") { sqlParts.push("AND"); continue; }
     if (part.toUpperCase() === "OR") { sqlParts.push("OR"); continue; }
 
-    // Parse: path operator value
-    // Try multi-char operators first, then single-char
+    // Parse: path operator value. Split at the first operator in the text, and at
+    // that position take the longest one (so "!~*" isn't read as "!" + "~*", and a
+    // ":" or "=" inside the value doesn't end the path).
     let matched = false;
-    for (const op of ["!=", ">=", "<=", "~*", "!~*", "@>", ":", "=", ">", "<"]) {
+    let best: { op: string; idx: number } | null = null;
+    for (const op of ["!~*", "!=", ">=", "<=", "~*", "@>", ":", "=", ">", "<"]) {
       const idx = part.indexOf(op);
-      if (idx > 0) {
-        const path = part.slice(0, idx).trim();
-        const value = part.slice(idx + op.length).trim();
-        // Accept both simple paths and array-unnest paths
-        if (!SAFE_PATH.test(path) && !SAFE_ARRAY_PATH.test(path)) throw new Error(`Invalid filter path: ${path}`);
-        const sqlOp = WHERE_OPS[op];
+      if (idx > 0 && (!best || idx < best.idx || (idx === best.idx && op.length > best.op.length))) best = { op, idx };
+    }
+    if (best) {
+      const { op, idx } = best;
+      const path = part.slice(0, idx).trim();
+      const value = part.slice(idx + op.length).trim();
+      // Accept both simple paths and array-unnest paths
+      if (!SAFE_PATH.test(path) && !SAFE_ARRAY_PATH.test(path)) throw new Error(`Invalid filter path: ${path}`);
+      const sqlOp = WHERE_OPS[op];
 
-        // Array paths with [] → EXISTS subquery with LATERAL unnest
-        if (path.includes("[]")) {
-          const compiled = compileArrayPath(path);
+      // Array paths with [] → EXISTS subquery with LATERAL unnest
+      if (path.includes("[]")) {
+        const compiled = compileArrayPath(path);
+        const cleanValue = value.replace(/^['"]|['"]$/g, "");
+        params.push(cleanValue);
+        const existsSql = `EXISTS (SELECT 1 FROM documents _fd
+          JOIN versions _fv ON _fv.document_id = _fd.id AND _fv.version = _fd.current_version
+          ${compiled.laterals.join("\n            ")}
+          WHERE _fd.id = d.id AND ${compiled.leaf} ${sqlOp} $${params.length})`;
+        sqlParts.push(existsSql);
+      } else {
+        const segments = path.split(".");
+        const jsonPath = segments.length === 1
+          ? `v.data->>'${segments[0]}'`
+          : `v.data #>> '{${segments.join(",")}}'`;
+
+        if (op === "@>") {
+          const jsonSegments = segments.length === 1 ? `v.data->'${segments[0]}'` : `v.data #> '{${segments.join(",")}}'`;
+          try { JSON.parse(value); } catch { throw new Error(`@> needs a JSON value: ${value}`); }
+          params.push(value);
+          // bind as text, then parse once (binding as jsonb would encode the string again)
+          sqlParts.push(`${jsonSegments} @> ($${params.length}::text)::jsonb`);
+        } else if ([">", ">=", "<", "<="].includes(op)) {
+          params.push(parseFloat(value) || value);
+          sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
+        } else {
           const cleanValue = value.replace(/^['"]|['"]$/g, "");
           params.push(cleanValue);
-          const existsSql = `EXISTS (SELECT 1 FROM documents _fd
-            JOIN versions _fv ON _fv.document_id = _fd.id AND _fv.version = _fd.current_version
-            ${compiled.laterals.join("\n            ")}
-            WHERE _fd.id = d.id AND ${compiled.leaf} ${sqlOp} $${params.length})`;
-          sqlParts.push(existsSql);
-        } else {
-          const segments = path.split(".");
-          const jsonPath = segments.length === 1
-            ? `v.data->>'${segments[0]}'`
-            : `v.data #>> '{${segments.join(",")}}'`;
-
-          if (op === "@>") {
-            const jsonSegments = segments.length === 1 ? `v.data->'${segments[0]}'` : `v.data #> '{${segments.join(",")}'`;
-            params.push(value);
-            sqlParts.push(`${jsonSegments} @> $${params.length}::jsonb`);
-          } else if ([">", ">=", "<", "<="].includes(op)) {
-            params.push(parseFloat(value) || value);
-            sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
-          } else {
-            const cleanValue = value.replace(/^['"]|['"]$/g, "");
-            params.push(cleanValue);
-            sqlParts.push(`${jsonPath} ${sqlOp} $${params.length}`);
-          }
+          sqlParts.push(`${jsonPath} ${sqlOp} $${params.length}`);
         }
-        matched = true;
-        break;
       }
+      matched = true;
     }
     if (!matched) throw new Error(`Invalid filter expression: ${part}`);
   }
@@ -2253,11 +2324,12 @@ async function handleQuery(
           params.push(...whereClause.params);
         }
 
-        // Cursor (id-based for timestamp-precision safety)
+        // Cursor: continue after the cursor's document in (created_at, id) order. Its
+        // timestamp is read from the database, so microsecond precision is kept.
         if (cursorParams.length) {
           params.push(...cursorParams);
           const idParam = `$${params.length}`;
-          extraWhere += ` AND d.id < ${idParam}`;
+          extraWhere += ` AND (d.created_at, d.id) < (SELECT c.created_at, c.id FROM documents c WHERE c.id = ${idParam})`;
         }
 
         params.push(limit + 1); // over-fetch by 1 for cursor
@@ -2318,6 +2390,7 @@ async function handleQuery(
       const allLaterals: string[] = [];
       const metricExprs: string[] = [];
       const metricNames: string[] = [];
+      const numericMetrics = new Set<string>(); // count, countDistinct, sum, avg
       let lateralIdx = 0;
 
       for (const [name, def] of Object.entries(metrics)) {
@@ -2341,6 +2414,7 @@ async function handleQuery(
           case "avg":          metricExprs.push(`AVG((${leaf})::numeric) AS "${name}"`); break;
         }
         metricNames.push(name);
+        if (op !== "min" && op !== "max") numericMetrics.add(name);
       }
 
       // Build groupBy expressions — array paths with [] get LATERAL joins
@@ -2427,11 +2501,11 @@ async function handleQuery(
           const metricValues: Record<string, unknown> = {};
           for (const name of metricNames) {
             const val = r[name];
-            // Only coerce to number if the entire string is numeric (count/sum/avg results).
-            // min/max on strings must stay as strings.
+            // count/sum/avg are numbers (Postgres returns bigint/numeric as strings, e.g.
+            // "2024.5000000000000000"). min/max keep their type unless the value is a plain number.
             if (typeof val === "string") {
               const num = Number(val);
-              metricValues[name] = !isNaN(num) && String(num) === val.trim() ? num : val;
+              metricValues[name] = numericMetrics.has(name) || (!isNaN(num) && String(num) === val.trim()) ? num : val;
             } else {
               metricValues[name] = val;
             }
@@ -2828,7 +2902,7 @@ async function handleListProjects(url: URL): Promise<Response> {
     FROM common.permissions p
     JOIN common.org_slugs s ON s.org_id = p.org_id
     JOIN "user" u ON u.id = p.org_id
-    WHERE p.principal = '*'
+    WHERE p.principal = '*' AND p.access <> 'none'  -- a 'none' rule closes a resource
     ORDER BY u.name, p.resource
   `;
 
@@ -2917,6 +2991,7 @@ async function handlePublicCollectionRequest(
   // Check if the collection/tree name is actually an alias on a permission rule.
   // If so, resolve it to the real resource name. Aliases only work for principal='*' rules.
   let resolvedCollection = collection;
+  let treeAlias: string | null = null; // the URL said /{alias}/… instead of /tree/{name}/…
   if (collection !== "tree" && collection !== "wren.js" && collection !== "llms.txt") {
     const aliasRow = await sql<{ resource: string }[]>`
       SELECT resource FROM common.permissions
@@ -2930,7 +3005,7 @@ async function handlePublicCollectionRequest(
         // Redirect to tree handler with the real tree name
         resolvedCollection = "tree";
         id = realName;
-        sub = sub; // preserve existing sub segments
+        treeAlias = collection;
       } else {
         resolvedCollection = realName;
       }
@@ -2949,8 +3024,9 @@ async function handlePublicCollectionRequest(
 
     // Reconstruct the full tree path from the raw URL — support both the canonical
     // /api/v1/orgs/{slug}/tree/{treeName}/... and the short /orgs/{slug}/tree/{treeName}/... alias.
-    const apiPrefix   = `/api/v1/orgs/${slug}/tree/${treeName}`;
-    const shortPrefix = `/orgs/${slug}/tree/${treeName}`;
+    const urlTree = treeAlias ?? `tree/${treeName}`;
+    const apiPrefix   = `/api/v1/orgs/${slug}/${urlTree}`;
+    const shortPrefix = `/orgs/${slug}/${urlTree}`;
     const treePath = url.pathname.startsWith(apiPrefix)   ? url.pathname.slice(apiPrefix.length)   || "/" :
                      url.pathname.startsWith(shortPrefix) ? url.pathname.slice(shortPrefix.length) || "/" :
                      "/";
@@ -2994,7 +3070,7 @@ async function handlePublicCollectionRequest(
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
     let r = await handleGetByKey(schemaName, resolvedCollection, keyValue, effectiveUrl);
-    r = await withRefResolution(r, schemaName, url, effectiveLabel);
+    r = await withRefResolution(r, schemaName, url, effectiveLabel, resource => checkAccess(orgId, "", "*", resource, "read"));
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
@@ -3008,13 +3084,13 @@ async function handlePublicCollectionRequest(
       ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
       : url;
     let r = await handleGet(schemaName, resolvedCollection, id, effectiveUrl);
-    r = await withRefResolution(r, schemaName, url, effectiveLabel);
+    r = await withRefResolution(r, schemaName, url, effectiveLabel, resource => checkAccess(orgId, "", "*", resource, "read"));
     return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
   }
 
   // GET /orgs/{slug}/{collection} — list documents
   let r = await handleList(schemaName, resolvedCollection, url, "", ar.labelFilter);
-  r = await withRefResolution(r, schemaName, url, ar.labelFilter);
+  r = await withRefResolution(r, schemaName, url, ar.labelFilter, resource => checkAccess(orgId, "", "*", resource, "read"));
   return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
 }
 
@@ -3100,6 +3176,7 @@ const MAX_TREE_REF_LIMIT = 100;
 interface RefPointer {
   path: (string | number)[];
   collection: string;
+  label?: string;          // version to resolve: the caller's rule's label filter, else the request's label
   id?: string;
   key?: string;
   // Tree ref fields
@@ -3181,17 +3258,40 @@ function setAtPath(obj: unknown, path: (string | number)[], value: unknown): voi
  * Uses batch fetching: all refs at one depth level are resolved in a single
  * SQL query per collection. Returns a new data object with refs replaced.
  */
+/** Access to "collection:<name>" or "tree:<name>" for whoever is reading (their own rules). */
+type RefAccess = (resource: string) => Promise<AccessResult>;
+
 async function resolveDocRefs(
   schemaName: string,
   data: unknown,
   maxDepth: number,
-  label?: string,
+  label: string | undefined,
+  access: RefAccess,
 ): Promise<unknown> {
   if (maxDepth <= 0) return data;
 
+  // A ref only resolves if the reader may read its target, under their rule's label
+  // filter. Rules with a data filter don't resolve refs (the filter can't be applied
+  // to an inlined document safely).
+  const accessCache = new Map<string, Promise<AccessResult>>();
+  const canRead = (resource: string) => {
+    if (!accessCache.has(resource)) accessCache.set(resource, access(resource).catch(() => ({ allowed: false, auditReads: false, auditWrites: false })));
+    return accessCache.get(resource)!;
+  };
+
   // Deep clone so we can mutate
   let current = JSON.parse(JSON.stringify(data));
-  const seen = new Set<string>(); // loop detection: "collection:id" or "collection:key:val"
+  // Loop detection: a ref is circular when the same target is already among its own
+  // ancestors. The same document referenced twice side by side is fine.
+  // Key: JSON of a resolved ref's path → targets on the way down to it, itself included.
+  const ancestry = new Map<string, Set<string>>();
+  const ancestorsOf = (path: (string | number)[]) => {
+    for (let n = path.length; n >= 0; n--) {
+      const a = ancestry.get(JSON.stringify(path.slice(0, n)));
+      if (a) return a;
+    }
+    return new Set<string>();
+  };
 
   for (let depth = 0; depth < maxDepth; depth++) {
     const refs = collectRefs(current);
@@ -3210,11 +3310,18 @@ async function resolveDocRefs(
         : ref.isQuery
           ? `${ref.collection}:${ref.queryWhere ?? ""}:${JSON.stringify(ref.queryQ ?? "")}`
           : (ref.id ? `${ref.collection}:${ref.id}` : `${ref.collection}:key:${ref.key}`);
-      if (seen.has(seenKey)) {
+      const above = ancestorsOf(ref.path);
+      if (above.has(seenKey)) {
         setAtPath(current, ref.path, { $circular: true, $ref: ref.collection });
         continue;
       }
-      seen.add(seenKey);
+      ancestry.set(JSON.stringify(ref.path), new Set([...above, seenKey]));
+      const ar = await canRead(ref.isTree ? `tree:${ref.treeName}` : `collection:${ref.isQuery ? ref.queryCollection : ref.collection}`);
+      if (!ar.allowed || ar.filterExpr) {
+        setAtPath(current, ref.path, { $ref: ref.collection, $forbidden: true });
+        continue;
+      }
+      ref.label = ar.labelFilter ?? label;
       if (ref.isTree) treeRefs.push(ref);
       else if (ref.isQuery) queryRefs.push(ref);
       else docRefs.push(ref);
@@ -3227,14 +3334,15 @@ async function resolveDocRefs(
       const treePath = ref.treePath ?? "/";
       const limit = ref.treeLimit ?? DEFAULT_TREE_REF_LIMIT;
 
+      const refLabel = ref.label;
       const nodes = await withTenant(schemaName, async tx => {
-        const prefix = treePath === "/" ? "/%" : treePath.replace(/\/$/, "") + "/%";
-        if (label) {
+        const prefix = (treePath === "/" ? "/" : likeEscape(treePath.replace(/\/$/, "")) + "/") + "%";
+        if (refLabel) {
           return tx<{ path: string; document_id: string; data: unknown }[]>`
             SELECT p.path, p.document_id, v.data
             FROM paths p
             JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
-            JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+            JOIN labels l ON l.document_id = d.id AND l.label = ${refLabel}
             JOIN versions v ON v.document_id = d.id AND v.version = l.version
             WHERE p.tree = ${treeName}
               AND (p.path = ${treePath} OR p.path LIKE ${prefix})
@@ -3267,7 +3375,7 @@ async function resolveDocRefs(
       }
       if (ref.querySelect) queryBody.select = ref.querySelect;
       if (ref.queryWhere) queryBody.where = ref.queryWhere;
-      if (ref.queryLabel || label) queryBody.label = ref.queryLabel ?? label;
+      if (ref.queryLabel || ref.label) queryBody.label = ref.queryLabel ?? ref.label;
       queryBody.limit = ref.queryLimit ?? 20;
 
       try {
@@ -3276,8 +3384,7 @@ async function resolveDocRefs(
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(queryBody),
         });
-        const noPermFilter: AccessResult = { allowed: true, auditReads: false, auditWrites: false };
-        const queryResponse = await handleQuery(schemaName, collection, fakeReq, noPermFilter);
+        const queryResponse = await handleQuery(schemaName, collection, fakeReq, await canRead(`collection:${collection}`));
         const result = await queryResponse.json() as Record<string, unknown>;
         // Inline either rows (aggregate) or items (projection) — or the full result if neither
         setAtPath(current, ref.path, result.rows ?? result.items ?? result);
@@ -3290,11 +3397,13 @@ async function resolveDocRefs(
     // Group by collection for batch fetching
     const byCollection = new Map<string, RefPointer[]>();
     for (const ref of docRefs) {
-      if (!byCollection.has(ref.collection)) byCollection.set(ref.collection, []);
-      byCollection.get(ref.collection)!.push(ref);
+      const group = JSON.stringify([ref.collection, ref.label ?? null]);
+      if (!byCollection.has(group)) byCollection.set(group, []);
+      byCollection.get(group)!.push(ref);
     }
 
-    for (const [collection, colRefs] of byCollection) {
+    for (const colRefs of byCollection.values()) {
+      const { collection, label } = colRefs[0];
       const idRefs = colRefs.filter(r => r.id);
       const keyRefs = colRefs.filter(r => r.key);
 
@@ -3363,7 +3472,8 @@ async function withRefResolution(
   res: Response,
   schemaName: string,
   url: URL,
-  label?: string,
+  label: string | undefined,
+  access: RefAccess,
 ): Promise<Response> {
   const depthParam = url.searchParams.get("depth");
   if (!depthParam) return res;
@@ -3375,13 +3485,13 @@ async function withRefResolution(
 
   // Resolve refs in the data field (single doc) or in each item's data (list)
   if (body.data && typeof body.data === "object") {
-    body.data = await resolveDocRefs(schemaName, body.data, depth, label);
+    body.data = await resolveDocRefs(schemaName, body.data, depth, label, access);
   }
   if (Array.isArray(body.items)) {
     body.items = await Promise.all(
       (body.items as { data: unknown }[]).map(async item => ({
         ...item,
-        data: await resolveDocRefs(schemaName, item.data, depth, label),
+        data: await resolveDocRefs(schemaName, item.data, depth, label, access),
       }))
     );
   }
@@ -3724,7 +3834,7 @@ async function handleVersionGet(schemaName: string, collection: string, id: stri
       FROM versions v
       JOIN documents d ON d.id = v.document_id
       WHERE v.document_id = ${id} AND v.version = ${version}
-        AND d.collection = ${collection}
+        AND d.collection = ${collection} AND d.deleted_at IS NULL
     `;
     return rows[0] ?? null;
   });
@@ -3790,7 +3900,8 @@ async function handleLabel(schemaName: string, collection: string, id: string, r
       INSERT INTO labels (document_id, label, version, created_by)
       VALUES (${id}, ${label}, ${targetVersion}, ${userId})
       ON CONFLICT (document_id, label) DO UPDATE
-        SET version = EXCLUDED.version, updated_at = NOW()
+        SET version = EXCLUDED.version, updated_at = NOW(),
+            impersonated_by = EXCLUDED.impersonated_by -- who moved it last (column default)
     `;
     return { label, version: targetVersion };
   });
@@ -3899,11 +4010,13 @@ async function reconcileIndexes(
     const name = indexName(collection, idx);
     const ddl = buildIndexDDL(collection, idx, name);
     try {
-      await sql.unsafe(`SET search_path TO ${schemaName}, common, public`);
-      if (idx.kind === "trigram") {
-        await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
-      }
-      await sql.unsafe(ddl);
+      // One transaction, so the search_path applies to the DDL's connection and
+      // ends with it (a plain SET would stick to a pooled connection).
+      await sql.begin(async tx => {
+        await tx.unsafe(`SET LOCAL search_path TO ${schemaName}, common, public`);
+        if (idx.kind === "trigram") await tx.unsafe(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+        await tx.unsafe(ddl);
+      });
     } catch (e) { console.error(`[index] failed to create ${name}:`, String(e).slice(0, 200)); }
   }
 }
@@ -4211,7 +4324,7 @@ async function handleDiff(schemaName: string, collection: string, id: string, ur
       FROM versions v
       JOIN documents d ON d.id = v.document_id
       WHERE v.document_id = ${id} AND v.version IN (${v1}, ${v2})
-        AND d.collection = ${collection}
+        AND d.collection = ${collection} AND d.deleted_at IS NULL
       ORDER BY v.version
     `;
     if (rows.length < 2) return null;
@@ -4292,8 +4405,9 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
       SELECT document_id, assignment_doc_id FROM paths WHERE tree = ${treeName} AND path = ${treePath}
     `;
 
-    // Direct children — paths one level deeper
-    const prefix = treePath.replace(/\/$/, "") + "/";
+    // Everything below this path (all depths: a deep path needn't have a row for
+    // each folder above it)
+    const prefix = likeEscape(treePath.replace(/\/$/, "")) + "/";
     const children = await tx<{ document_id: string; path: string }[]>`
       SELECT document_id, path FROM paths
       WHERE tree = ${treeName} AND path LIKE ${prefix + "%"}
@@ -4394,7 +4508,8 @@ async function handleTreePromote(
           INSERT INTO labels (document_id, label, version, created_by)
           VALUES (${r.id}, ${label}, ${r.version}, ${userId})
           ON CONFLICT (document_id, label) DO UPDATE
-            SET version = EXCLUDED.version, updated_at = NOW()
+            SET version = EXCLUDED.version, updated_at = NOW(),
+            impersonated_by = EXCLUDED.impersonated_by -- who moved it last (column default)
         `;
       }
       return rows.map(r => ({ path: r.path, documentId: r.id, collection: r.collection, version: r.version }));
@@ -4434,7 +4549,7 @@ async function handleTreePut(schemaName: string, treeName: string, treePath: str
       const [doc] = await tx<{ id: string }[]>`
         SELECT id FROM documents WHERE id = ${documentId} AND deleted_at IS NULL
       `;
-      if (!doc) throw new Error("Document not found");
+      if (!doc) throw new HttpError(404, "Document not found");
     }
 
     // Get existing path row (if any) to find the assignment doc
@@ -4479,7 +4594,8 @@ async function handleTreePut(schemaName: string, treeName: string, treePath: str
         VALUES (${documentId}, ${treeName}, ${treePath}, ${assignmentDocId})
         ON CONFLICT (tree, path) DO UPDATE
           SET document_id = EXCLUDED.document_id,
-              assignment_doc_id = EXCLUDED.assignment_doc_id
+              assignment_doc_id = EXCLUDED.assignment_doc_id,
+              impersonated_by = EXCLUDED.impersonated_by
       `;
     } else {
       // Create an empty folder or unassign a document (clear document_id)
@@ -4487,7 +4603,7 @@ async function handleTreePut(schemaName: string, treeName: string, treePath: str
         INSERT INTO paths (document_id, tree, path)
         VALUES (${null}, ${treeName}, ${treePath})
         ON CONFLICT (tree, path) DO UPDATE
-          SET document_id = NULL
+          SET document_id = NULL, impersonated_by = EXCLUDED.impersonated_by
       `;
     }
   });
@@ -4683,7 +4799,9 @@ async function handleGetMe(user: SessionUser): Promise<Response> {
   // read the full /api/permissions list.
   const principal = principalFor(user);
   // Same principals the access check uses (own + groups, or a narrowed key), plus public rules
-  const principals = isOwnOrg ? [principal] : await effectivePrincipals(orgId, user.userId, principal);
+  const principals = isOwnOrg && !(principal.startsWith("key:") && await keyHasOwnRules(orgId, principal))
+    ? [principal]
+    : await effectivePrincipals(orgId, user.userId, principal);
   const permRows = await sql<{
     id: string; principal: string; resource: string; access: string;
     label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
@@ -4793,6 +4911,8 @@ const DISK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 async function handleGetOrgUsage(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
+  // The session may still point at an org this person has been removed from
+  if (!(await isOrgMember(userId, orgId))) return Response.json({ error: "Forbidden" }, { status: 403 });
   const schemaName = sanitizeSchemaName(orgId);
 
   // Disk usage — cached 5 minutes
@@ -4934,8 +5054,10 @@ async function generateLlmsTxt(
   accessibleTrees: string[],
   authenticated: boolean,
   publicView: boolean = !authenticated,
+  ruleAccess?: RefAccess, // a member's own rules; null/undefined + !publicView = the owner (everything)
 ): Promise<string> {
   const schema = sanitizeSchemaName(orgId);
+  const accessFor: RefAccess | null = ruleAccess ?? (publicView ? r => checkAccess(orgId, "", "*", r, "read") : null);
 
   // Check if the tenant schema exists
   const schemaExists = await sql<{ exists: boolean }[]>`
@@ -4972,9 +5094,9 @@ async function generateLlmsTxt(
   const collectionData: CollectionData[] = [];
 
   for (const col of accessibleCollections) {
-    // Public viewers only see collections a principal='*' rule actually allows
+    // Public viewers and members only see collections their rules actually allow
     // (a broad '*' rule can be narrowed by a 'none' rule on one collection).
-    const publicAr = publicView ? await checkAccess(orgId, "", "*", `collection:${col}`, "read") : null;
+    const publicAr = accessFor ? await accessFor(`collection:${col}`) : null;
     if (publicAr && !publicAr.allowed) continue;
 
     // Count
@@ -5103,17 +5225,29 @@ async function generateLlmsTxt(
     lines.push("## Trees", "");
 
     for (const treeName of accessibleTrees) {
+      // Publicly, a tree whose rule shows one label only lists the pages released
+      // under it: unreleased paths would give away draft URLs.
+      const treeAr = accessFor ? await accessFor(`tree:${treeName}`) : null;
+      if (treeAr && (!treeAr.allowed || treeAr.filterExpr)) continue;
+      const visibleLabel = treeAr?.labelFilter ?? null;
       const pathRows = await sql<{ path: string; document_id: string; collection: string }[]>`
         SELECT p.path, p.document_id, d.collection
         FROM ${sql.unsafe(schema)}.paths p
-        JOIN ${sql.unsafe(schema)}.documents d ON d.id = p.assignment_doc_id
+        JOIN ${sql.unsafe(schema)}.documents d ON d.id = p.document_id AND d.deleted_at IS NULL
         WHERE p.tree = ${treeName}
+          AND (${visibleLabel}::text IS NULL OR EXISTS (
+            SELECT 1 FROM ${sql.unsafe(schema)}.labels l WHERE l.document_id = d.id AND l.label = ${visibleLabel}))
         ORDER BY p.path
         LIMIT 20
       `;
 
       const totalPaths = await sql<{ count: string }[]>`
-        SELECT COUNT(*)::text AS count FROM ${sql.unsafe(schema)}.paths WHERE tree = ${treeName}
+        SELECT COUNT(*)::text AS count
+        FROM ${sql.unsafe(schema)}.paths p
+        JOIN ${sql.unsafe(schema)}.documents d ON d.id = p.document_id AND d.deleted_at IS NULL
+        WHERE p.tree = ${treeName}
+          AND (${visibleLabel}::text IS NULL OR EXISTS (
+            SELECT 1 FROM ${sql.unsafe(schema)}.labels l WHERE l.document_id = d.id AND l.label = ${visibleLabel}))
       `;
       const pathCount = parseInt(totalPaths[0]?.count ?? "0", 10);
 
@@ -5167,8 +5301,11 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
   // True when the caller only gets what principal='*' rules allow (anonymous or non-member).
   let publicView = !authenticated;
 
-  if (authenticated && (user!.userId === orgId || (() => false)())) {
-    // Authenticated as owner: show all collections
+  // A key only acts in its own org; elsewhere its holder gets the public view
+  const foreignKey = authenticated && !!user!.keyId && user!.keyOrgId !== orgId;
+  let memberAccess: RefAccess | undefined;
+  if (authenticated && !foreignKey && user!.userId === orgId && !user!.keyId) {
+    // The owner, signed in: show all collections
     const colRows = await sql<{ collection: string }[]>`
       SELECT DISTINCT collection FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.documents
       WHERE deleted_at IS NULL
@@ -5181,12 +5318,14 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
     `.catch(() => [] as { tree: string }[]);
     accessibleTrees = treeRows.map(r => r.tree);
   } else if (authenticated) {
-    // Authenticated as someone else: check membership + permissions
-    const isMember = user!.userId === orgId || (await sql<{ org_id: string }[]>`
+    // Authenticated as someone else (or the owner through a key): membership + their rules
+    const isMember = !foreignKey && (user!.userId === orgId || (await sql<{ org_id: string }[]>`
       SELECT org_id FROM common.org_members WHERE org_id = ${orgId} AND user_id = ${user!.userId}
-    `).length > 0;
+    `).length > 0);
 
     if (isMember) {
+      const principal = principalFor(user!);
+      memberAccess = r => checkAccess(orgId, user!.userId, principal, r, "read");
       const colRows = await sql<{ collection: string }[]>`
         SELECT DISTINCT collection FROM ${sql.unsafe(sanitizeSchemaName(orgId))}.documents
         WHERE deleted_at IS NULL
@@ -5242,7 +5381,7 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
     }
   }
 
-  const body = await generateLlmsTxt(orgId, orgName, slug, base, accessibleCollections, accessibleTrees, authenticated, publicView);
+  const body = await generateLlmsTxt(orgId, orgName, slug, base, accessibleCollections, accessibleTrees, authenticated, publicView, memberAccess);
   return new Response(body, { headers: {
     "Content-Type": "text/plain; charset=utf-8",
     // Owner/member views include private data — keep them out of shared caches.
@@ -5304,6 +5443,7 @@ async function handleCreateInvite(req: Request, userId: string, sessionId: strin
   const email = body.email?.trim().toLowerCase();
   const role = body.role ?? "member";
   if (!email) return Response.json({ error: "email is required" }, { status: 400 });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return Response.json({ error: "email is not a valid address" }, { status: 400 });
   // role = what they may manage (admin: invites, keys, rules, groups); groups = which data
   if (!["member", "admin"].includes(role)) return Response.json({ error: "role must be member or admin" }, { status: 400 });
   await ensureDefaultGroups(orgId);
@@ -5952,6 +6092,10 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
     return Response.json({ error: "filterLang must be jq|jmespath|jsonata" }, { status: 400 });
   if (filterExpr && !filterLang)
     return Response.json({ error: "filterLang is required when filterExpr is set" }, { status: 400 });
+  if (filterExpr && filterLang) {
+    const exprError = await filterExprError(filterLang, filterExpr);
+    if (exprError) return Response.json({ error: exprError }, { status: 400 });
+  }
 
   // Validate alias: no reserved keywords, no _ prefix, alphanumeric + hyphens only
   if (alias) {
@@ -5977,7 +6121,12 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
           audit_writes = EXCLUDED.audit_writes,
           alias        = EXCLUDED.alias
     RETURNING id, created_at
-  `;
+  `.catch(e => {
+    if (e?.code === "23505" && String(e.constraint_name ?? "").includes("alias")) {
+      throw new HttpError(409, `Alias "${alias}" is already used by another rule`);
+    }
+    throw e;
+  });
 
   return Response.json({
     id: row.id, principal, resource, access, labelFilter, filterLang, filterExpr,
@@ -5999,6 +6148,16 @@ async function handleUpdatePermission(permId: string, req: Request, userId: stri
     return Response.json({ error: "access must be none|read|write|admin" }, { status: 400 });
   if (body.filterLang && !["jq", "jmespath", "jsonata"].includes(body.filterLang))
     return Response.json({ error: "filterLang must be jq|jmespath|jsonata" }, { status: 400 });
+  if (body.filterExpr || body.filterLang) {
+    const [cur] = await sql<{ filter_lang: string | null; filter_expr: string | null }[]>`
+      SELECT filter_lang, filter_expr FROM common.permissions WHERE id = ${permId} AND org_id = ${orgId}
+    `;
+    const lang = "filterLang" in body ? body.filterLang : cur?.filter_lang;
+    const expr = "filterExpr" in body ? body.filterExpr : cur?.filter_expr;
+    if (expr && !lang) return Response.json({ error: "filterLang is required when filterExpr is set" }, { status: 400 });
+    const exprError = expr && lang ? await filterExprError(lang, expr) : null;
+    if (exprError) return Response.json({ error: exprError }, { status: 400 });
+  }
 
   const rows = await sql<{ id: string; principal: string; resource: string; access: string;
     label_filter: string | null; filter_lang: string | null; filter_expr: string | null;
@@ -6044,16 +6203,42 @@ async function handleDeletePermission(permId: string, userId: string, sessionId:
 // internal receivers by host name: WREN_WEBHOOK_ALLOW_HOSTS=n8n.internal,hooks.lan
 const WEBHOOK_ALLOW_HOSTS = new Set((process.env.WREN_WEBHOOK_ALLOW_HOSTS ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
 
-function isPrivateAddress(ip: string): boolean {
-  const v4 = ip.startsWith("::ffff:") && isIP(ip.slice(7)) === 4 ? ip.slice(7) : ip;
-  if (isIP(v4) === 4) {
-    const [a, b] = v4.split(".").map(Number);
-    return a === 0 || a === 10 || a === 127 || a >= 224 ||
-      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19));
+function isPrivateIPv4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number);
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19));
+}
+
+/** The eight 16-bit groups of an IPv6 address (handles "::" and a dotted IPv4 tail). */
+function ipv6Groups(ip: string): number[] | null {
+  let s = ip.toLowerCase().split("%")[0];
+  const tail = s.match(/(\d+\.\d+\.\d+\.\d+)$/);
+  if (tail) {
+    const [a, b, c, d] = tail[1].split(".").map(Number);
+    s = s.slice(0, -tail[1].length) + ((a << 8) | b).toString(16) + ":" + ((c << 8) | d).toString(16);
   }
-  const x = ip.toLowerCase();
-  return x === "::" || x === "::1" || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || x.startsWith("ff");
+  const [head, rest] = s.split("::");
+  const h = head ? head.split(":") : [];
+  const r = rest !== undefined ? (rest ? rest.split(":") : []) : null;
+  const groups = r === null ? h : [...h, ...Array(8 - h.length - r.length).fill("0"), ...r];
+  if (groups.length !== 8) return null;
+  const nums = groups.map(g => parseInt(g, 16));
+  return nums.some(n => isNaN(n) || n < 0 || n > 0xffff) ? null : nums;
+}
+
+function isPrivateAddress(ip: string): boolean {
+  if (isIP(ip) === 4) return isPrivateIPv4(ip);
+  const g = ipv6Groups(ip);
+  if (!g) return true; // can't tell: don't send
+  const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  const zeros = (n: number) => g.slice(0, n).every(x => x === 0);
+  if (zeros(8) || (zeros(7) && g[7] === 1)) return true;                  // :: and ::1
+  if (zeros(5) && g[5] === 0xffff) return isPrivateIPv4(v4(g[6], g[7]));  // ::ffff:a.b.c.d (mapped)
+  if (zeros(6)) return isPrivateIPv4(v4(g[6], g[7]));                     // ::a.b.c.d (compatible)
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every(x => x === 0)) return isPrivateIPv4(v4(g[6], g[7])); // NAT64
+  if (g[0] === 0x2002) return isPrivateIPv4(v4(g[1], g[2]));              // 6to4
+  return (g[0] & 0xfe00) === 0xfc00 || (g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xff00) === 0xff00; // ULA, link-local, multicast
 }
 
 /** Why a webhook may not be sent to this URL, or null if it may. */
@@ -6110,10 +6295,10 @@ async function signPayload(body: string, secret: string): Promise<string> {
   return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function deliverBatch(orgId: string, batchKey: string, events: { type: string; payload: unknown }[]): Promise<void> {
-  const webhooks = await sql<{ id: string; url: string; secret: string; events: string[] }[]>`
+async function deliverBatch(orgId: string, batchKey: string, events: { type: string; payload: unknown }[], onlyWebhookId?: string): Promise<void> {
+  const webhooks = (await sql<{ id: string; url: string; secret: string; events: string[] }[]>`
     SELECT id, url, secret, events FROM common.webhooks WHERE org_id = ${orgId} AND enabled = true
-  `;
+  `).filter(wh => !onlyWebhookId || wh.id === onlyWebhookId);
 
   for (const wh of webhooks) {
     // Filter events this webhook subscribes to (empty = all)
@@ -6391,11 +6576,11 @@ async function handleReplayWebhook(webhookId: string, req: Request, userId: stri
 
   if (events.length === 0) return Response.json({ replayed: 0 });
 
+  // Sent now, as one batch, to this webhook only (not through the batching window,
+  // and not to the org's other webhooks)
   const replayKey = `${orgId}:replay:${Date.now()}`;
-  pendingWebhookBatches.set(replayKey, {
-    orgId,
-    events: events.map(e => ({ type: e.event_type, payload: e.payload })),
-  });
+  deliverBatch(orgId, replayKey, events.map(e => ({ type: e.event_type, payload: e.payload })), webhookId)
+    .catch(e => console.error("[webhook] replay failed:", e));
 
   return Response.json({ replayed: events.length, batchKey: replayKey });
 }
