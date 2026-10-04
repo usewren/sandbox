@@ -1279,8 +1279,17 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
     // While impersonating, the admin acts as the member on data only: no org
     // management, and nothing that would reveal the member's other orgs.
-    if (user.impersonator && ["keys", "permissions", "invites", "members", "groups", "webhooks", "org"].includes(collection)) {
+    if (user.impersonator && ["keys", "permissions", "invites", "members", "groups", "webhooks", "org", "connected-apps"].includes(collection)) {
       return Response.json({ error: "Not available while impersonating. End impersonation first." }, { status: 403 });
+    }
+
+    // Connected apps (MCP sign-ins) — /api/v1/connected-apps[/:clientId]
+    // A person's own browser session only: not API keys, not MCP tokens.
+    if (collection === "connected-apps") {
+      if (!user.sessionId || user.keyId) return Response.json({ error: "Sign in with a browser session to manage connected apps" }, { status: 403 });
+      if (req.method === "GET"    && !id) return handleListConnectedApps(user);
+      if (req.method === "DELETE" && id)  return handleRevokeConnectedApp(id, user);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Identity & scope — /api/v1/me
@@ -5435,6 +5444,49 @@ async function handleMcpConsentApprove(req: Request): Promise<Response> {
     .catch((e: Error) => ({ error: e.message }));
   if (!result?.redirectURI) return Response.json({ error: result?.error ?? "Could not complete authorization" }, { status: 400 });
   return Response.json({ redirectURI: result.redirectURI });
+}
+
+// Apps the user signed in to WREN via MCP (OAuth), across all their orgs.
+async function handleListConnectedApps(user: SessionUser): Promise<Response> {
+  const rows = await sql<{
+    client_id: string; name: string; redirect_urls: string; icon: string | null;
+    first_at: Date; last_at: Date; refresh_expires: Date | null;
+    org_id: string | null; org_name: string | null; org_slug: string | null;
+  }[]>`
+    SELECT t.client_id, a.name, a.redirect_urls, a.icon,
+           MIN(t.created_at) AS first_at, MAX(t.created_at) AS last_at, MAX(t.refresh_token_expires_at) AS refresh_expires,
+           g.org_id, ou.name AS org_name, s.slug AS org_slug
+    FROM public.oauth_access_token t
+    JOIN public.oauth_application a ON a.client_id = t.client_id
+    LEFT JOIN common.mcp_grants g ON g.user_id = t.user_id AND g.client_id = t.client_id
+    LEFT JOIN "user" ou ON ou.id = g.org_id
+    LEFT JOIN common.org_slugs s ON s.org_id = g.org_id
+    WHERE t.user_id = ${user.userId}
+    GROUP BY t.client_id, a.name, a.redirect_urls, a.icon, g.org_id, ou.name, s.slug
+    ORDER BY MAX(t.created_at) DESC
+  `;
+  return Response.json({
+    apps: rows.map(r => ({
+      clientId: r.client_id,
+      name: r.name,
+      icon: r.icon,
+      redirectHosts: [...new Set(r.redirect_urls.split(",").map(u => { try { return new URL(u.trim()).host; } catch { return u.trim(); } }))],
+      org: r.org_id ? { id: r.org_id, name: r.org_id === user.userId ? "My workspace" : r.org_name, slug: r.org_slug } : null,
+      connectedAt: r.first_at,
+      lastRenewedAt: r.last_at,
+      expiresAt: r.refresh_expires,
+    })),
+  });
+}
+
+// Revoke: delete the app's tokens, consent and org choice for this user. The app's
+// next call fails (tokens are looked up on every request) and it must ask again.
+async function handleRevokeConnectedApp(clientId: string, user: SessionUser): Promise<Response> {
+  const tokens = await sql`DELETE FROM public.oauth_access_token WHERE user_id = ${user.userId} AND client_id = ${clientId} RETURNING id`;
+  await sql`DELETE FROM public.oauth_consent WHERE user_id = ${user.userId} AND client_id = ${clientId}`;
+  const grants = await sql`DELETE FROM common.mcp_grants WHERE user_id = ${user.userId} AND client_id = ${clientId} RETURNING client_id`;
+  if (!tokens.length && !grants.length) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ clientId, revoked: true, tokensRevoked: tokens.length });
 }
 
 // -------------------------------------------------------

@@ -110,5 +110,28 @@ describe("MCP sign-in (OAuth)", () => {
 
     expect((await fetch(`${BASE_URL}/api/v1/me`, { headers: { Authorization: `Bearer ${tok.access_token}` } })).status).toBe(401);
     expect((await mcp("not-a-token", "tools/list")).status).toBe(401);
+    accessToken = tok.access_token;
+  });
+
+  let accessToken: string;
+  it("connected apps: listed with their org, and revoking stops the app immediately", async () => {
+    const H = { Cookie: alice.cookie, Origin: BASE_URL };
+    const { apps } = await (await fetch(`${BASE_URL}/api/v1/connected-apps`, { headers: H })).json();
+    const app = apps.find((a: any) => a.clientId === clientId);
+    expect(app.name).toBe("Test Agent");
+    expect(app.redirectHosts).toEqual(["localhost:8091"]);
+    expect(app.org.id).toBe(bob.id);
+
+    expect((await mcp(accessToken, "tools/list")).status).toBe(200);
+    const rev = await fetch(`${BASE_URL}/api/v1/connected-apps/${clientId}`, { method: "DELETE", headers: H });
+    expect(rev.status).toBe(200);
+    expect((await mcp(accessToken, "tools/list")).status).toBe(401);
+    const after = (await (await fetch(`${BASE_URL}/api/v1/connected-apps`, { headers: H })).json()).apps;
+    expect(after.some((a: any) => a.clientId === clientId)).toBe(false);
+  });
+
+  it("connected apps can't be managed with an API key", async () => {
+    const key = (await (await post("/api/v1/keys", { name: "k" }, alice.cookie)).json()).key;
+    expect((await fetch(`${BASE_URL}/api/v1/connected-apps`, { headers: { Authorization: `Bearer ${key}` } })).status).toBe(403);
   });
 });
