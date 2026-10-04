@@ -123,6 +123,8 @@ const PUBLIC_CACHE_HEADERS = {
 
 function withHeaders(res: Response, headers: Record<string, string>): Response {
   for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+  // Never let a CDN keep serving a 404/403 after the content is published.
+  if (!res.ok) res.headers.set("Cache-Control", "no-store");
   return res;
 }
 
@@ -534,21 +536,32 @@ const ALLOWED_ORIGINS = new Set([
     : []),
 ]);
 
-function corsHeaders(origin: string | null, host: string | null): Record<string, string> {
-  let allowed = "";
+// Public (no-auth) routes: /orgs/{slug}/..., /api/v1/orgs/{slug}/..., /api/v1/projects.
+// These never honour credentials, so any origin may read them.
+function isPublicPath(pathname: string): boolean {
+  return pathname.startsWith("/orgs/") || pathname.startsWith("/api/v1/orgs/") || pathname === "/api/v1/projects";
+}
+
+function corsHeaders(origin: string | null, host: string | null, pathname: string): Record<string, string> {
+  const base = {
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, Cookie, Authorization",
+  };
+  let trusted = false;
   if (origin && ALLOWED_ORIGINS.has(origin)) {
-    allowed = origin;
+    trusted = true;
   } else if (origin && host) {
     // Same-site: if the Origin's host matches the request Host header, always allow.
     // This covers Cloudflare Tunnel and any reverse proxy without needing env vars.
-    try { if (new URL(origin).host === host) allowed = origin; } catch {}
+    try { if (new URL(origin).host === host) trusted = true; } catch {}
   }
-  return {
-    "Access-Control-Allow-Origin": allowed,
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Accept, Cookie",
-  };
+  // Trusted origins may use the session cookie.
+  if (trusted) return { ...base, "Access-Control-Allow-Origin": origin!, "Access-Control-Allow-Credentials": "true", "Vary": "Origin" };
+  if (isPublicPath(pathname)) return { ...base, "Access-Control-Allow-Origin": "*" };
+  // Any other origin may call the API with an explicit Bearer key, but never with
+  // cookies (no Allow-Credentials), so a foreign page can't ride a logged-in session.
+  if (origin) return { ...base, "Access-Control-Allow-Origin": origin, "Vary": "Origin" };
+  return { ...base, "Access-Control-Allow-Origin": "" };
 }
 
 // -------------------------------------------------------
@@ -747,7 +760,7 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     const origin = req.headers.get("origin");
-    const cors = corsHeaders(origin, req.headers.get("host"));
+    const cors = corsHeaders(origin, req.headers.get("host"), url.pathname);
 
     // CORS preflight
     if (req.method === "OPTIONS") {
@@ -1098,12 +1111,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Org context routes — /api/v1/org and /api/v1/org/slug
     if (collection === "org" && !id) {
-      if (req.method === "GET") return handleGetOrg(user.userId, user.sessionId);
+      if (req.method === "GET") return handleGetOrg(user.userId, user.sessionId, user.keyOrgId);
       if (req.method === "PUT") return handleSwitchOrg(req, user.userId, user.sessionId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
     if (collection === "org" && id === "slug" && !sub) {
-      if (req.method === "PUT") return handleSetOrgSlug(req, user.userId, user.sessionId);
+      if (req.method === "PUT") return handleSetOrgSlug(req, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
     if (collection === "org" && id === "usage" && !sub) {
@@ -1113,39 +1126,39 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Invite management routes — /api/v1/invites[/:inviteId | /accept | /received]
     if (collection === "invites") {
-      if (req.method === "GET"    && !id)               return handleListInvites(user.userId, user.sessionId);
+      if (req.method === "GET"    && !id)               return handleListInvites(user.userId, user.sessionId, user.keyOrgId);
       if (req.method === "GET"    && id === "received")  return handleListReceivedInvites(user);
-      if (req.method === "POST"   && !id)               return handleCreateInvite(req, user.userId, user.sessionId);
+      if (req.method === "POST"   && !id)               return handleCreateInvite(req, user.userId, user.sessionId, user.keyOrgId);
       if (req.method === "POST"   && id === "accept")   return handleAcceptInvite(req, user.userId);
       if (req.method === "POST"   && sub === "accept")  return handleAcceptInviteById(id, user);
-      if (req.method === "DELETE" && id)                return handleRevokeInvite(id, user.userId, user.sessionId);
+      if (req.method === "DELETE" && id)                return handleRevokeInvite(id, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Member management routes — /api/v1/members[/:memberId]
     if (collection === "members") {
-      if (req.method === "GET"    && !id) return handleListMembers(user.userId, user.sessionId);
-      if (req.method === "DELETE" && id)  return handleRemoveMember(id, user.userId, user.sessionId);
+      if (req.method === "GET"    && !id) return handleListMembers(user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && id)  return handleRemoveMember(id, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Permission management routes — /api/v1/permissions[/:permissionId]
     if (collection === "permissions") {
-      if (req.method === "GET"    && !id)  return handleListPermissions(user.userId, user.sessionId);
-      if (req.method === "POST"   && !id)  return handleCreatePermission(req, user.userId, user.sessionId);
-      if (req.method === "PUT"    && id)   return handleUpdatePermission(id, req, user.userId, user.sessionId);
-      if (req.method === "DELETE" && id)   return handleDeletePermission(id, user.userId, user.sessionId);
+      if (req.method === "GET"    && !id)  return handleListPermissions(user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && !id)  return handleCreatePermission(req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "PUT"    && id)   return handleUpdatePermission(id, req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && id)   return handleDeletePermission(id, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
     // Webhook management routes — /api/v1/webhooks[/:id[/deliveries|/replay]]
     if (collection === "webhooks") {
-      if (req.method === "GET"    && !id)                        return handleListWebhooks(user.userId, user.sessionId);
-      if (req.method === "POST"   && !id)                        return handleCreateWebhook(req, user.userId, user.sessionId);
-      if (req.method === "PUT"    && id && !sub)                 return handleUpdateWebhook(id, req, user.userId, user.sessionId);
-      if (req.method === "DELETE" && id && !sub)                 return handleDeleteWebhook(id, user.userId, user.sessionId);
-      if (req.method === "GET"    && id && sub === "deliveries") return handleGetWebhookDeliveries(id, user.userId, user.sessionId);
-      if (req.method === "POST"   && id && sub === "replay")     return handleReplayWebhook(id, req, user.userId, user.sessionId);
+      if (req.method === "GET"    && !id)                        return handleListWebhooks(user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && !id)                        return handleCreateWebhook(req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "PUT"    && id && !sub)                 return handleUpdateWebhook(id, req, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "DELETE" && id && !sub)                 return handleDeleteWebhook(id, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "GET"    && id && sub === "deliveries") return handleGetWebhookDeliveries(id, user.userId, user.sessionId, user.keyOrgId);
+      if (req.method === "POST"   && id && sub === "replay")     return handleReplayWebhook(id, req, user.userId, user.sessionId, user.keyOrgId);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -1360,7 +1373,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Route: GET /{collection}/{id}/raw  (binary asset download)
     if (req.method === "GET" && id && sub === "raw") {
-      const r = await handleGetAssetRaw(schemaName, collection, id, url);
+      const r = await handleGetAssetRaw(schemaName, collection, id, url, colAr.labelFilter ?? undefined);
       audit(colAr, colResource, true, r.status);
       return r;
     }
@@ -1649,8 +1662,9 @@ async function handleList(
 ): Promise<Response> {
   const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50"), 200);
   const offset = parseInt(url.searchParams.get("offset") ?? "0");
-  // ?label= on the URL takes precedence over the permission label filter
-  const effectiveLabel = url.searchParams.get("label") ?? labelFilter;
+  // The permission label filter wins over ?label= (same as get/tree/_query), otherwise
+  // a public reader could pass ?label=draft or ?label= to see unpublished versions.
+  const effectiveLabel = labelFilter ?? url.searchParams.get("label") ?? undefined;
 
   // ?select= field projection
   let selectPaths: string[] | null = null;
@@ -2392,14 +2406,29 @@ async function handleUpdateAsset(schemaName: string, collection: string, docId: 
   });
 }
 
-async function handleGetAssetRaw(schemaName: string, collection: string, docId: string, url: URL): Promise<Response> {
-  const versionParam = url.searchParams.get("version");
+async function handleGetAssetRaw(schemaName: string, collection: string, docId: string, url: URL, labelFilter?: string): Promise<Response> {
+  // A permission label filter pins the version and overrides ?version=/?label=.
+  const label = labelFilter ?? url.searchParams.get("label") ?? undefined;
+  const versionParam = label ? null : url.searchParams.get("version");
   const rows = await withTenant(schemaName, async tx => {
+    // Every branch checks the collection, so a rule on one collection can't be
+    // used to read raw bytes of a document in another.
+    if (label) {
+      return tx<{ data: Buffer; mime_type: string; filename: string }[]>`
+        SELECT ac.data, ac.mime_type, ac.filename
+        FROM asset_contents ac
+        JOIN labels l ON l.document_id = ac.document_id AND l.version = ac.version AND l.label = ${label}
+        JOIN documents d ON d.id = ac.document_id
+        WHERE ac.document_id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
+      `;
+    }
     if (versionParam) {
       return tx<{ data: Buffer; mime_type: string; filename: string }[]>`
         SELECT ac.data, ac.mime_type, ac.filename
         FROM asset_contents ac
+        JOIN documents d ON d.id = ac.document_id
         WHERE ac.document_id = ${docId} AND ac.version = ${parseInt(versionParam)}
+          AND d.collection = ${collection} AND d.deleted_at IS NULL
       `;
     }
     return tx<{ data: Buffer; mime_type: string; filename: string }[]>`
@@ -2549,6 +2578,7 @@ async function handlePublicCollectionRequest(
 
   // ── Public tree access: GET /orgs/{slug}/tree/{treeName}[/{...path}] ──────
   if (resolvedCollection === "tree") {
+    if (req && req.method !== "GET") return publicReadOnly();
     const treeName = id;
     if (!treeName) return Response.json({ error: "Tree name required" }, { status: 400 });
 
@@ -2582,6 +2612,9 @@ async function handlePublicCollectionRequest(
     return withHeaders(r, PUBLIC_CACHE_HEADERS);
   }
 
+  // Everything else here is read-only; a POST used to fall through and silently list.
+  if (req && req.method !== "GET") return publicReadOnly();
+
   // GET /orgs/{slug}/{collection}/_materialized/{name} — public materialized result.
   if (id === "_materialized" && sub && req?.method === "GET") {
     const r = await handleGetMaterialized(schemaName, resolvedCollection, sub);
@@ -2605,7 +2638,7 @@ async function handlePublicCollectionRequest(
   }
 
   if (id && sub === "raw") {
-    return handleGetAssetRaw(schemaName, resolvedCollection, id, url);
+    return withHeaders(await handleGetAssetRaw(schemaName, resolvedCollection, id, url, ar.labelFilter ?? undefined), PUBLIC_CACHE_HEADERS);
   }
 
   if (id && !sub) {
@@ -2622,6 +2655,12 @@ async function handlePublicCollectionRequest(
   let r = await handleList(schemaName, resolvedCollection, url, "", ar.labelFilter);
   r = await withRefResolution(r, schemaName, url, ar.labelFilter);
   return withHeaders(await filterPublicResponse(r, ar), PUBLIC_CACHE_HEADERS);
+}
+
+function publicReadOnly(): Response {
+  return Response.json({
+    error: "Public org URLs are read-only. Write with /api/v1/{collection} or /api/v1/tree/{tree}/{path} and an Authorization: Bearer key.",
+  }, { status: 405 });
 }
 
 async function filterPublicResponse(res: Response, ar: AccessResult): Promise<Response> {
@@ -4242,8 +4281,8 @@ async function handleGetMe(user: SessionUser): Promise<Response> {
   });
 }
 
-async function handleGetOrg(userId: string, sessionId: string | null): Promise<Response> {
-  const current = await resolveUserOrgId(userId, sessionId);
+async function handleGetOrg(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const current = await resolveUserOrgId(userId, sessionId, keyOrgId);
 
   // All orgs accessible to this user: own + any they're a member of
   const memberships = await sql<{ org_id: string }[]>`
@@ -4375,8 +4414,8 @@ async function handleGetOrgUsage(userId: string, sessionId: string | null, keyOr
 // Slug + llms.txt handlers
 // -------------------------------------------------------
 
-async function handleSetOrgSlug(req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const currentOrgId = await resolveUserOrgId(userId, sessionId);
+async function handleSetOrgSlug(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const currentOrgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   // Only the org owner can set their own slug
   if (currentOrgId !== userId) {
     return Response.json({ error: "Only the org owner can set the slug" }, { status: 403 });
@@ -4506,22 +4545,38 @@ async function generateLlmsTxt(
     `;
     const labels = labelRows.map(r => ({ label: r.label, count: parseInt(r.count, 10) }));
 
-    // Sample documents
-    const sampleRows = await sql<{ data: unknown; id: string; current_version: number; labels: string[] }[]>`
-      SELECT v.data, d.id, d.current_version,
-             ARRAY(SELECT label FROM ${sql.unsafe(schema)}.labels WHERE document_id = d.id ORDER BY label) AS labels
-      FROM ${sql.unsafe(schema)}.documents d
-      JOIN ${sql.unsafe(schema)}.versions v ON v.document_id = d.id AND v.version = d.current_version
-      WHERE d.collection = ${col} AND d.deleted_at IS NULL
-      ORDER BY d.updated_at DESC NULLS LAST
-      LIMIT 3
-    `;
-    const samples = sampleRows.map(r => ({
+    // Sample documents. Public visitors only see what a public read would return:
+    // the rule's labelled version, with its data filter applied.
+    const publicAr = authenticated ? null : await checkAccess(orgId, "", "*", `collection:${col}`, "read");
+    const sampleLabel = publicAr?.labelFilter ?? null;
+    const sampleRows = sampleLabel
+      ? await sql<{ data: unknown; id: string; current_version: number; labels: string[] }[]>`
+          SELECT v.data, d.id, lf.version AS current_version,
+                 ARRAY(SELECT label FROM ${sql.unsafe(schema)}.labels WHERE document_id = d.id ORDER BY label) AS labels
+          FROM ${sql.unsafe(schema)}.documents d
+          JOIN ${sql.unsafe(schema)}.labels lf ON lf.document_id = d.id AND lf.label = ${sampleLabel}
+          JOIN ${sql.unsafe(schema)}.versions v ON v.document_id = d.id AND v.version = lf.version
+          WHERE d.collection = ${col} AND d.deleted_at IS NULL
+          ORDER BY d.updated_at DESC NULLS LAST
+          LIMIT 3
+        `
+      : await sql<{ data: unknown; id: string; current_version: number; labels: string[] }[]>`
+          SELECT v.data, d.id, d.current_version,
+                 ARRAY(SELECT label FROM ${sql.unsafe(schema)}.labels WHERE document_id = d.id ORDER BY label) AS labels
+          FROM ${sql.unsafe(schema)}.documents d
+          JOIN ${sql.unsafe(schema)}.versions v ON v.document_id = d.id AND v.version = d.current_version
+          WHERE d.collection = ${col} AND d.deleted_at IS NULL
+          ORDER BY d.updated_at DESC NULLS LAST
+          LIMIT 3
+        `;
+    const samples = await Promise.all(sampleRows.map(async r => ({
       id: r.id,
       version: r.current_version,
       labels: r.labels,
-      data: r.data,
-    }));
+      data: publicAr?.filterExpr && publicAr.filterLang
+        ? await applyDataFilter(r.data, publicAr.filterLang, publicAr.filterExpr)
+        : r.data,
+    })));
 
     collectionData.push({ name: col, count, schema: colSchema, labels, samples });
   }
@@ -4618,10 +4673,18 @@ async function generateLlmsTxt(
   lines.push("## Access", "");
   lines.push(`Base URL: ${base}`);
   lines.push(`API docs: ${base}/docs`);
+  lines.push(`Org slug: ${slug}`);
+  lines.push("");
+  lines.push("Public (no auth, read-only, only what principal='*' rules allow; auth headers are ignored here):");
+  lines.push(`- Site / browser URLs:  ${base}/orgs/${slug}/tree/{tree}/{path}`);
+  lines.push(`- Data (GET, POST _query): ${base}/api/v1/orgs/${slug}/{collection}[/{id}[/raw]]`);
+  lines.push("Private (Authorization: Bearer wren_… or session cookie; org comes from the key, never from the URL):");
+  lines.push(`- ${base}/api/v1/{collection}[/{id}], ${base}/api/v1/tree/{tree}/{path}, ${base}/api/v1/me`);
+  lines.push("");
   if (!authenticated) {
     lines.push(`Full authenticated context: ${base}/api/v1/orgs/${slug}/llms.txt`);
   } else {
-    lines.push(`API key creation: POST ${base}/api/keys`);
+    lines.push(`API key creation: POST ${base}/api/v1/keys`);
   }
 
   return lines.join("\n");
@@ -4741,8 +4804,8 @@ async function handleWellKnownLlmsTxt(url: URL): Promise<Response> {
 // Invite handlers
 // -------------------------------------------------------
 
-async function handleListInvites(userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleListInvites(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -4769,8 +4832,8 @@ async function handleListInvites(userId: string, sessionId: string | null): Prom
   });
 }
 
-async function handleCreateInvite(req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleCreateInvite(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -4863,8 +4926,8 @@ async function handleAcceptInviteById(inviteId: string, user: SessionUser): Prom
   return Response.json({ accepted: true, orgId: invite.org_id });
 }
 
-async function handleRevokeInvite(inviteId: string, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleRevokeInvite(inviteId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -4913,8 +4976,8 @@ async function handleAcceptInvite(req: Request, userId: string): Promise<Respons
 // Member handlers
 // -------------------------------------------------------
 
-async function handleListMembers(userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleListMembers(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -4936,8 +4999,8 @@ async function handleListMembers(userId: string, sessionId: string | null): Prom
   });
 }
 
-async function handleRemoveMember(memberId: string, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleRemoveMember(memberId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -4971,8 +5034,8 @@ async function forbiddenIfNotAdminOrOwner(userId: string, orgId: string): Promis
   return Response.json({ error: "Only org owners or admin members can manage this" }, { status: 403 });
 }
 
-async function handleListPermissions(userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleListPermissions(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5005,8 +5068,8 @@ async function handleListPermissions(userId: string, sessionId: string | null): 
   });
 }
 
-async function handleCreatePermission(req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleCreatePermission(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5061,8 +5124,8 @@ async function handleCreatePermission(req: Request, userId: string, sessionId: s
   }, { status: 201 });
 }
 
-async function handleUpdatePermission(permId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleUpdatePermission(permId: string, req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5099,8 +5162,8 @@ async function handleUpdatePermission(permId: string, req: Request, userId: stri
   });
 }
 
-async function handleDeletePermission(permId: string, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleDeletePermission(permId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5265,8 +5328,8 @@ async function purgeOldWebhookData(): Promise<void> {
 
 // ── Webhook CRUD handlers ────────────────────────────────────────────────────
 
-async function handleListWebhooks(userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleListWebhooks(userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5285,8 +5348,8 @@ async function handleListWebhooks(userId: string, sessionId: string | null): Pro
   });
 }
 
-async function handleCreateWebhook(req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleCreateWebhook(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5320,8 +5383,8 @@ async function handleCreateWebhook(req: Request, userId: string, sessionId: stri
   }, { status: 201 });
 }
 
-async function handleUpdateWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleUpdateWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5350,8 +5413,8 @@ async function handleUpdateWebhook(webhookId: string, req: Request, userId: stri
   return Response.json({ id: webhookId, updated: true });
 }
 
-async function handleDeleteWebhook(webhookId: string, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleDeleteWebhook(webhookId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5362,8 +5425,8 @@ async function handleDeleteWebhook(webhookId: string, userId: string, sessionId:
   return Response.json({ id: webhookId, deleted: true });
 }
 
-async function handleGetWebhookDeliveries(webhookId: string, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleGetWebhookDeliveries(webhookId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
@@ -5388,8 +5451,8 @@ async function handleGetWebhookDeliveries(webhookId: string, userId: string, ses
   });
 }
 
-async function handleReplayWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null): Promise<Response> {
-  const orgId = await resolveUserOrgId(userId, sessionId);
+async function handleReplayWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
 
