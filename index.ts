@@ -11,6 +11,8 @@ import jsonata from "jsonata";
 import { handleMcp } from "./mcp";
 
 const WREN_VERSION = "0.4.2";
+// Set at image build time: docker build --build-arg WREN_BUILD=$(git rev-parse --short HEAD) …
+const WREN_BUILD = process.env.WREN_BUILD?.trim() || "dev";
 
 // ── Crash-resilient logging ──────────────────────────────────────────────────
 // Ring buffer: keeps the last 5 minutes of logs on disk. On startup, preserves
@@ -135,6 +137,14 @@ const CONTENT_NEGOTIATED_HEADERS = {
 const PUBLIC_CACHE_HEADERS = {
   "Cache-Control": PUBLIC_CACHE,
 };
+
+// Base URL for links we hand out (projects, llms.txt, sitemap, robots). Behind a
+// TLS-terminating proxy (e.g. Cloudflare Tunnel) the request URL is http://, so
+// prefer the configured public URL.
+function publicBase(url: URL): string {
+  const configured = (process.env.WREN_URL || process.env.BETTER_AUTH_URL || "").replace(/\r/g, "").trim().replace(/\/$/, "");
+  return configured || `${url.protocol}//${url.host}`;
+}
 
 function withHeaders(res: Response, headers: Record<string, string>): Response {
   for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
@@ -826,7 +836,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: WREN_VERSION, build: "20260414b" });
+      return Response.json({ status: "ok", version: WREN_VERSION, build: WREN_BUILD });
     }
 
 
@@ -945,14 +955,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // LLM / crawler discovery files
     if (url.pathname === "/robots.txt") {
-      const base = `${url.protocol}//${url.host}`;
+      const base = publicBase(url);
       return new Response(
         `User-agent: *\nAllow: /\n\n# AI crawlers — welcome\nUser-agent: GPTBot\nAllow: /\n\nUser-agent: ClaudeBot\nAllow: /\n\nUser-agent: PerplexityBot\nAllow: /\n\nUser-agent: anthropic-ai\nAllow: /\n\nSitemap: ${base}/sitemap.xml\n`,
         { headers: { "Content-Type": "text/plain; charset=utf-8" } },
       );
     }
     if (url.pathname === "/sitemap.xml") {
-      const base = `${url.protocol}//${url.host}`;
+      const base = publicBase(url);
       const now = new Date().toISOString().split("T")[0];
       return new Response(
         `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/deploy</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/d</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/projects</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n  <url><loc>${base}/concepts</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/guides</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n${listGuideSlugs().map(s => `  <url><loc>${base}/guides/${s}</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n`).join("")}</urlset>`,
@@ -2572,7 +2582,7 @@ async function handleListProjects(url: URL): Promise<Response> {
 
   // For each tree, check if it has an /index.html entry point (makes it a
   // browsable site/app). Query all tenant schemas in one go per org.
-  const base = `${url.protocol}//${url.host}`;
+  const base = publicBase(url);
   const projects = await Promise.all([...byOrg.values()].map(async org => {
     // Look up entry pages for all trees in this org's schema
     const schemaName = sanitizeSchemaName(org.orgId);
@@ -2591,7 +2601,8 @@ async function handleListProjects(url: URL): Promise<Response> {
     return {
       name: org.name,
       slug: org.slug,
-      url: `${base}/api/v1/orgs/${org.slug}`,
+      // /api/v1/orgs/{slug} on its own is not a route; the org's llms.txt describes everything it publishes
+      url: `${base}/orgs/${org.slug}/llms.txt`,
       collections: org.collections.map(c => ({
         name: c.name,
         access: c.access,
@@ -4844,7 +4855,7 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
   const orgId = await resolveSlugToOrgId(slug);
   if (!orgId) return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
 
-  const base = `${url.protocol}//${url.host}`;
+  const base = publicBase(url);
   const authenticated = user !== null;
 
   // Determine org name

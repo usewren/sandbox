@@ -50,6 +50,10 @@ RUN cp -r /adminui2 /app/public/admin
 # Copy marketing site static files
 RUN cp -r /marketing /app/public/marketing
 
+# Build identifier reported by /health, e.g. --build-arg WREN_BUILD=$(git -C sandbox rev-parse --short HEAD)
+ARG WREN_BUILD=dev
+ENV WREN_BUILD=$WREN_BUILD
+
 EXPOSE 4000
 
 CMD ["bun", "run", "/app/index.ts"]
