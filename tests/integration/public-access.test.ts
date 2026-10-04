@@ -91,6 +91,16 @@ describe("trees and caching", () => {
     await post("/api/v1/permissions", { principal: "*", resource: `tree:${tree}`, access: "read", labelFilter: "published" }, cookie);
   });
 
+  it("upload responses include the file metadata and sha256", async () => {
+    const form = new FormData();
+    form.append("file", new File(["abc"], "a.txt", { type: "text/plain" }));
+    const res = await fetch(`${BASE_URL}/api/v1/${secretCol}`, { method: "POST", headers: { Origin: BASE_URL, Cookie: cookie }, body: form });
+    const body = await res.json();
+    expect(body.data).toMatchObject({ _binary: true, filename: "a.txt", size: 3 });
+    expect(body.data.mimeType).toStartWith("text/plain");
+    expect(body.data.sha256).toBe(new Bun.CryptoHasher("sha256").update("abc").digest("hex"));
+  });
+
   it("uploads record a sha256 of the bytes", async () => {
     const doc = await (await get(`/api/v1/${secretCol}/${fileId}`, cookie)).json();
     expect(doc.data.sha256).toBe(new Bun.CryptoHasher("sha256").update("<h1>v1</h1>").digest("hex"));

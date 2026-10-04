@@ -2402,6 +2402,7 @@ async function insertAssetVersion(
       VALUES (${docId}, ${version}, ${buffer}, ${meta.mimeType}, ${meta.filename}, ${meta.size})
     `;
   });
+  return meta;
 }
 
 async function handleCreateAsset(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
