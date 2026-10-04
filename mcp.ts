@@ -360,6 +360,51 @@ function publicTools(scope: McpScope): Tool[] {
   return tools;
 }
 
+// ── Public data of every org: /mcp without a key, and public_* tools with a key ──
+// Wraps the per-org public tools with an `org` argument. Always uses `anonApi`, so a
+// keyed session gets exactly the anonymous view of other orgs' data.
+
+function globalPublicTools(anonApi: Api): Tool[] {
+  const orgArg = { org: str("Org slug (see list_public)") };
+  const listPublic: Tool = {
+    name: "list_public", title: "List public data", readOnly: true,
+    description: "List the orgs on this server that publish anything, with their public collections (and label filters) and public sites (trees with entry pages).",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      const r = await anonApi("GET", "/api/v1/projects");
+      if (!r.ok) return apiError(r);
+      const projects = ((r.json as Json).projects ?? []) as Json[];
+      return ok({
+        orgs: projects.map(p => ({
+          org: p.slug, name: p.name, about: p.url,
+          collections: ((p.collections ?? []) as Json[]).map(c => c.labelFilter ? `${c.name} (label ${c.labelFilter})` : c.name),
+          sites: ((p.trees ?? []) as Json[]).map(t => ({ tree: t.name, entry: t.entryUrl ?? null })),
+        })),
+      });
+    },
+  };
+  // Template tools for any org; their slug is filled in per call.
+  const templates = publicTools({ slug: "_" });
+  const wrapped = templates.map((t): Tool => ({
+    ...t,
+    name: `public_${t.name}`,
+    title: `${t.title} (public, any org)`,
+    description: `${t.description} Works for any org's public data; pass its slug as org.`,
+    inputSchema: {
+      ...t.inputSchema,
+      required: ["org", ...(((t.inputSchema.required ?? []) as string[]))],
+      properties: { ...orgArg, ...((t.inputSchema.properties ?? {}) as Json) },
+    },
+    async run(args) {
+      const slug = String(args.org ?? "").trim();
+      if (!/^[a-z0-9-]+$/.test(slug)) return { text: "Provide org: an org slug from list_public.", isError: true };
+      const tool = publicTools({ slug }).find(x => x.name === t.name)!;
+      return tool.run(args, anonApi);
+    },
+  }));
+  return [listPublic, ...wrapped];
+}
+
 function guessType(name: string): string {
   const ext = name.toLowerCase().split(".").pop() ?? "";
   return ({
@@ -399,11 +444,8 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
     const cols = url.searchParams.get("collections")?.split(",").map(s => s.trim()).filter(Boolean);
     scope = { ...scope, ...(tree ? { tree } : {}), ...(cols?.length ? { collections: cols } : {}) };
   }
-  const publicMode = !!scope && anonymous;
-  const tools = publicMode ? publicTools(scope!) : TOOLS.filter(t => !readonly || t.readOnly);
-
-  const api: Api = async (method, path, body, opts = {}) => {
-    const headers: Record<string, string> = { ...auth, Accept: opts.accept ?? "application/json", Origin: origin };
+  const makeApi = (creds: Record<string, string>): Api => async (method, path, body, opts = {}) => {
+    const headers: Record<string, string> = { ...creds, Accept: opts.accept ?? "application/json", Origin: origin };
     let payload: BodyInit | undefined;
     if (opts.form) payload = opts.form;
     else if (body !== undefined) { headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
@@ -415,6 +457,21 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
     else text = new TextDecoder().decode(bytes.slice(0, 2000));
     return { status: res.status, ok: res.ok, json, text, contentType, bytes };
   };
+  const api = makeApi(auth);
+  // Public-data tools never send the caller's credentials: they see exactly what an
+  // anonymous visitor sees, even inside a keyed session.
+  const anonApi = makeApi({});
+
+  // Modes:
+  //   org-bound, no key  → that org's public tools (optionally one site)
+  //   /mcp, no key       → public data of every org (public_* tools)
+  //   key                → own-org tools (+ public_* for any org, on /mcp)
+  const orgPublicMode = !!scope && anonymous;
+  const globalPublicMode = !scope && anonymous;
+  const publicMode = orgPublicMode || globalPublicMode;
+  const tools = orgPublicMode ? publicTools(scope!)
+    : globalPublicMode ? globalPublicTools(anonApi)
+    : [...TOOLS.filter(t => !readonly || t.readOnly), ...(scope ? [] : globalPublicTools(anonApi))];
 
   if (!publicMode) {
     // Credentials are required up front so clients get a clear 401 instead of tool errors.
@@ -433,11 +490,16 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
     }
   }
 
-  const instructions = publicMode
+  const instructions = orgPublicMode
     ? `Public, read-only access to what org "${scope!.slug}" publishes${scope!.tree ? ` on the "${scope!.tree}" site` : ""}. ` +
       `Start with site_info, then list_tree/read_file${scope!.tree && !scope!.collections?.length ? "" : " or query_documents"}. ` +
       `Only published content is visible; nothing can be changed here.`
-    : INSTRUCTIONS + (readonly ? "\nThis connection is read-only." : "");
+    : globalPublicMode
+    ? `Public, read-only access to everything orgs on this WREN server publish. Start with list_public to see orgs, ` +
+      `their public collections and sites, then use the public_* tools with an org slug. Only published content is visible; ` +
+      `nothing can be changed here. To write, connect with Authorization: Bearer wren_…`
+    : INSTRUCTIONS + (readonly ? "\nThis connection is read-only." : "") +
+      (scope ? "" : "\nThe public_* tools read any org's public data (no key is sent for those).");
 
   let body: unknown;
   try { body = await req.json(); } catch { return Response.json(rpcError(null, -32700, "Parse error"), { status: 400 }); }
