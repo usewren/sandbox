@@ -3967,9 +3967,10 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
     return { tree: treeName, path: treePath, document: doc, assignmentDocId: exact?.assignment_doc_id ?? null, pathExists, children: children.map(c => ({ path: c.path, documentId: c.document_id })) };
   });
 
-  // 404 only if the path doesn't exist AND has no descendants
+  // 404 only if the path doesn't exist AND has no descendants.
+  // no-store: otherwise the CDN keeps serving the 404 after the file is deployed.
   if (!result.pathExists && result.children.length === 0) {
-    return Response.json({ error: "Not found" }, { status: 404 });
+    return Response.json({ error: "Not found" }, { status: 404, headers: { "Cache-Control": "no-store" } });
   }
 
   // Content negotiation: if the document is a binary asset and the client prefers
