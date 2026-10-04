@@ -269,6 +269,102 @@ async function flushRequestStats(): Promise<void> {
 
 setInterval(flushRequestStats, 3_600_000); // flush every hour
 
+// -------------------------------------------------------
+// Landing-page experiment — "/" serves one variant per visitor
+// -------------------------------------------------------
+// Each new visitor gets a random variant, kept in the wren_v cookie (the variant
+// letter only, no identifier). Counts are aggregated per day/variant/event: no
+// IPs, no user ids. /a … /e always serve a fixed variant and aren't counted.
+// WREN_LANDING_VARIANTS=c turns the experiment off (everyone gets c, no cookie).
+const LANDING_FILES: Record<string, string> = {
+  a: "index.html", b: "trees.html", c: "combined.html", d: "deploy.html", e: "ai.html",
+};
+const LANDING_VARIANTS = (() => {
+  const v = (process.env.WREN_LANDING_VARIANTS ?? "a,b,c,d,e").split(",").map(s => s.trim()).filter(s => s in LANDING_FILES);
+  return v.length ? v : ["c"];
+})();
+const LANDING_DEFAULT = LANDING_VARIANTS.includes("c") ? "c" : LANDING_VARIANTS[0];
+const LANDING_EVENTS = ["visitor", "view", "admin", "signup"] as const;
+type LandingEvent = typeof LANDING_EVENTS[number];
+const BOT_UA = /bot|crawl|spider|slurp|preview|facebookexternalhit|curl|wget|python|httpx|go-http|headless|monitor|uptime|lighthouse/i;
+const landingCounts = new Map<string, number>(); // "variant|event" → count since last flush
+
+function readCookie(req: Request, name: string): string | null {
+  const m = (req.headers.get("cookie") ?? "").match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+/** The visitor's variant if they are in the experiment (a cookie we assigned). */
+function landingVariantOf(req: Request): string | null {
+  const v = readCookie(req, "wren_v");
+  return v && LANDING_VARIANTS.length > 1 && LANDING_VARIANTS.includes(v) ? v : null;
+}
+
+function countLanding(variant: string, event: LandingEvent): void {
+  const key = `${variant}|${event}`;
+  landingCounts.set(key, (landingCounts.get(key) ?? 0) + 1);
+}
+
+function landingCookie(req: Request, name: string, value: string): string {
+  const secure = req.url.startsWith("https://") || req.headers.get("x-forwarded-proto") === "https";
+  return `${name}=${value}; Path=/; Max-Age=${90 * 86400}; SameSite=Lax; HttpOnly${secure ? "; Secure" : ""}`;
+}
+
+async function flushLandingStats(): Promise<void> {
+  if (landingCounts.size === 0) return;
+  const entries = Array.from(landingCounts.entries());
+  landingCounts.clear();
+  const today = new Date().toISOString().split("T")[0];
+  await Promise.all(entries.map(([key, n]) => {
+    const [variant, event] = key.split("|");
+    return sql`
+      INSERT INTO common.landing_stats (date, variant, event, count)
+      VALUES (${today}, ${variant}, ${event}, ${n})
+      ON CONFLICT (date, variant, event) DO UPDATE SET count = common.landing_stats.count + EXCLUDED.count
+    `.catch(() => {});
+  }));
+}
+
+setInterval(flushLandingStats, 60_000);
+
+function serveLanding(req: Request): Response {
+  const headers: Record<string, string> = { "Content-Type": "text/html", ...NO_CACHE, Vary: "Cookie" };
+  const ua = req.headers.get("user-agent") ?? "";
+  let variant = landingVariantOf(req);
+  if (LANDING_VARIANTS.length < 2 || !ua || BOT_UA.test(ua)) {
+    variant = variant ?? LANDING_DEFAULT; // crawlers always see the default, uncounted
+  } else {
+    if (!variant) {
+      variant = LANDING_VARIANTS[Math.floor(Math.random() * LANDING_VARIANTS.length)];
+      headers["Set-Cookie"] = landingCookie(req, "wren_v", variant);
+      countLanding(variant, "visitor");
+    }
+    countLanding(variant, "view");
+  }
+  return new Response(Bun.file(join(import.meta.dir, "public", "marketing", LANDING_FILES[variant])), { headers });
+}
+
+/** GET /api/v1/landing-stats?days=30 — server operators only (WREN_OPERATORS emails). */
+async function handleLandingStats(url: URL): Promise<Response> {
+  const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 30, 1), 365);
+  await flushLandingStats();
+  const rows = await sql<{ variant: string; event: string; count: string; since: string | null }[]>`
+    SELECT variant, event, SUM(count)::bigint AS count, MIN(date)::text AS since
+    FROM common.landing_stats
+    WHERE date > CURRENT_DATE - ${days}::int
+    GROUP BY variant, event
+  `;
+  const variants = Object.keys(LANDING_FILES).map(v => {
+    const counts = Object.fromEntries(LANDING_EVENTS.map(e => [e, 0])) as Record<LandingEvent, number>;
+    for (const r of rows) if (r.variant === v && (LANDING_EVENTS as readonly string[]).includes(r.event)) counts[r.event as LandingEvent] = Number(r.count);
+    return { variant: v, file: LANDING_FILES[v], active: LANDING_VARIANTS.includes(v), ...counts };
+  });
+  const since = rows.map(r => r.since).filter(Boolean).sort()[0] ?? null;
+  return Response.json({ days, since, variants });
+}
+
+const OPERATORS = new Set((process.env.WREN_OPERATORS ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+
 // Webhook constants (must be before setInterval references)
 const WEBHOOK_BATCH_WINDOW_MS = Number(process.env.WEBHOOK_BATCH_WINDOW_MS ?? "5000");
 const WEBHOOK_MAX_RETRIES = 5;
@@ -951,10 +1047,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       });
     }
 
-    // Marketing site — root now serves variant C (three building blocks).
-    // Variant A is still accessible at /a for the A/B/C experiment.
+    // Marketing site — "/" serves one landing variant per visitor (see serveLanding);
+    // /a … /e always show one variant, for reviewing and sharing.
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "combined.html")), {
+      return serveLanding(req);
+    }
+    // A/B variant E — AI-agents-first landing
+    if (url.pathname === "/e" || url.pathname === "/e.html") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "marketing", "ai.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
+    // Landing experiment results (the data comes from /api/v1/landing-stats)
+    if (url.pathname === "/stats/landing") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "landing-stats.html")), {
         headers: { "Content-Type": "text/html", ...NO_CACHE },
       });
     }
@@ -1073,7 +1179,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const filePath = (!subPath || subPath === "/")
         ? ADMIN_INDEX
         : join(ADMIN_DIR, subPath);
-      return serveAdminFile(filePath) ?? serveAdminIndex();
+      const res = serveAdminFile(filePath) ?? serveAdminIndex();
+      // Landing experiment: count the first Admin UI open per visitor
+      const variant = filePath === ADMIN_INDEX ? landingVariantOf(req) : null;
+      if (variant && !readCookie(req, "wren_va")) {
+        countLanding(variant, "admin");
+        res.headers.append("Set-Cookie", landingCookie(req, "wren_va", "1"));
+      }
+      return res;
     }
 
     // Legacy React admin UI — built static files with SPA fallback
@@ -1101,17 +1214,22 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     if (url.pathname.startsWith("/api/auth")) {
       const proto = req.headers.get("x-forwarded-proto");
-      if (proto === "https" && !req.url.startsWith("https://")) {
-        const secureUrl = req.url.replace(/^http:/, "https:");
-        return auth.handler(new Request(secureUrl, {
-          method: req.method,
-          headers: req.headers,
-          body: req.body,
-          // @ts-ignore — Bun supports duplex
-          duplex: "half",
-        }));
+      const authReq = proto === "https" && !req.url.startsWith("https://")
+        ? new Request(req.url.replace(/^http:/, "https:"), {
+            method: req.method,
+            headers: req.headers,
+            body: req.body,
+            // @ts-ignore — Bun supports duplex
+            duplex: "half",
+          })
+        : req;
+      const res = await auth.handler(authReq);
+      // Landing experiment: a successful email sign-up counts for the visitor's variant
+      if (url.pathname === "/api/auth/sign-up/email" && req.method === "POST" && res.ok) {
+        const variant = landingVariantOf(req);
+        if (variant) countLanding(variant, "signup");
       }
-      return auth.handler(req);
+      return res;
     }
 
     // Login UI
@@ -1281,6 +1399,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // management, and nothing that would reveal the member's other orgs.
     if (user.impersonator && ["keys", "permissions", "invites", "members", "groups", "webhooks", "org", "connected-apps"].includes(collection)) {
       return Response.json({ error: "Not available while impersonating. End impersonation first." }, { status: 403 });
+    }
+
+    // Landing experiment results — server operators (WREN_OPERATORS) in their own browser session
+    if (collection === "landing-stats" && req.method === "GET") {
+      if (!user.sessionId || user.keyId || user.impersonator || !OPERATORS.has(user.email.toLowerCase())) {
+        return Response.json({ error: "Only server operators (WREN_OPERATORS) can see landing stats" }, { status: 403 });
+      }
+      return handleLandingStats(url);
     }
 
     // Connected apps (MCP sign-ins) — /api/v1/connected-apps[/:clientId]
