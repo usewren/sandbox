@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WREN — Landing experiment</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f5f3ff; color: #111827; margin: 0; padding: 32px 16px; }
+    .card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(67,56,202,.12); padding: 24px; max-width: 920px; margin: 0 auto; }
+    h1 { font-size: 1.3rem; margin: 0 0 4px; }
+    .muted { color: #6b7280; font-size: .9rem; }
+    .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+    select { padding: 6px 8px; border-radius: 6px; border: 1px solid #d1d5db; font: inherit; }
+    .wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; font-variant-numeric: tabular-nums; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid #e5e7eb; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    th { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; font-weight: 600; }
+    tr.off td { color: #9ca3af; }
+    .ci { color: #9ca3af; font-size: .8rem; }
+    .best { color: #047857; font-weight: 700; }
+    a { color: #4338ca; }
+    .note { font-size: .85rem; color: #4b5563; line-height: 1.6; margin-top: 16px; }
+    .error { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Landing experiment</h1>
+    <p class="muted">Each new visitor to <code>/</code> sees one variant, chosen at random and kept for 90 days. Counts are per day and variant; nothing identifies a person.</p>
+    <div class="bar">
+      <label>Period <select id="days">
+        <option value="7">last 7 days</option>
+        <option value="30" selected>last 30 days</option>
+        <option value="90">last 90 days</option>
+        <option value="365">last year</option>
+      </select></label>
+      <span class="muted" id="since"></span>
+    </div>
+    <div id="out" class="muted">Loading…</div>
+    <p class="note">
+      <strong>Visitors</strong>: people newly assigned a variant. <strong>Admin opened</strong>: of those, how many opened the Admin UI (once per visitor).
+      <strong>Sign-ups</strong>: email sign-ups from a visitor in the experiment. Grey ranges are 95% intervals: while they overlap, the difference may be chance;
+      expect to need a few hundred visitors per variant. Crawlers always see variant C and aren't counted.
+    </p>
+  </div>
+
+  <script>
+    const out = document.getElementById("out");
+    const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    // Wilson score interval, 95%
+    function wilson(k, n) {
+      if (!n) return null;
+      const z = 1.96, p = k / n, d = 1 + z * z / n;
+      const c = (p + z * z / (2 * n)) / d, h = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d;
+      return [Math.max(0, c - h), Math.min(1, c + h)];
+    }
+    const pct = x => (x * 100).toFixed(1) + "%";
+    function rate(k, n, best) {
+      if (!n) return "–";
+      const ci = wilson(k, n);
+      return `<span class="${best ? "best" : ""}">${pct(k / n)}</span> <span class="ci">${pct(ci[0])}–${pct(ci[1])}</span>`;
+    }
+    const names = { a: "Versioned JSON storage", b: "Tree storage", c: "Three building blocks", d: "Deploy your site", e: "Open to every agent" };
+
+    async function load() {
+      out.textContent = "Loading…";
+      const res = await fetch(`/api/v1/landing-stats?days=${document.getElementById("days").value}`, { credentials: "include", headers: { Accept: "application/json" } });
+      if (res.status === 401) { out.innerHTML = `<p class="error">Sign in first: <a href="/login?redirect=/stats/landing">sign in</a>.</p>`; return; }
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) { out.innerHTML = `<p class="error">${esc(body.error || res.statusText)}</p>`; return; }
+      document.getElementById("since").textContent = body.since ? `data since ${body.since}` : "no data yet";
+      const vs = body.variants;
+      const bestOf = key => Math.max(...vs.filter(v => v.visitor >= 30).map(v => v[key] / v.visitor), 0);
+      const bestSign = bestOf("signup"), bestAdmin = bestOf("admin");
+      out.innerHTML = `<div class="wrap"><table>
+        <thead><tr><th>Variant</th><th>Visitors</th><th>Views</th><th>Admin opened</th><th>Sign-ups</th><th>Sign-up rate</th></tr></thead>
+        <tbody>${vs.map(v => `
+          <tr class="${v.active ? "" : "off"}">
+            <td><a href="/${v.variant}">/${v.variant}</a> ${esc(names[v.variant] ?? v.file)}${v.active ? "" : " <span class='ci'>(not running)</span>"}</td>
+            <td>${v.visitor}</td>
+            <td>${v.view}</td>
+            <td>${v.admin} · ${rate(v.admin, v.visitor, v.visitor >= 30 && v.admin / v.visitor === bestAdmin && bestAdmin > 0)}</td>
+            <td>${v.signup}</td>
+            <td>${rate(v.signup, v.visitor, v.visitor >= 30 && v.signup / v.visitor === bestSign && bestSign > 0)}</td>
+          </tr>`).join("")}
+        </tbody></table></div>`;
+    }
+    document.getElementById("days").addEventListener("change", load);
+    load();
+  </script>
+</body>
+</html>
