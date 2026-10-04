@@ -25,6 +25,19 @@ bun install
 DATABASE_URL=postgres://... bun run index.ts
 ```
 
+## Email
+
+WREN sends account confirmations, password-reset links and invites. The delivery method is configuration:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAIL_TRANSPORT` | `log`, or `smtp` if `SMTP_URL` is set | `log`: nothing is sent; each message and its link is written to the server log. `smtp`: send via `SMTP_URL`. |
+| `SMTP_URL` | none | e.g. `smtps://user:pass@smtp.example.com:465` or `smtp://user:pass@host:587` (any SMTP provider) |
+| `MAIL_FROM` | `WREN <no-reply@localhost>` | Sender address; use one your provider is allowed to send for (SPF/DKIM) |
+| `REQUIRE_EMAIL_VERIFICATION` | `false` | `true`: email/password accounts must confirm before signing in. An unconfirmed sign-in attempt sends a fresh link. Google/GitHub accounts are already confirmed. |
+
+Links in emails use `BETTER_AUTH_URL`, so set it to the public `https://` address. Before switching `REQUIRE_EMAIL_VERIFICATION` on for an existing instance, make sure mail delivery works: existing accounts that never confirmed will need the link to sign in.
+
 ## Docker image
 
 ```bash

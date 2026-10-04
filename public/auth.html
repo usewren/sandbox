@@ -104,6 +104,11 @@
     }
 
     .error.visible { display: block; }
+
+    .notice { font-size: 0.9rem; color: #065f46; background: #ecfdf5; border-radius: 6px; padding: 10px 12px; display: none; margin-top: 12px; }
+    .notice.visible { display: block; }
+    .hint { font-size: 0.85rem; color: #555; margin: 0; }
+    .link { font-size: 0.85rem; color: #4338ca; text-align: center; text-decoration: none; }
   </style>
 </head>
 <body>
@@ -126,7 +131,31 @@
       </label>
       <p class="error" id="login-error"></p>
       <button type="submit">Sign in</button>
+      <a href="?mode=forgot" class="link" id="forgot-link">Forgot password?</a>
     </form>
+
+    <form id="forgot" class="form" novalidate>
+      <p class="hint">Enter your account's email address and we'll send you a link to choose a new password.</p>
+      <label>
+        Email
+        <input type="email" name="email" autocomplete="email" required />
+      </label>
+      <p class="error" id="forgot-error"></p>
+      <button type="submit">Send reset link</button>
+      <a href="/login" class="link">Back to sign in</a>
+    </form>
+
+    <form id="reset" class="form" novalidate>
+      <p class="hint">Choose a new password for your account.</p>
+      <label>
+        New password
+        <input type="password" name="password" autocomplete="new-password" minlength="8" required />
+      </label>
+      <p class="error" id="reset-error"></p>
+      <button type="submit">Set new password</button>
+    </form>
+
+    <p class="notice" id="notice"></p>
 
     <form id="register" class="form" novalidate>
       <label>
@@ -164,9 +193,53 @@
         credentials: "include",
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.message ?? "Something went wrong");
+      if (!res.ok) { const err = new Error(data.message ?? "Something went wrong"); err.code = data.code; err.status = res.status; throw err; }
       return data;
     }
+
+    const params = new URLSearchParams(window.location.search);
+    const notice = (msg) => { const n = document.getElementById("notice"); n.textContent = msg; n.classList.add("visible"); };
+    function show(formId) {
+      document.querySelectorAll(".form").forEach(el => el.classList.remove("active"));
+      document.getElementById(formId).classList.add("active");
+      document.querySelector(".tabs").style.display = (formId === "login" || formId === "register") ? "" : "none";
+    }
+
+    // Modes reached from email links and the "forgot password" link
+    if (params.get("mode") === "forgot") show("forgot");
+    if (params.get("mode") === "reset") {
+      if (params.get("error") || !params.get("token")) {
+        show("forgot");
+        notice("That reset link is invalid or has expired. Request a new one below.");
+      } else show("reset");
+    }
+    if (params.get("verified") === "1") notice("Your email is confirmed. You can sign in.");
+    if (params.get("error") && params.get("mode") !== "reset") notice("That confirmation link is invalid or has expired. Sign in to get a new one.");
+
+    document.getElementById("forgot").addEventListener("submit", async e => {
+      e.preventDefault();
+      const form = e.target, error = document.getElementById("forgot-error"), btn = form.querySelector("button");
+      error.classList.remove("visible"); btn.disabled = true;
+      try {
+        await post("/api/auth/request-password-reset", { email: form.email.value, redirectTo: "/login?mode=reset" });
+        form.reset();
+        notice("If an account exists for that address, we've sent a link to choose a new password.");
+      } catch (err) { error.textContent = err.message; error.classList.add("visible"); }
+      finally { btn.disabled = false; }
+    });
+
+    document.getElementById("reset").addEventListener("submit", async e => {
+      e.preventDefault();
+      const form = e.target, error = document.getElementById("reset-error"), btn = form.querySelector("button");
+      error.classList.remove("visible"); btn.disabled = true;
+      try {
+        await post("/api/auth/reset-password", { newPassword: form.password.value, token: params.get("token") });
+        show("login");
+        notice("Your password has been changed. Sign in with the new one.");
+        history.replaceState(null, "", "/login");
+      } catch (err) { error.textContent = err.message; error.classList.add("visible"); }
+      finally { btn.disabled = false; }
+    });
 
     document.getElementById("login").addEventListener("submit", async e => {
       e.preventDefault();
@@ -180,10 +253,11 @@
           email: form.email.value,
           password: form.password.value,
         });
-        const params = new URLSearchParams(window.location.search);
         window.location.href = params.get("redirect") ?? "/profile";
       } catch (err) {
-        error.textContent = err.message;
+        error.textContent = err.status === 403
+          ? "Please confirm your email first. We've just sent you a new confirmation link."
+          : err.message;
         error.classList.add("visible");
       } finally {
         btn.disabled = false;
@@ -198,12 +272,19 @@
       error.classList.remove("visible");
       btn.disabled = true;
       try {
-        await post("/api/auth/sign-up/email", {
+        const data = await post("/api/auth/sign-up/email", {
           name: form.name.value,
           email: form.email.value,
           password: form.password.value,
+          callbackURL: "/login?verified=1",
         });
-        const params = new URLSearchParams(window.location.search);
+        if (!data.token) {
+          // Confirmation required (REQUIRE_EMAIL_VERIFICATION=true): no session yet
+          form.reset();
+          show("login");
+          notice("Account created. Check your email and click the confirmation link, then sign in.");
+          return;
+        }
         window.location.href = params.get("redirect") ?? "/profile";
       } catch (err) {
         error.textContent = err.message;

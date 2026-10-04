@@ -2,7 +2,7 @@ import postgres, { type Sql } from "postgres";
 import { parse as parseYaml } from "yaml";
 import { readFileSync, existsSync, writeFileSync, renameSync, readdirSync, unlinkSync, appendFileSync, mkdirSync } from "fs";
 import { join, extname } from "path";
-import { auth } from "auth";
+import { auth, sendMail, inviteMail } from "auth";
 import { setupCommon, createTenant, listTenants, migrateAllTenants, sanitizeSchemaName } from "db/runner";
 import Ajv from "ajv";
 import { json as jqJson } from "jq-wasm";
@@ -5006,10 +5006,25 @@ async function handleCreateInvite(req: Request, userId: string, sessionId: strin
     VALUES (${orgId}, ${email}, ${tokenHash}, ${tokenPrefix}, ${role}, ${userId})
     RETURNING id, created_at, expires_at
   `;
+
+  // Email the invite. Same base URL as Better Auth's confirmation/reset links.
+  const base = (process.env.BETTER_AUTH_URL?.replace(/\r/g, "").trim() || new URL(req.url).origin).replace(/\/$/, "");
+  const acceptUrl = `${base}/admin/#/accept/${encodeURIComponent(rawToken)}`;
+  const people = await sql<{ id: string; name: string; email: string }[]>`
+    SELECT id, name, email FROM "user" WHERE id = ANY(${[userId, orgId]})
+  `;
+  const inviter = people.find(p => p.id === userId);
+  const owner = people.find(p => p.id === orgId);
+  const emailSent = await sendMail(inviteMail(email, inviter?.name || inviter?.email || "Someone",
+    owner?.name || owner?.email || "a WREN org", role, acceptUrl));
+
   return Response.json({
     id: invite.id,
     email,
     role,
+    // false when no mail transport is configured (MAIL_TRANSPORT=log): share acceptUrl yourself
+    emailSent,
+    acceptUrl,
     token: rawToken, // returned once only — never stored in plaintext
     createdAt: invite.created_at,
     expiresAt: invite.expires_at,
