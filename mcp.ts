@@ -425,7 +425,10 @@ const rpcError = (id: RpcReq["id"], code: number, message: string) => ({ jsonrpc
 //                    no key  → public read-only tools, optionally narrowed by
 //                              ?tree=<name>&collections=a,b
 //                    key     → full tools, but only if the key belongs to {slug}
-export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, version: string, scope?: McpScope): Promise<Response> {
+// opts.presetIdentity: the caller was authenticated by the server before this call
+// (browser sign-in via /mcp/login) and the in-process `dispatch` carries that identity,
+// so the caller's own token is not forwarded.
+export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, version: string, scope?: McpScope, opts: { presetIdentity?: boolean; anonDispatch?: Dispatch } = {}): Promise<Response> {
   if (req.method !== "POST") {
     return new Response(JSON.stringify(rpcError(null, -32000, "This MCP endpoint is stateless: send JSON-RPC with POST")), {
       status: 405, headers: { "Content-Type": "application/json", Allow: "POST" },
@@ -435,21 +438,22 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
 
   // Forward only the caller's credentials to the in-process API calls.
   const auth: Record<string, string> = {};
-  const authz = req.headers.get("authorization"); if (authz) auth["Authorization"] = authz;
-  const cookie = req.headers.get("cookie"); if (cookie) auth["Cookie"] = cookie;
+  const authz = opts.presetIdentity ? null : req.headers.get("authorization"); if (authz) auth["Authorization"] = authz;
+  const cookie = opts.presetIdentity ? null : req.headers.get("cookie"); if (cookie) auth["Cookie"] = cookie;
   const origin = new URL(req.url).origin;
-  const anonymous = !authz && !cookie;
+  const anonymous = !opts.presetIdentity && !authz && !cookie;
   if (scope) {
     const tree = url.searchParams.get("tree")?.trim();
     const cols = url.searchParams.get("collections")?.split(",").map(s => s.trim()).filter(Boolean);
     scope = { ...scope, ...(tree ? { tree } : {}), ...(cols?.length ? { collections: cols } : {}) };
   }
-  const makeApi = (creds: Record<string, string>): Api => async (method, path, body, opts = {}) => {
-    const headers: Record<string, string> = { ...creds, Accept: opts.accept ?? "application/json", Origin: origin };
+  const anonDispatch = opts.anonDispatch ?? dispatch;
+  const makeApi = (creds: Record<string, string>, via: Dispatch = dispatch): Api => async (method, path, body, o = {}) => {
+    const headers: Record<string, string> = { ...creds, Accept: o.accept ?? "application/json", Origin: origin };
     let payload: BodyInit | undefined;
-    if (opts.form) payload = opts.form;
+    if (o.form) payload = o.form;
     else if (body !== undefined) { headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
-    const res = await dispatch(new Request(origin + path, { method, headers, body: payload }));
+    const res = await via(new Request(origin + path, { method, headers, body: payload }));
     const contentType = res.headers.get("content-type") ?? "";
     const bytes = new Uint8Array(await res.arrayBuffer());
     let json: unknown; let text: string | undefined;
@@ -460,7 +464,8 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
   const api = makeApi(auth);
   // Public-data tools never send the caller's credentials: they see exactly what an
   // anonymous visitor sees, even inside a keyed session.
-  const anonApi = makeApi({});
+  // (anonDispatch never carries a signed-in MCP identity either)
+  const anonApi = makeApi({}, anonDispatch);
 
   // Modes:
   //   org-bound, no key  → that org's public tools (optionally one site)

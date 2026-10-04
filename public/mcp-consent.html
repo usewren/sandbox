@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WREN — Allow access</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f5f3ff; color: #111827; margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+    .card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(67,56,202,.12); padding: 28px; width: 100%; max-width: 440px; }
+    h1 { font-size: 1.25rem; margin: 0 0 4px; }
+    .muted { color: #6b7280; font-size: .9rem; }
+    .app { display: flex; gap: 12px; align-items: center; margin: 18px 0; padding: 12px; background: #f9fafb; border-radius: 8px; }
+    .app img { width: 36px; height: 36px; border-radius: 8px; }
+    .app .name { font-weight: 700; }
+    ul.can { margin: 8px 0 18px; padding-left: 20px; font-size: .92rem; line-height: 1.6; }
+    fieldset { border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; margin: 0 0 18px; }
+    legend { font-size: .85rem; font-weight: 600; padding: 0 4px; }
+    label.org { display: flex; gap: 8px; align-items: center; padding: 6px 0; font-size: .95rem; cursor: pointer; }
+    label.org .role { color: #6b7280; font-size: .8rem; }
+    .buttons { display: flex; gap: 10px; }
+    button { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #d1d5db; background: #fff; font-size: .95rem; cursor: pointer; }
+    button.primary { background: #4338ca; border-color: #4338ca; color: #fff; font-weight: 600; }
+    button:disabled { opacity: .6; cursor: default; }
+    .error { color: #b91c1c; font-size: .9rem; margin-top: 12px; display: none; }
+    .warn { font-size: .82rem; color: #92400e; background: #fffbeb; border-radius: 6px; padding: 8px 10px; margin: 0 0 16px; }
+  </style>
+</head>
+<body>
+  <div class="card" id="card">
+    <p class="muted">Loading…</p>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const consentCode = params.get("consent_code");
+    const clientId = params.get("client_id");
+    const card = document.getElementById("card");
+    const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+    async function init() {
+      if (!consentCode || !clientId) { card.innerHTML = `<h1>Nothing to approve</h1><p class="muted">Start the sign-in from your app again.</p>`; return; }
+      const res = await fetch(`/mcp/consent/info?client_id=${encodeURIComponent(clientId)}`, { credentials: "include" });
+      if (res.status === 401) { location.href = "/login?redirect=" + encodeURIComponent(location.pathname + location.search); return; }
+      const info = await res.json();
+      if (!res.ok) { card.innerHTML = `<h1>Can't continue</h1><p class="muted">${esc(info.error)}</p>`; return; }
+
+      card.innerHTML = `
+        <h1>Allow an app to use WREN?</h1>
+        <p class="muted">Signed in as ${esc(info.user.name || info.user.email)} (${esc(info.user.email)})</p>
+        <div class="app">
+          ${info.client.icon ? `<img src="${esc(info.client.icon)}" alt="">` : ""}
+          <div><div class="name">${esc(info.client.name)}</div>
+            <div class="muted">will receive access at ${info.client.redirectHosts.map(esc).join(", ")}</div></div>
+        </div>
+        <p style="margin:0;font-size:.92rem">It will be able to, <strong>as you</strong>, in the org you choose:</p>
+        <ul class="can">
+          <li>read the data you can read there</li>
+          <li>write documents and files as previews (you decide what goes live)</li>
+          <li>and anything else your access there allows, including publishing</li>
+        </ul>
+        <fieldset><legend>Org this connection works in</legend>
+          ${info.orgs.map((o, i) => `
+            <label class="org"><input type="radio" name="org" value="${esc(o.id)}" ${i === 0 ? "checked" : ""}>
+              ${esc(o.name)} ${o.slug ? `<span class="muted">(${esc(o.slug)})</span>` : ""} <span class="role">${esc(o.role)}</span></label>`).join("")}
+        </fieldset>
+        <p class="warn">Only allow apps you started this sign-in from. The app stays signed in for up to 30 days (its access renews every hour).</p>
+        <div class="buttons">
+          <button id="deny">Deny</button>
+          <button class="primary" id="allow">Allow</button>
+        </div>
+        <p class="error" id="error"></p>`;
+
+      document.getElementById("allow").onclick = () => decide(true);
+      document.getElementById("deny").onclick = () => decide(false);
+    }
+
+    async function decide(accept) {
+      document.querySelectorAll("button").forEach(b => b.disabled = true);
+      const org = document.querySelector("input[name=org]:checked")?.value;
+      const res = await fetch("/mcp/consent/approve", {
+        method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ consent_code: consentCode, client_id: clientId, org_id: org, accept }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.redirectURI) { location.href = data.redirectURI; return; }
+      const err = document.getElementById("error");
+      err.textContent = data.error ?? "Something went wrong";
+      err.style.display = "block";
+      document.querySelectorAll("button").forEach(b => b.disabled = false);
+    }
+
+    init();
+  </script>
+</body>
+</html>

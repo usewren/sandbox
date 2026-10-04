@@ -2,7 +2,7 @@ import postgres, { type Sql } from "postgres";
 import { parse as parseYaml } from "yaml";
 import { readFileSync, existsSync, writeFileSync, renameSync, readdirSync, unlinkSync, appendFileSync, mkdirSync } from "fs";
 import { join, extname } from "path";
-import { auth, sendMail, inviteMail } from "auth";
+import { auth, sendMail, inviteMail, oAuthDiscoveryMetadata } from "auth";
 import { setupCommon, createTenant, listTenants, migrateAllTenants, sanitizeSchemaName } from "db/runner";
 import Ajv from "ajv";
 import { json as jqJson } from "jq-wasm";
@@ -14,8 +14,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // Per-request context. Set when an org admin's session impersonates a member, so
 // every tenant transaction stamps its writes with the impersonating admin (see
 // withTenant) and the request is audit-logged with both identities.
-type RequestContext = { impersonatedBy?: string; audit?: { orgId: string; targetId: string } };
+type RequestContext = { impersonatedBy?: string; audit?: { orgId: string; targetId: string }; mcpUser?: SessionUser };
 const requestContext = new AsyncLocalStorage<RequestContext>();
+// In-process requests made by MCP tools on behalf of a signed-in (OAuth) MCP user.
+// Only Request objects created by the server itself can carry that identity.
+const internalRequests = new WeakSet<Request>();
 
 const WREN_VERSION = "0.5.0";
 // Set at image build time: docker build --build-arg WREN_BUILD=$(git rev-parse --short HEAD) …
@@ -661,6 +664,10 @@ async function checkApiKey(req: Request): Promise<SessionUser | null> {
 }
 
 async function requireSession(req: Request): Promise<SessionUser | null> {
+  // An MCP tool call from a signed-in MCP connection (/mcp/login): the identity was
+  // established from the OAuth token and is only honoured for internal requests.
+  const ctx = requestContext.getStore();
+  if (ctx?.mcpUser && internalRequests.has(req)) return ctx.mcpUser;
   const apiKey = await checkApiKey(req);
   if (apiKey) return apiKey;
   const session = await auth.api.getSession({ headers: req.headers });
@@ -1083,6 +1090,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // plain HTTP. Better Auth auto-detects its origin from the request URL, so
     // it sees http:// while the browser sends Origin: https://. Rewrite the
     // request URL to match the real protocol so origin validation succeeds.
+    // MCP OAuth: always show WREN's consent page. Better Auth only asks for consent
+    // when the client sends prompt=consent; MCP clients register themselves, so
+    // auto-approval would hand a signed-in user's token to any registered client.
+    if (url.pathname === "/api/auth/mcp/authorize" && url.searchParams.get("prompt") !== "consent") {
+      const forced = new URL(url);
+      forced.searchParams.set("prompt", "consent");
+      return Response.redirect(`${forced.pathname}${forced.search}`, 302);
+    }
+
     if (url.pathname.startsWith("/api/auth")) {
       const proto = req.headers.get("x-forwarded-proto");
       if (proto === "https" && !req.url.startsWith("https://")) {
@@ -1205,6 +1221,23 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // Tools call this same handler in-process, so all permission checks apply.
     if (url.pathname === "/mcp") {
       return handleMcp(req, url, r => handleRequest(r, new URL(r.url)), WREN_VERSION);
+    }
+
+    // MCP with browser sign-in (OAuth). Same tools as /mcp with a key; the org is the
+    // one the user picked on the consent page for this client.
+    if (url.pathname === "/mcp/login") return handleMcpLogin(req, url);
+    if (url.pathname === "/mcp/consent" && req.method === "GET") {
+      return new Response(Bun.file(join(import.meta.dir, "public", "mcp-consent.html")), { headers: { "Content-Type": "text/html", ...NO_CACHE } });
+    }
+    if (url.pathname === "/mcp/consent/info" && req.method === "GET") return handleMcpConsentInfo(req, url);
+    if (url.pathname === "/mcp/consent/approve" && req.method === "POST") return handleMcpConsentApprove(req);
+
+    // OAuth discovery for MCP clients (RFC 8414 / RFC 9728)
+    if (url.pathname === "/.well-known/oauth-authorization-server" || url.pathname === "/.well-known/oauth-authorization-server/api/auth") {
+      return oAuthDiscoveryMetadata(auth)(req);
+    }
+    if (url.pathname === "/.well-known/oauth-protected-resource" || url.pathname === "/.well-known/oauth-protected-resource/mcp/login") {
+      return Response.json(mcpProtectedResource(url), { headers: { "Cache-Control": "public, max-age=300" } });
     }
 
     // All data/management API routes live under /api/v1/
@@ -5287,6 +5320,121 @@ async function handleAcceptInvite(req: Request, userId: string): Promise<Respons
   await sql`UPDATE common.invites SET accepted_at = NOW() WHERE id = ${invite.id}`;
 
   return Response.json({ accepted: true, orgId: invite.org_id });
+}
+
+// -------------------------------------------------------
+// MCP with browser sign-in (OAuth)
+// -------------------------------------------------------
+// Flow: client POSTs /mcp/login → 401 with resource metadata → discovers the
+// authorization server → registers → /api/auth/mcp/authorize (forced to
+// prompt=consent) → /login if needed → /mcp/consent: user approves and picks an org
+// → token. Every /mcp/login call then acts as that user in that org.
+
+const internalDispatch = (r: Request) => { internalRequests.add(r); return handleRequest(r, new URL(r.url)); };
+
+function mcpProtectedResource(url: URL) {
+  const base = publicBase(url);
+  const issuer = (process.env.BETTER_AUTH_URL?.replace(/\r/g, "").trim() || base).replace(/\/$/, "");
+  return {
+    resource: `${base}/mcp/login`,
+    resource_name: "WREN",
+    authorization_servers: [issuer],
+    scopes_supported: ["openid", "profile", "email", "offline_access"],
+    bearer_methods_supported: ["header"],
+  };
+}
+
+async function handleMcpLogin(req: Request, url: URL): Promise<Response> {
+  if (req.method !== "POST") return handleMcp(req, url, internalDispatch, WREN_VERSION);   // → 405
+  const challenge = (message: string, invalid = false) => new Response(
+    JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message } }),
+    { status: 401, headers: {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": `Bearer resource_metadata="${publicBase(url)}/.well-known/oauth-protected-resource/mcp/login"${invalid ? ', error="invalid_token"' : ""}`,
+    } },
+  );
+  const authz = req.headers.get("authorization") ?? "";
+  if (!authz.startsWith("Bearer ")) return challenge("Sign in required");
+  if (authz.startsWith("Bearer wren_")) return challenge("API keys use /mcp; /mcp/login is for browser sign-in", true);
+
+  const token = await (auth.api as any).getMcpSession({ headers: req.headers }).catch(() => null) as { userId?: string; clientId?: string } | null;
+  if (!token?.userId || !token.clientId) return challenge("Invalid or expired sign-in", true);
+  const [grant] = await sql<{ org_id: string }[]>`
+    SELECT org_id FROM common.mcp_grants WHERE user_id = ${token.userId} AND client_id = ${token.clientId}
+  `;
+  if (!grant) return challenge("No org was chosen for this connection; sign in again", true);
+  if (!(await isOrgMember(token.userId, grant.org_id))) {
+    return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32003, message: "You are no longer a member of the org this connection was approved for" } }, { status: 403 });
+  }
+  const [u] = await sql<{ name: string; email: string }[]>`SELECT name, email FROM "user" WHERE id = ${token.userId}`;
+  const ctx = requestContext.getStore();
+  if (ctx) ctx.mcpUser = { userId: token.userId, name: u?.name ?? "", email: u?.email ?? "", sessionId: null, keyOrgId: grant.org_id };
+  return handleMcp(req, url, internalDispatch, WREN_VERSION, undefined, {
+    presetIdentity: true,
+    anonDispatch: r => handleRequest(r, new URL(r.url)),   // public_* tools: never the user's identity
+  });
+}
+
+// Orgs a signed-in user can approve an MCP connection for: their own + memberships.
+async function orgChoices(userId: string) {
+  const own = await sql<{ email: string }[]>`SELECT email FROM "user" WHERE id = ${userId}`;
+  const ownSlug = own[0] ? await getOrCreateSlug(userId, own[0].email) : null;
+  const memberships = await sql<{ org_id: string; role: string; name: string; slug: string | null }[]>`
+    SELECT m.org_id, m.role, u.name, s.slug
+    FROM common.org_members m JOIN "user" u ON u.id = m.org_id LEFT JOIN common.org_slugs s ON s.org_id = m.org_id
+    WHERE m.user_id = ${userId} ORDER BY u.name
+  `;
+  return [
+    { id: userId, name: "My workspace", slug: ownSlug, role: "owner" },
+    ...memberships.map(m => ({ id: m.org_id, name: m.name, slug: m.slug, role: m.role })),
+  ];
+}
+
+async function handleMcpConsentInfo(req: Request, url: URL): Promise<Response> {
+  const user = await requireSession(req);
+  if (!user || user.keyId) return Response.json({ error: "Sign in first" }, { status: 401 });
+  if (user.impersonator) return Response.json({ error: "Not available while viewing as someone else" }, { status: 403 });
+  const clientId = url.searchParams.get("client_id") ?? "";
+  const [app] = await sql<{ name: string; redirect_urls: string; icon: string | null }[]>`
+    SELECT name, redirect_urls, icon FROM public.oauth_application WHERE client_id = ${clientId}
+  `;
+  if (!app) return Response.json({ error: "Unknown application" }, { status: 404 });
+  const redirectHosts = [...new Set(app.redirect_urls.split(",").map(u => { try { return new URL(u.trim()).host; } catch { return u.trim(); } }))];
+  return Response.json({
+    client: { name: app.name, icon: app.icon, redirectHosts },
+    user: { name: user.name, email: user.email },
+    orgs: await orgChoices(user.userId),
+  });
+}
+
+async function handleMcpConsentApprove(req: Request): Promise<Response> {
+  const user = await requireSession(req);
+  if (!user || user.keyId) return Response.json({ error: "Sign in first" }, { status: 401 });
+  if (user.impersonator) return Response.json({ error: "Not available while viewing as someone else" }, { status: 403 });
+  const body = await req.json().catch(() => ({})) as { consent_code?: string; client_id?: string; org_id?: string; accept?: boolean };
+  if (!body.consent_code || !body.client_id) return Response.json({ error: "consent_code and client_id are required" }, { status: 400 });
+
+  // The consent code must be this user's pending authorization for this client
+  const [pending] = await sql<{ value: string }[]>`SELECT value FROM public.verification WHERE identifier = ${body.consent_code} AND expires_at > NOW()`;
+  let p: { clientId?: string; userId?: string } = {};
+  try { p = JSON.parse(pending?.value ?? "{}"); } catch {}
+  if (p.clientId !== body.client_id || p.userId !== user.userId) {
+    return Response.json({ error: "This authorization request has expired or isn't yours; start again from your app" }, { status: 400 });
+  }
+
+  if (body.accept) {
+    if (!body.org_id || !(await isOrgMember(user.userId, body.org_id))) {
+      return Response.json({ error: "Choose one of your orgs" }, { status: 400 });
+    }
+    await sql`
+      INSERT INTO common.mcp_grants (user_id, client_id, org_id) VALUES (${user.userId}, ${body.client_id}, ${body.org_id})
+      ON CONFLICT (user_id, client_id) DO UPDATE SET org_id = EXCLUDED.org_id, updated_at = NOW()
+    `;
+  }
+  const result = await (auth.api as any).oAuthConsent({ body: { accept: !!body.accept, consent_code: body.consent_code }, headers: req.headers })
+    .catch((e: Error) => ({ error: e.message }));
+  if (!result?.redirectURI) return Response.json({ error: result?.error ?? "Could not complete authorization" }, { status: 400 });
+  return Response.json({ redirectURI: result.redirectURI });
 }
 
 // -------------------------------------------------------
