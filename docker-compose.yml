@@ -11,6 +11,11 @@ services:
       BETTER_AUTH_URL: http://localhost:4000
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-change-me-in-production}
       CACHE_PURGE_BACKEND: ${CACHE_PURGE_BACKEND:-noop}
+      # Email (account confirmation, password reset, invites). Unset = nothing is
+      # sent; links are written to the server log instead.
+      SMTP_URL: ${SMTP_URL:-}                      # e.g. smtps://user:pass@smtp.example.com:465
+      MAIL_FROM: ${MAIL_FROM:-WREN <no-reply@localhost>}
+      REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}   # true = must confirm before signing in
       WREN_LOG_DIR: /data
       NODE_ENV: production
     volumes:
