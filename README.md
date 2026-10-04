@@ -25,6 +25,15 @@ bun install
 DATABASE_URL=postgres://... bun run index.ts
 ```
 
+## Landing-page experiment
+
+`/` shows each new visitor one of the landing variants `/a`–`/e`, chosen at random and kept for 90 days in the `wren_v` cookie (the variant letter only). Views, first Admin UI opens and email sign-ups are counted per day and variant, with nothing that identifies a person; crawlers always get `/c` and aren't counted.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WREN_LANDING_VARIANTS` | `a,b,c,d,e` | Variants in the experiment. One value (e.g. `c`) turns it off. |
+| `WREN_OPERATORS` | none | Comma-separated emails that can see the results at `/stats/landing`. |
+
 ## Email
 
 WREN sends account confirmations, password-reset links and invites. The delivery method is configuration:
@@ -42,7 +51,7 @@ Links in emails use `BETTER_AUTH_URL`, so set it to the public `https://` addres
 
 ```bash
 docker pull reusr1/wren:latest
-# or pin a version: reusr1/wren:0.5.0
+# or pin a version: reusr1/wren:0.6.0
 # Platforms: linux/amd64, linux/arm64
 ```
 
@@ -50,7 +59,7 @@ Building it yourself (run from the folder that contains all the repos, since the
 
 ```bash
 docker build -f sandbox/Dockerfile --build-arg WREN_BUILD=$(git -C sandbox rev-parse --short HEAD) -t wren:local .
-curl -s localhost:4000/health   # → {"status":"ok","version":"0.5.0","build":"<commit>"}
+curl -s localhost:4000/health   # → {"status":"ok","version":"0.6.0","build":"<commit>"}
 ```
 
 Public links that WREN generates (`/api/v1/projects`, `llms.txt`, sitemap) use `WREN_URL`, falling back to `BETTER_AUTH_URL`. Set it to your public `https://` address when running behind a TLS-terminating proxy.
