@@ -555,12 +555,14 @@ function corsHeaders(origin: string | null, host: string | null, pathname: strin
     // This covers Cloudflare Tunnel and any reverse proxy without needing env vars.
     try { if (new URL(origin).host === host) trusted = true; } catch {}
   }
+  // Public routes: always "*" regardless of Origin, so a CDN-cached response is valid
+  // for every site. Same-origin pages don't need CORS at all.
+  if (isPublicPath(pathname)) return { ...base, "Access-Control-Allow-Origin": "*" };
   // Trusted origins may use the session cookie.
   if (trusted) return { ...base, "Access-Control-Allow-Origin": origin!, "Access-Control-Allow-Credentials": "true", "Vary": "Origin" };
-  if (isPublicPath(pathname)) return { ...base, "Access-Control-Allow-Origin": "*" };
-  // Any other origin may call the API with an explicit Bearer key, but never with
+  // Any other origin may call the data API with an explicit Bearer key, but never with
   // cookies (no Allow-Credentials), so a foreign page can't ride a logged-in session.
-  if (origin) return { ...base, "Access-Control-Allow-Origin": origin, "Vary": "Origin" };
+  if (origin && pathname.startsWith("/api/v1/")) return { ...base, "Access-Control-Allow-Origin": origin, "Vary": "Origin" };
   return { ...base, "Access-Control-Allow-Origin": "" };
 }
 
@@ -790,7 +792,17 @@ const server = Bun.serve({
       res = new Response(null, { status: res.status, headers });
     }
 
-    Object.entries(cors).forEach(([k, v]) => res.headers.set(k, v));
+    for (const [k, v] of Object.entries(cors)) {
+      // Merge Vary instead of replacing it: content-negotiated responses rely on Vary: Accept.
+      if (k === "Vary" && res.headers.has("Vary")) res.headers.set("Vary", `${res.headers.get("Vary")}, ${v}`);
+      else res.headers.set(k, v);
+    }
+    // Authenticated responses must never be stored by a shared cache: Cloudflare caches
+    // static extensions (.js, .css, .png…) by default, so a private file fetched with a
+    // key could otherwise be served to anonymous visitors from the edge.
+    if (url.pathname.startsWith("/api/v1/") && !isPublicPath(url.pathname)) {
+      res.headers.set("Cache-Control", "private, no-store");
+    }
     return res;
   },
 });
@@ -2324,13 +2336,15 @@ async function insertAssetVersion(
   version: number,
   file: File,
   userId: string,
-): Promise<void> {
+): Promise<{ _binary: true; filename: string; mimeType: string; size: number; sha256: string }> {
   const buffer = Buffer.from(await file.arrayBuffer());
   const meta = {
-    _binary:  true,
+    _binary:  true as const,
     filename: file.name,
     mimeType: file.type || "application/octet-stream",
     size:     buffer.byteLength,
+    // Lets deploy tools detect same-size edits without downloading the bytes.
+    sha256:   new Bun.CryptoHasher("sha256").update(buffer).digest("hex"),
   };
   await withTenant(schemaName, async tx => {
     await tx`
@@ -2358,7 +2372,7 @@ async function handleCreateAsset(schemaName: string, collection: string, req: Re
     return inserted.id;
   });
 
-  await insertAssetVersion(schemaName, docId, 1, file, userId);
+  const meta = await insertAssetVersion(schemaName, docId, 1, file, userId);
 
   const doc = await withTenant(schemaName, async tx => {
     const [row] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
@@ -2369,7 +2383,7 @@ async function handleCreateAsset(schemaName: string, collection: string, req: Re
 
   return Response.json({
     id: doc.id, version: 1, collection,
-    data: { _binary: true, filename: file.name, mimeType: file.type || "application/octet-stream", size: file.size },
+    data: meta,
     createdAt: doc.created_at, updatedAt: doc.updated_at,
   }, { status: 201 });
 }
@@ -2388,7 +2402,7 @@ async function handleUpdateAsset(schemaName: string, collection: string, docId: 
   if (!existing) return Response.json({ error: "Not found" }, { status: 404 });
 
   const newVersion = existing.current_version + 1;
-  await insertAssetVersion(schemaName, docId, newVersion, file, userId);
+  const meta = await insertAssetVersion(schemaName, docId, newVersion, file, userId);
 
   const doc = await withTenant(schemaName, async tx => {
     const [row] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
@@ -2401,7 +2415,7 @@ async function handleUpdateAsset(schemaName: string, collection: string, docId: 
 
   return Response.json({
     id: doc.id, version: newVersion, collection,
-    data: { _binary: true, filename: file.name, mimeType: file.type || "application/octet-stream", size: file.size },
+    data: meta,
     createdAt: doc.created_at, updatedAt: doc.updated_at,
   });
 }
@@ -3967,9 +3981,11 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
     return { tree: treeName, path: treePath, document: doc, assignmentDocId: exact?.assignment_doc_id ?? null, pathExists, children: children.map(c => ({ path: c.path, documentId: c.document_id })) };
   });
 
-  // 404 only if the path doesn't exist AND has no descendants.
+  // 404 if nothing is visible here: the path doesn't exist (or its document has no
+  // version under the requested/enforced label, e.g. deployed but not yet promoted)
+  // AND there are no descendants.
   // no-store: otherwise the CDN keeps serving the 404 after the file is deployed.
-  if (!result.pathExists && result.children.length === 0) {
+  if ((!result.pathExists || !result.document) && result.children.length === 0) {
     return Response.json({ error: "Not found" }, { status: 404, headers: { "Cache-Control": "no-store" } });
   }
 
@@ -4483,6 +4499,7 @@ async function generateLlmsTxt(
   accessibleCollections: string[],
   accessibleTrees: string[],
   authenticated: boolean,
+  publicView: boolean = !authenticated,
 ): Promise<string> {
   const schema = sanitizeSchemaName(orgId);
 
@@ -4521,6 +4538,11 @@ async function generateLlmsTxt(
   const collectionData: CollectionData[] = [];
 
   for (const col of accessibleCollections) {
+    // Public viewers only see collections a principal='*' rule actually allows
+    // (a broad '*' rule can be narrowed by a 'none' rule on one collection).
+    const publicAr = publicView ? await checkAccess(orgId, "", "*", `collection:${col}`, "read") : null;
+    if (publicAr && !publicAr.allowed) continue;
+
     // Count
     const countRows = await sql<{ count: string }[]>`
       SELECT COUNT(*) AS count FROM ${sql.unsafe(schema)}.documents
@@ -4548,7 +4570,6 @@ async function generateLlmsTxt(
 
     // Sample documents. Public visitors only see what a public read would return:
     // the rule's labelled version, with its data filter applied.
-    const publicAr = authenticated ? null : await checkAccess(orgId, "", "*", `collection:${col}`, "read");
     const sampleLabel = publicAr?.labelFilter ?? null;
     const sampleRows = sampleLabel
       ? await sql<{ data: unknown; id: string; current_version: number; labels: string[] }[]>`
@@ -4588,7 +4609,7 @@ async function generateLlmsTxt(
   const lines: string[] = [
     `# ${orgName} — Wren data context`,
     ``,
-    `> Versioned JSON document store. ${accessibleCollections.length} collections, ${totalDocs} total documents.`,
+    `> Versioned JSON document store. ${collectionData.length} collections, ${totalDocs} total documents.`,
     ``,
     `*${authenticated ? "Authenticated" : "Public"} data context. Generated ${date}.*`,
     ``,
@@ -4709,6 +4730,8 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
 
   let accessibleCollections: string[];
   let accessibleTrees: string[];
+  // True when the caller only gets what principal='*' rules allow (anonymous or non-member).
+  let publicView = !authenticated;
 
   if (authenticated && (user!.userId === orgId || (() => false)())) {
     // Authenticated as owner: show all collections
@@ -4743,6 +4766,7 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
       accessibleTrees = treeRows.map(r => r.tree);
     } else {
       // Not a member — fall back to public access rules
+      publicView = true;
       const resources = await getPublicResources(orgId);
       if (resources.collections === "all") {
         const colRows = await sql<{ collection: string }[]>`
@@ -4784,8 +4808,12 @@ async function handleOrgLlmsTxt(slug: string | undefined, url: URL, user: Sessio
     }
   }
 
-  const body = await generateLlmsTxt(orgId, orgName, slug, base, accessibleCollections, accessibleTrees, authenticated);
-  return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  const body = await generateLlmsTxt(orgId, orgName, slug, base, accessibleCollections, accessibleTrees, authenticated, publicView);
+  return new Response(body, { headers: {
+    "Content-Type": "text/plain; charset=utf-8",
+    // Owner/member views include private data — keep them out of shared caches.
+    ...(publicView ? {} : { "Cache-Control": "private, no-store" }),
+  } });
 }
 
 async function handleWellKnownLlmsTxt(url: URL): Promise<Response> {

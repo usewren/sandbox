@@ -78,6 +78,46 @@ describe("public access", () => {
   });
 });
 
+describe("trees and caching", () => {
+  const tree = `site${Date.now()}`;
+  let fileId: string;
+
+  beforeAll(async () => {
+    const form = new FormData();
+    form.append("file", new File(["<h1>v1</h1>"], "index.html", { type: "text/html" }));
+    const up = await fetch(`${BASE_URL}/api/v1/${secretCol}`, { method: "POST", headers: { Origin: BASE_URL, Cookie: cookie }, body: form });
+    fileId = (await up.json()).id;
+    await put(`/api/v1/tree/${tree}/index.html`, { documentId: fileId });
+    await post("/api/v1/permissions", { principal: "*", resource: `tree:${tree}`, access: "read", labelFilter: "published" }, cookie);
+  });
+
+  it("uploads record a sha256 of the bytes", async () => {
+    const doc = await (await get(`/api/v1/${secretCol}/${fileId}`, cookie)).json();
+    expect(doc.data.sha256).toBe(new Bun.CryptoHasher("sha256").update("<h1>v1</h1>").digest("hex"));
+  });
+
+  it("a deployed-but-unpromoted file is 404 publicly, not a 200 stub", async () => {
+    const res = await fetch(`${BASE_URL}/orgs/${slug}/tree/${tree}/index.html`);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("after promote the file is served publicly with Vary: Accept kept", async () => {
+    await post(`/api/v1/${secretCol}/${fileId}/labels`, { label: "published" }, cookie);
+    const res = await fetch(`${BASE_URL}/orgs/${slug}/tree/${tree}/index.html`, { headers: { Accept: "text/html", Origin: BASE_URL } });
+    expect(await res.text()).toBe("<h1>v1</h1>");
+    expect(res.headers.get("vary") ?? "").toContain("Accept");
+  });
+
+  it("authenticated file and tree reads are never shared-cacheable", async () => {
+    for (const path of [`/api/v1/${secretCol}/${fileId}/raw`, `/api/v1/tree/${tree}/index.html`]) {
+      const res = await fetch(`${BASE_URL}${path}`, { headers: { Origin: BASE_URL, Cookie: cookie, Accept: "text/html" } });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("private, no-store");
+    }
+  });
+});
+
 describe("CORS", () => {
   const foreign = "https://example.com";
 
@@ -85,6 +125,16 @@ describe("CORS", () => {
     const res = await fetch(`${BASE_URL}/api/v1/orgs/${slug}/${col}`, { headers: { Origin: foreign } });
     expect(res.headers.get("access-control-allow-origin")).toBe("*");
     expect(res.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+
+  it("public routes send * even to trusted origins, so a cached response works everywhere", async () => {
+    const res = await fetch(`${BASE_URL}/api/v1/orgs/${slug}/${col}`, { headers: { Origin: BASE_URL } });
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  it("auth routes don't echo foreign origins", async () => {
+    const res = await fetch(`${BASE_URL}/api/auth/get-session`, { method: "OPTIONS", headers: { Origin: foreign } });
+    expect(res.headers.get("access-control-allow-origin") ?? "").not.toBe(foreign);
   });
 
   it("private API allows Bearer from other origins but never cookies", async () => {
