@@ -8,6 +8,9 @@ import Ajv from "ajv";
 import { json as jqJson } from "jq-wasm";
 import jmespath from "jmespath";
 import jsonata from "jsonata";
+import { handleMcp } from "./mcp";
+
+const WREN_VERSION = "0.4.2";
 
 // ── Crash-resilient logging ──────────────────────────────────────────────────
 // Ring buffer: keeps the last 5 minutes of logs on disk. On startup, preserves
@@ -823,7 +826,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Health check
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.4.2", build: "20260414b" });
+      return Response.json({ status: "ok", version: WREN_VERSION, build: "20260414b" });
     }
 
 
@@ -1106,6 +1109,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         return handlePublicCollectionRequest(slug, collection, id, subSeg, url, req.headers.get("accept"), req);
       }
       return Response.json({ error: "Not found" }, { status: 404 });
+    }
+
+    // MCP endpoint for AI agents: one per instance, org comes from the API key.
+    // Tools call this same handler in-process, so all permission checks apply.
+    if (url.pathname === "/mcp") {
+      return handleMcp(req, url, r => handleRequest(r, new URL(r.url)), WREN_VERSION);
     }
 
     // All data/management API routes live under /api/v1/
