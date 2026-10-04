@@ -32,8 +32,8 @@ beforeAll(async () => {
 });
 
 describe("MCP endpoint", () => {
-  it("requires a key", async () => {
-    const res = await mcp("initialize", {}, { auth: null });
+  it("rejects an invalid key with 401", async () => {
+    const res = await mcp("initialize", {}, { auth: "Bearer wren_not_a_real_key" });
     expect(res.status).toBe(401);
     expect(res.headers.get("www-authenticate")).toContain("Bearer");
   });
@@ -135,6 +135,39 @@ describe("MCP endpoint", () => {
     const res = await mcp("tools/list", {}, { path, auth: `Bearer ${otherKey}` });
     expect(res.status).toBe(403);
     expect((await mcp("initialize", {}, { auth: null, path: "/orgs/no-such-org-here/mcp" })).status).toBe(404);
+  });
+
+  it("/mcp without a key: public data of every org, read-only", async () => {
+    const init = await (await mcp("initialize", { protocolVersion: "2025-06-18" }, { auth: null })).json();
+    expect(init.result.instructions).toContain("list_public");
+    const names = (await (await mcp("tools/list", {}, { auth: null })).json()).result.tools.map((t: any) => t.name).sort();
+    expect(names).toEqual(["list_public", "public_get_document", "public_list_tree", "public_query_documents", "public_read_file", "public_site_info"]);
+    const listed = await (await mcp("tools/call", { name: "list_public", arguments: {} }, { auth: null })).json();
+    expect(listed.result.structuredContent.orgs.some((o: any) => o.org === slug)).toBe(true);
+    const page = await (await mcp("tools/call", { name: "public_read_file", arguments: { org: slug, tree, path: "/index.html" } }, { auth: null })).json();
+    expect(page.result.content[0].text).toBe("<h1>agent</h1>");
+    const priv = await (await mcp("tools/call", { name: "public_query_documents", arguments: { org: slug, collection: col } }, { auth: null })).json();
+    expect(priv.result.isError).toBe(true);
+    const write = await (await mcp("tools/call", { name: "write_document", arguments: { collection: col, data: {} } }, { auth: null })).json();
+    expect(write.error.code).toBe(-32602);
+  });
+
+  it("/mcp with a key adds public_* tools that never use the key", async () => {
+    const names = (await (await mcp("tools/list")).json()).result.tools.map((t: any) => t.name);
+    expect(names).toContain("write_document");
+    expect(names).toContain("public_query_documents");
+    expect(names).toHaveLength(18);
+    const ro = (await (await mcp("tools/list", {}, { path: "/mcp?readonly=1" })).json()).result.tools.map((t: any) => t.name);
+    expect(ro).toHaveLength(14);
+    // the key can read its own private document directly…
+    const own = await call("get_document", { collection: col, key: "doc-1" });
+    expect(own.isError).toBeUndefined();
+    // …but not through the public tool, which sends no credentials
+    const pub = await call("public_get_document", { org: slug, collection: col, id: own.structuredContent.id });
+    expect(pub.isError).toBe(true);
+    // the org-bound endpoint with a key stays own-org only (no public_* tools)
+    const bound = (await (await mcp("tools/list", {}, { path: `/orgs/${slug}/mcp` })).json()).result.tools.map((t: any) => t.name);
+    expect(bound.some((n: string) => n.startsWith("public_"))).toBe(false);
   });
 
   it("GET is not supported (stateless endpoint)", async () => {
