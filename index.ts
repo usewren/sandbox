@@ -5045,8 +5045,10 @@ async function handleCreateInvite(req: Request, userId: string, sessionId: strin
 }
 
 async function handleListReceivedInvites(user: SessionUser): Promise<Response> {
-  const [u] = await sql<{ email: string }[]>`SELECT email FROM "user" WHERE id = ${user.userId}`;
+  const [u] = await sql<{ email: string; email_verified: boolean }[]>`SELECT email, email_verified FROM "user" WHERE id = ${user.userId}`;
   if (!u) return Response.json({ invites: [] });
+  // Only a confirmed address may see (and accept) invites sent to it.
+  if (!u.email_verified) return Response.json({ invites: [], emailVerified: false });
 
   const invites = await sql<{
     id: string; org_id: string; role: string;
@@ -5077,8 +5079,16 @@ async function handleListReceivedInvites(user: SessionUser): Promise<Response> {
 
 // Accept an invite by ID — no token required, validates that the logged-in user's email matches
 async function handleAcceptInviteById(inviteId: string, user: SessionUser): Promise<Response> {
-  const [u] = await sql<{ email: string }[]>`SELECT email FROM "user" WHERE id = ${user.userId}`;
+  const [u] = await sql<{ email: string; email_verified: boolean }[]>`SELECT email, email_verified FROM "user" WHERE id = ${user.userId}`;
   if (!u) return Response.json({ error: "User not found" }, { status: 404 });
+  // Without the link, the only proof of owning the invited address is a confirmed
+  // email; otherwise anyone could register that address and accept.
+  if (!u.email_verified) {
+    return Response.json({
+      error: "Confirm your email address first, or open the invite link you received.",
+      code: "EMAIL_NOT_VERIFIED",
+    }, { status: 403 });
+  }
 
   const [invite] = await sql<{
     id: string; org_id: string; email: string; role: string;
@@ -5088,7 +5098,7 @@ async function handleAcceptInviteById(inviteId: string, user: SessionUser): Prom
     FROM common.invites WHERE id = ${inviteId}
   `;
   if (!invite)            return Response.json({ error: "Invite not found" }, { status: 404 });
-  if (invite.email !== u.email)
+  if (invite.email.trim().toLowerCase() !== u.email.trim().toLowerCase())
                           return Response.json({ error: "This invite is for a different email address" }, { status: 403 });
   if (invite.revoked_at)  return Response.json({ error: "Invite has been revoked" }, { status: 410 });
   if (invite.accepted_at) return Response.json({ error: "Invite already accepted" }, { status: 409 });
@@ -5142,6 +5152,16 @@ async function handleAcceptInvite(req: Request, userId: string): Promise<Respons
                            return Response.json({ error: "Invite has expired" }, { status: 410 });
   if (invite.org_id === userId)
                            return Response.json({ error: "Cannot accept your own invite" }, { status: 400 });
+
+  // The invite is for one email address: the link proves possession (it was sent
+  // there), the account proves who accepts. Anyone else holding the link can't use it.
+  const [u] = await sql<{ email: string }[]>`SELECT email FROM "user" WHERE id = ${userId}`;
+  if (!u || u.email.trim().toLowerCase() !== invite.email.trim().toLowerCase()) {
+    return Response.json({
+      error: `This invite is for ${invite.email}. Sign in (or create an account) with that email address to accept it.`,
+      code: "INVITE_EMAIL_MISMATCH",
+    }, { status: 403 });
+  }
 
   await sql`
     INSERT INTO common.org_members (org_id, user_id, role)
