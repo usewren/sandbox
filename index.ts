@@ -10,7 +10,7 @@ import jmespath from "jmespath";
 import jsonata from "jsonata";
 import { handleMcp } from "./mcp";
 
-const WREN_VERSION = "0.4.2";
+const WREN_VERSION = "0.5.0";
 // Set at image build time: docker build --build-arg WREN_BUILD=$(git rev-parse --short HEAD) …
 const WREN_BUILD = process.env.WREN_BUILD?.trim() || "dev";
 
