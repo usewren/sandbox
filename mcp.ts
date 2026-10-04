@@ -260,6 +260,106 @@ const TOOLS: Tool[] = [
   },
 ];
 
+// ── Public tools: /orgs/{slug}/mcp without a key ────────────────────────────
+// Read-only, through the public routes, so only what principal "*" rules allow
+// (and the label they pin) is visible. A scope can narrow this to one tree and an
+// explicit list of collections, which is what a custom domain usually exposes.
+
+export type McpScope = { slug: string; tree?: string; collections?: string[] };
+
+function publicTools(scope: McpScope): Tool[] {
+  const S = enc(scope.slug);
+  const treeArg = scope.tree ? {} : { tree: str("Tree name") };
+  const pinnedTree = (a: Json) => String(scope.tree ?? a.tree ?? "");
+  const collectionAllowed = (c: string) => !scope.tree || (scope.collections ?? []).includes(c);
+  const collectionProp = scope.collections?.length
+    ? { type: "string", enum: scope.collections, description: "Collection name" } : str("Collection name");
+
+  const tools: Tool[] = [
+    {
+      name: "site_info", title: "What this site publishes", readOnly: true,
+      description: "Describe the public content available here: collections, trees, schemas and sample documents.",
+      inputSchema: { type: "object", properties: {} },
+      async run(_a, api) {
+        if (scope.tree) {
+          // Scoped (e.g. a custom domain): describe only what this scope exposes —
+          // the org-wide llms.txt would list every other public tree and collection.
+          const r = await api("GET", `/api/v1/orgs/${S}/tree/${enc(scope.tree)}?full=true`);
+          if (!r.ok) return apiError(r);
+          const nodes = ((r.json as Json).nodes ?? []) as { path: string }[];
+          return ok({
+            site: scope.tree,
+            pages: nodes.length,
+            examplePaths: nodes.slice(0, 25).map(n => n.path),
+            collections: scope.collections ?? [],
+            tools: "list_tree and read_file for pages" + (scope.collections?.length ? "; query_documents and get_document for the listed collections" : ""),
+          });
+        }
+        const r = await api("GET", `/orgs/${S}/llms.txt`, undefined, { accept: "text/plain" });
+        if (!r.ok || !r.bytes) return apiError(r);
+        return { text: new TextDecoder().decode(r.bytes) };
+      },
+    },
+    {
+      name: "list_tree", title: "List the site's pages and files", readOnly: true,
+      description: scope.tree ? `List every path in the "${scope.tree}" site.` : "List every path in a public tree.",
+      inputSchema: { type: "object", required: scope.tree ? [] : ["tree"], properties: { ...treeArg } },
+      async run(a, api) {
+        const r = await api("GET", `/api/v1/orgs/${S}/tree/${enc(pinnedTree(a))}?full=true`);
+        return r.ok ? ok(r.json) : apiError(r);
+      },
+    },
+    {
+      name: "read_file", title: "Read a page or file", readOnly: true,
+      description: "Read the content of a public page or file (HTML, CSS, JS, JSON, text) by path. Binary files return metadata only.",
+      inputSchema: { type: "object", required: scope.tree ? ["path"] : ["tree", "path"], properties: { ...treeArg, path: str("Path, e.g. /index.html") } },
+      async run(a, api) {
+        const r = await api("GET", `/orgs/${S}/tree/${enc(pinnedTree(a))}${treePath(String(a.path))}`, undefined, { accept: "*/*" });
+        if (!r.ok) return apiError(r);
+        const textual = /^(text\/|application\/(json|javascript|xml|.*\+json|.*\+xml))|image\/svg/.test(r.contentType);
+        if (!textual || !r.bytes || r.bytes.byteLength > MAX_TEXT_FILE) return ok({ contentType: r.contentType, size: r.bytes?.byteLength, note: "binary or large file: content not returned" });
+        return { text: new TextDecoder().decode(r.bytes) };
+      },
+    },
+  ];
+  if (!scope.tree || scope.collections?.length) {
+    tools.push(
+      {
+        name: "query_documents", title: "Query public data", readOnly: true,
+        description: "Find documents in a public collection: where, select, aggregate, cursor paging (max 1000 per page).",
+        inputSchema: {
+          type: "object", required: ["collection"],
+          properties: {
+            collection: collectionProp, where: str("Filter, e.g. \"country:SUI\""),
+            select: { type: "array", items: { type: "string" } }, aggregate: { type: "object" },
+            limit: { type: "integer", minimum: 1, maximum: 1000, default: 50 }, cursor: str("Cursor from the previous page"),
+          },
+        },
+        async run(a, api) {
+          if (!collectionAllowed(String(a.collection))) return { text: `Collection "${a.collection}" is not available here.`, isError: true };
+          const body: Json = { limit: a.limit ?? 50 };
+          for (const k of ["where", "select", "aggregate", "cursor"]) if (a[k] !== undefined) body[k] = a[k];
+          const r = await api("POST", `/api/v1/orgs/${S}/${enc(String(a.collection))}/_query`, body);
+          return r.ok ? ok(r.json) : apiError(r);
+        },
+      },
+      {
+        name: "get_document", title: "Get a public document", readOnly: true,
+        description: "Read one public document by id or natural key.",
+        inputSchema: { type: "object", required: ["collection"], properties: { collection: collectionProp, id: str("Document id"), key: str("Natural key value") } },
+        async run(a, api) {
+          if (!collectionAllowed(String(a.collection))) return { text: `Collection "${a.collection}" is not available here.`, isError: true };
+          if (!a.id && !a.key) return { text: "Provide id or key.", isError: true };
+          const c = enc(String(a.collection));
+          const r = await api("GET", a.id ? `/api/v1/orgs/${S}/${c}/${enc(String(a.id))}` : `/api/v1/orgs/${S}/${c}/by-key/${enc(String(a.key))}`);
+          return r.ok ? ok(r.json) : apiError(r);
+        },
+      },
+    );
+  }
+  return tools;
+}
+
 function guessType(name: string): string {
   const ext = name.toLowerCase().split(".").pop() ?? "";
   return ({
@@ -275,20 +375,32 @@ type RpcReq = { jsonrpc?: string; id?: string | number | null; method?: string; 
 const rpcResult = (id: RpcReq["id"], result: unknown) => ({ jsonrpc: "2.0", id, result });
 const rpcError = (id: RpcReq["id"], code: number, message: string) => ({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
 
-export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, version: string): Promise<Response> {
+// /mcp            → org from the API key (key required)
+// /orgs/{slug}/mcp → org fixed by the URL (what a custom domain maps to):
+//                    no key  → public read-only tools, optionally narrowed by
+//                              ?tree=<name>&collections=a,b
+//                    key     → full tools, but only if the key belongs to {slug}
+export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, version: string, scope?: McpScope): Promise<Response> {
   if (req.method !== "POST") {
     return new Response(JSON.stringify(rpcError(null, -32000, "This MCP endpoint is stateless: send JSON-RPC with POST")), {
       status: 405, headers: { "Content-Type": "application/json", Allow: "POST" },
     });
   }
   const readonly = url.searchParams.get("readonly") === "1" || url.searchParams.get("readonly") === "true";
-  const tools = TOOLS.filter(t => !readonly || t.readOnly);
 
   // Forward only the caller's credentials to the in-process API calls.
   const auth: Record<string, string> = {};
   const authz = req.headers.get("authorization"); if (authz) auth["Authorization"] = authz;
   const cookie = req.headers.get("cookie"); if (cookie) auth["Cookie"] = cookie;
   const origin = new URL(req.url).origin;
+  const anonymous = !authz && !cookie;
+  if (scope) {
+    const tree = url.searchParams.get("tree")?.trim();
+    const cols = url.searchParams.get("collections")?.split(",").map(s => s.trim()).filter(Boolean);
+    scope = { ...scope, ...(tree ? { tree } : {}), ...(cols?.length ? { collections: cols } : {}) };
+  }
+  const publicMode = !!scope && anonymous;
+  const tools = publicMode ? publicTools(scope!) : TOOLS.filter(t => !readonly || t.readOnly);
 
   const api: Api = async (method, path, body, opts = {}) => {
     const headers: Record<string, string> = { ...auth, Accept: opts.accept ?? "application/json", Origin: origin };
@@ -304,13 +416,28 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
     return { status: res.status, ok: res.ok, json, text, contentType, bytes };
   };
 
-  // Credentials are required up front so clients get a clear 401 instead of tool errors.
-  const me = await api("GET", "/api/v1/me");
-  if (me.status === 401) {
-    return new Response(JSON.stringify(rpcError(null, -32001, "Unauthorized: send Authorization: Bearer wren_… (a WREN API key)")), {
-      status: 401, headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="wren"' },
-    });
+  if (!publicMode) {
+    // Credentials are required up front so clients get a clear 401 instead of tool errors.
+    const me = await api("GET", "/api/v1/me");
+    if (me.status === 401) {
+      return new Response(JSON.stringify(rpcError(null, -32001, "Unauthorized: send Authorization: Bearer wren_… (a WREN API key)")), {
+        status: 401, headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="wren"' },
+      });
+    }
+    // An org-bound endpoint (e.g. behind a custom domain) never serves another org's key.
+    const keySlug = (((me.json as Json | undefined)?.org as Json | undefined)?.slug) as string | undefined;
+    if (scope && keySlug !== scope.slug) {
+      return new Response(JSON.stringify(rpcError(null, -32003, `Forbidden: this endpoint serves org "${scope.slug}"; your key belongs to another org`)), {
+        status: 403, headers: { "Content-Type": "application/json" },
+      });
+    }
   }
+
+  const instructions = publicMode
+    ? `Public, read-only access to what org "${scope!.slug}" publishes${scope!.tree ? ` on the "${scope!.tree}" site` : ""}. ` +
+      `Start with site_info, then list_tree/read_file${scope!.tree && !scope!.collections?.length ? "" : " or query_documents"}. ` +
+      `Only published content is visible; nothing can be changed here.`
+    : INSTRUCTIONS + (readonly ? "\nThis connection is read-only." : "");
 
   let body: unknown;
   try { body = await req.json(); } catch { return Response.json(rpcError(null, -32700, "Parse error"), { status: 400 }); }
@@ -320,14 +447,14 @@ export async function handleMcp(req: Request, url: URL, dispatch: Dispatch, vers
   const out: unknown[] = [];
   for (const m of msgs) {
     const isNotification = m.id === undefined || m.id === null;
-    const reply = await handleMessage(m, tools, api, version, readonly);
+    const reply = await handleMessage(m, tools, api, version, instructions, readonly || publicMode);
     if (!isNotification && reply) out.push(reply);
   }
   if (out.length === 0) return new Response(null, { status: 202 });
   return Response.json(batch ? out : out[0], { headers: { "Cache-Control": "no-store" } });
 }
 
-async function handleMessage(m: RpcReq, tools: Tool[], api: Api, version: string, readonly: boolean): Promise<unknown> {
+async function handleMessage(m: RpcReq, tools: Tool[], api: Api, version: string, instructions: string, readonly: boolean): Promise<unknown> {
   if (!m || m.jsonrpc !== "2.0" || typeof m.method !== "string") return rpcError(m?.id, -32600, "Invalid request");
   switch (m.method) {
     case "initialize": {
@@ -336,7 +463,7 @@ async function handleMessage(m: RpcReq, tools: Tool[], api: Api, version: string
         protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "wren", title: "WREN", version },
-        instructions: INSTRUCTIONS + (readonly ? "\nThis connection is read-only." : ""),
+        instructions,
       });
     }
     case "ping":

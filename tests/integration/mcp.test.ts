@@ -96,6 +96,47 @@ describe("MCP endpoint", () => {
     expect(m.error.code).toBe(-32601);
   });
 
+  it("org-bound endpoint without a key: public read-only tools", async () => {
+    const path = `/orgs/${slug}/mcp`;
+    const init = await (await mcp("initialize", { protocolVersion: "2025-06-18" }, { auth: null, path })).json();
+    expect(init.result.instructions).toContain("read-only");
+    const names = (await (await mcp("tools/list", {}, { auth: null, path })).json()).result.tools.map((t: any) => t.name);
+    expect(names.sort()).toEqual(["get_document", "list_tree", "query_documents", "read_file", "site_info"]);
+    const page = await (await mcp("tools/call", { name: "read_file", arguments: { tree, path: "/index.html" } }, { auth: null, path })).json();
+    expect(page.result.content[0].text).toBe("<h1>agent</h1>");
+    // the docs collection has no public rule → the public API refuses it
+    const priv = await (await mcp("tools/call", { name: "query_documents", arguments: { collection: col } }, { auth: null, path })).json();
+    expect(priv.result.isError).toBe(true);
+  });
+
+  it("?tree= scopes a domain's endpoint to one site and hides everything else", async () => {
+    const path = `/orgs/${slug}/mcp?tree=${tree}`;
+    const names = (await (await mcp("tools/list", {}, { auth: null, path })).json()).result.tools.map((t: any) => t.name);
+    expect(names.sort()).toEqual(["list_tree", "read_file", "site_info"]);
+    const info = await (await mcp("tools/call", { name: "site_info", arguments: {} }, { auth: null, path })).json();
+    expect(info.result.content[0].text).toContain(tree);
+    expect(info.result.content[0].text).not.toContain(col);
+    const page = await (await mcp("tools/call", { name: "read_file", arguments: { path: "/index.html" } }, { auth: null, path })).json();
+    expect(page.result.content[0].text).toBe("<h1>agent</h1>");
+    const scoped = `/orgs/${slug}/mcp?tree=${tree}&collections=only-this`;
+    const q = await (await mcp("tools/call", { name: "query_documents", arguments: { collection: col } }, { auth: null, path: scoped })).json();
+    expect(q.result.isError).toBe(true);
+    expect(q.result.content[0].text).toContain("not available here");
+  });
+
+  it("org-bound endpoint with a key: own org gets full tools, other orgs are refused", async () => {
+    const path = `/orgs/${slug}/mcp`;
+    const own = (await (await mcp("tools/list", {}, { path })).json()).result.tools.map((t: any) => t.name);
+    expect(own).toContain("promote_tree");
+    const other = `other+${Date.now()}@wren.dev`;
+    await signUp(other, "secret123", "Other");
+    const { cookie } = await signIn(other, "secret123");
+    const otherKey = (await (await post("/api/v1/keys", { name: "x" }, cookie)).json()).key;
+    const res = await mcp("tools/list", {}, { path, auth: `Bearer ${otherKey}` });
+    expect(res.status).toBe(403);
+    expect((await mcp("initialize", {}, { auth: null, path: "/orgs/no-such-org-here/mcp" })).status).toBe(404);
+  });
+
   it("GET is not supported (stateless endpoint)", async () => {
     expect((await fetch(`${BASE_URL}/mcp`, { headers: { Authorization: `Bearer ${key}` } })).status).toBe(405);
   });

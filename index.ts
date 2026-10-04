@@ -1086,6 +1086,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return handleWellKnownLlmsTxt(url);
     }
 
+    // Org-bound MCP endpoint: /orgs/{slug}/mcp — what a custom domain's /mcp maps to.
+    // Without a key: public read-only tools (optionally ?tree=&collections=).
+    // With a key: full tools, only for keys of this org.
+    const orgMcp = url.pathname.match(/^\/orgs\/([a-z0-9-]+)\/mcp$/);
+    if (orgMcp) {
+      if (!(await resolveSlugToOrgId(orgMcp[1]))) return Response.json({ error: "Not found" }, { status: 404 });
+      return handleMcp(req, url, r => handleRequest(r, new URL(r.url)), WREN_VERSION, { slug: orgMcp[1] });
+    }
+
     // Clean public URLs: /orgs/{slug}/... — alias for /api/v1/orgs/{slug}/...
     // Allows tree paths like /orgs/tkd/tree/site/index.html to open directly in a browser.
     if (req.method === "GET" && url.pathname.startsWith("/orgs/")) {
