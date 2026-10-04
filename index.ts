@@ -105,6 +105,18 @@ const MIME: Record<string, string> = {
 
 const NO_CACHE = { "Cache-Control": "no-cache, no-store, must-revalidate" };
 
+const MARKETING_DIR = join(import.meta.dir, "public", "marketing");
+
+// Guide pages live in marketing/guides/{slug}.html; "index" is the /guides landing page.
+function listGuideSlugs(): string[] {
+  try {
+    return readdirSync(join(MARKETING_DIR, "guides"))
+      .filter(f => /^[a-z0-9-]+\.html$/.test(f) && f !== "index.html")
+      .map(f => f.replace(/\.html$/, ""))
+      .sort();
+  } catch { return []; }
+}
+
 // Public read policy: short freshness window, long stale-while-revalidate.
 // Combined with explicit purges on mutation, this gives near-instant updates
 // for editors while still absorbing most read traffic at the CDN.
@@ -908,6 +920,26 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       });
     }
 
+    // Concepts page and guides (how-tos, case studies): static HTML, no JS required
+    if (url.pathname === "/guides.css") {
+      return new Response(Bun.file(join(MARKETING_DIR, "guides.css")), {
+        headers: { "Content-Type": "text/css", ...NO_CACHE },
+      });
+    }
+    if ((url.pathname === "/concepts" || url.pathname === "/concepts.html") && existsSync(join(MARKETING_DIR, "concepts.html"))) {
+      return new Response(Bun.file(join(MARKETING_DIR, "concepts.html")), {
+        headers: { "Content-Type": "text/html", ...NO_CACHE },
+      });
+    }
+    if (url.pathname === "/guides" || url.pathname === "/guides/" || url.pathname.startsWith("/guides/")) {
+      const slug = url.pathname.replace(/^\/guides\/?/, "").replace(/\.html$/, "").replace(/\/$/, "") || "index";
+      const file = join(MARKETING_DIR, "guides", `${slug}.html`);
+      if (!/^[a-z0-9-]+$/.test(slug) || !existsSync(file)) {
+        return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain" } });
+      }
+      return new Response(Bun.file(file), { headers: { "Content-Type": "text/html", ...NO_CACHE } });
+    }
+
     // LLM / crawler discovery files
     if (url.pathname === "/robots.txt") {
       const base = `${url.protocol}//${url.host}`;
@@ -920,7 +952,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const base = `${url.protocol}//${url.host}`;
       const now = new Date().toISOString().split("T")[0];
       return new Response(
-        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/deploy</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/d</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/projects</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n</urlset>`,
+        `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${base}/</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/a</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/b</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/c</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/tutorial</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/trees</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/tutorial/deploy</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/d</loc><lastmod>${now}</lastmod><priority>1.0</priority></url>\n  <url><loc>${base}/docs</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/projects</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n  <url><loc>${base}/llms.txt</loc><lastmod>${now}</lastmod><priority>0.7</priority></url>\n  <url><loc>${base}/concepts</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n  <url><loc>${base}/guides</loc><lastmod>${now}</lastmod><priority>0.9</priority></url>\n${listGuideSlugs().map(s => `  <url><loc>${base}/guides/${s}</loc><lastmod>${now}</lastmod><priority>0.8</priority></url>\n`).join("")}</urlset>`,
         { headers: { "Content-Type": "application/xml; charset=utf-8" } },
       );
     }
@@ -1236,6 +1268,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         treeRes = await handleTreeFull(schemaName, treeName, effectiveTreeLabel);
       else if (req.method === "GET")
         treeRes = await handleTreeGet(schemaName, treeName, treePath, req.headers.get("accept"), effectiveTreeLabel);
+      else if (req.method === "POST" && treePath === "/_promote") {
+        // Moving a label is a write on every collection whose documents are in the tree.
+        const canWrite = async (col: string) =>
+          (await checkAccess(orgId, user.userId, principal, `collection:${col}`, "write")).allowed;
+        treeRes = await handleTreePromote(schemaName, treeName, req, user.userId, canWrite);
+        if (treeRes.status < 400) {
+          const { promoted } = await treeRes.clone().json() as { promoted: { path: string; documentId: string; collection: string }[] };
+          for (const p of promoted) {
+            purgeForTreePath(orgId, treeName, p.path).catch(() => {});
+            purgeForDocument(orgId, p.collection, p.documentId).catch(() => {});
+            emitWebhookEvent(orgId, "label.set", { collection: p.collection, id: p.documentId }).catch(() => {});
+          }
+        }
+      }
       else if (req.method === "PUT") {
         treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId, orgId);
         if (treeRes.status < 400) {
@@ -4003,6 +4049,67 @@ async function handleTreeGet(schemaName: string, treeName: string, treePath: str
   // Tree GET is content-negotiated — the same URL can return JSON or raw bytes
   // depending on Accept. Vary: Accept tells the CDN to key its cache on both.
   return withHeaders(Response.json(result), CONTENT_NEGOTIATED_HEADERS);
+}
+
+// POST /api/v1/tree/{name}/_promote  {label?: "published", from?: "preview"}
+// Points `label` at a version of every document in the tree in ONE transaction, so
+// visitors never see a half-promoted site and a failure changes nothing.
+// Version per document: the version carrying `from` if given (documents without it
+// are left alone), otherwise the current version.
+async function handleTreePromote(
+  schemaName: string, treeName: string, req: Request, userId: string,
+  canWrite: (collection: string) => Promise<boolean>,
+): Promise<Response> {
+  const body = await req.json().catch(() => ({})) as { label?: unknown; from?: unknown };
+  const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : "published";
+  const from = typeof body.from === "string" && body.from.trim() ? body.from.trim() : null;
+
+  try {
+    const promoted = await withTenant(schemaName, async tx => {
+      const rows = from
+        ? await tx<{ path: string; id: string; collection: string; version: number }[]>`
+            SELECT DISTINCT ON (d.id) p.path, d.id, d.collection, l.version
+            FROM paths p
+            JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
+            JOIN labels l ON l.document_id = d.id AND l.label = ${from}
+            WHERE p.tree = ${treeName}
+            ORDER BY d.id, p.path
+          `
+        : await tx<{ path: string; id: string; collection: string; version: number }[]>`
+            SELECT DISTINCT ON (d.id) p.path, d.id, d.collection, d.current_version AS version
+            FROM paths p
+            JOIN documents d ON d.id = p.document_id AND d.deleted_at IS NULL
+            WHERE p.tree = ${treeName}
+            ORDER BY d.id, p.path
+          `;
+
+      for (const col of new Set(rows.map(r => r.collection))) {
+        if (!(await canWrite(col))) throw new PromoteError(403, `No write access to collection '${col}'`);
+      }
+
+      for (const r of rows) {
+        await tx`
+          INSERT INTO labels (document_id, label, version, created_by)
+          VALUES (${r.id}, ${label}, ${r.version}, ${userId})
+          ON CONFLICT (document_id, label) DO UPDATE
+            SET version = EXCLUDED.version, updated_at = NOW()
+        `;
+      }
+      return rows.map(r => ({ path: r.path, documentId: r.id, collection: r.collection, version: r.version }));
+    });
+
+    if (promoted.length === 0) {
+      return Response.json({ error: from ? `No documents in tree '${treeName}' carry label '${from}'` : `Tree '${treeName}' is empty` }, { status: 404 });
+    }
+    return Response.json({ tree: treeName, label, from, promoted });
+  } catch (e) {
+    if (e instanceof PromoteError) return Response.json({ error: e.message }, { status: e.status });
+    throw e;
+  }
+}
+
+class PromoteError extends Error {
+  constructor(public status: number, message: string) { super(message); }
 }
 
 async function handleTreePut(schemaName: string, treeName: string, treePath: string, req: Request, userId: string, orgId: string): Promise<Response> {
