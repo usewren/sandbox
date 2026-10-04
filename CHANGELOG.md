@@ -2,6 +2,19 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## Unreleased
+
+### Security
+- **Webhooks can't reach private addresses.** Any org owner could register a webhook pointing at the server's own network (the database, other containers, `169.254.169.254`), and the delivery log's status codes showed what answered. URLs must now be `http(s)` and resolve to public addresses, checked on save and before every delivery; redirects aren't followed. Internal receivers can be allowed by host name with `WREN_WEBHOOK_ALLOW_HOSTS`.
+
+### Added
+- **Live events (Server-Sent Events).** `GET /api/v1/_events` streams committed changes you can read; `GET /api/v1/orgs/{slug}/_events` (and `/orgs/{slug}/_events`) streams public changes to anyone, following the public rules (with `labelFilter: published` only `published` moves). Filters `?collections=` and `?trees=`; resume with `Last-Event-ID`. Events carry ids, versions, label names and tree paths, never data.
+- Changes come from a database trigger (migrations common/014, tenant/013) and arrive after commit, so every write path is covered: REST, by-key upserts, uploads, tree promote and MCP.
+
+### Fixed
+- **Webhooks come from the same change feed**, so payloads are complete: `document.created` now includes the document `id` (documented but missing), every document event carries `version`, `label.set` says which label moved and to which version, and `schema.updated` (documented, never sent) is sent. New type `label.removed`. A rollback is reported as `document.updated` (the old `rollback: true` flag is gone).
+- Orgs without webhooks no longer store an event row for every write.
+
 ## 0.6.0 — 2026-10-04
 
 ### Security

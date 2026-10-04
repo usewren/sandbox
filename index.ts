@@ -4,6 +4,9 @@ import { readFileSync, existsSync, writeFileSync, renameSync, readdirSync, unlin
 import { join, extname } from "path";
 import { auth, sendMail, inviteMail, oAuthDiscoveryMetadata } from "auth";
 import { setupCommon, createTenant, listTenants, migrateAllTenants, sanitizeSchemaName } from "db/runner";
+import { startEvents, openStream, type Access } from "./events";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import Ajv from "ajv";
 import { json as jqJson } from "jq-wasm";
 import jmespath from "jmespath";
@@ -232,6 +235,12 @@ const sql = postgres(process.env.DATABASE_URL ?? "postgres://wren:wren@localhost
 // Set up common schema and warm the known-tenant cache at startup
 await setupCommon(sql);
 await migrateAllTenants(sql);
+// Change feed: committed writes in any tenant → event streams and webhooks
+await startEvents(sql, async (orgId, change) => {
+  if (!(await orgHasWebhooks(orgId))) return;
+  const { type, at: _at, ...payload } = change;
+  emitWebhookEvent(orgId, type, payload).catch(() => {});
+});
 const knownTenants = new Set((await listTenants(sql)).map(t => t.org_id));
 
 const openapiPath = process.env.OPENAPI_PATH ?? "../docs/openapi.yaml";
@@ -1326,6 +1335,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           const optionalUser = await requireSession(req);
           return handleOrgLlmsTxt(slug, url, optionalUser);
         }
+        if (sub === "_events" && rest.length === 1) return handlePublicEvents(slug, req, url);
         // Pass everything after /orgs/{slug}/ to the public collection/tree handler
         const collection = rest[0];
         const id = rest[1];
@@ -1381,6 +1391,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (req.method !== "GET" && req.method !== "POST") return Response.json({ error: "Method not allowed" }, { status: 405 });
       const optionalUser = await requireSession(req); // null = unauthenticated
       if (sub === "llms.txt") return handleOrgLlmsTxt(id, url, optionalUser);
+      if (sub === "_events" && !version && req.method === "GET") return handlePublicEvents(id, req, url);
       if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url, req.headers.get("accept"), req);
       return Response.json({ error: "Not found" }, { status: 404 });
     }
@@ -1503,6 +1514,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const schemaName = await ensureTenant(orgId);
     const principal = principalFor(user);
 
+    // Live changes you can read in this org — GET /api/v1/_events (Server-Sent Events)
+    if (collection === "_events" && !id && req.method === "GET") {
+      keepOpen(req);
+      return openStream(req, url, orgId, resource => checkAccess(orgId, user.userId, principal, resource, "read"));
+    }
+
     // Helper: check access and return 403 on denial (fires audit log on deny)
     async function gate(resource: string, reqAccess: "read" | "write" | "admin"): Promise<AccessResult | Response> {
       const ar = await checkAccess(orgId, user.userId, principal, resource, reqAccess);
@@ -1570,7 +1587,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           for (const p of promoted) {
             purgeForTreePath(orgId, treeName, p.path).catch(() => {});
             purgeForDocument(orgId, p.collection, p.documentId).catch(() => {});
-            emitWebhookEvent(orgId, "label.set", { collection: p.collection, id: p.documentId }).catch(() => {});
           }
         }
       }
@@ -1578,14 +1594,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId, orgId);
         if (treeRes.status < 400) {
           purgeForTreePath(orgId, treeName, treePath).catch(() => {});
-          emitWebhookEvent(orgId, "tree.assigned", { tree: treeName, path: treePath }).catch(() => {});
         }
       }
       else if (req.method === "DELETE") {
         treeRes = await handleTreeDelete(schemaName, treeName, treePath, user.userId);
         if (treeRes.status < 400) {
           purgeForTreePath(orgId, treeName, treePath).catch(() => {});
-          emitWebhookEvent(orgId, "tree.removed", { tree: treeName, path: treePath }).catch(() => {});
         }
       }
       else return Response.json({ error: "Method not allowed" }, { status: 405 });
@@ -1704,7 +1718,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
           refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
-          emitWebhookEvent(orgId, "document.updated", { collection, id: docId, key: keyValue }).catch(() => {});
         }
         return res;
       }
@@ -1714,7 +1727,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
           refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
-          emitWebhookEvent(orgId, "document.deleted", { collection, id: docId, key: keyValue }).catch(() => {});
         }
         return res;
       }
@@ -1752,7 +1764,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (r.status < 400) {
         purgeForCollection(orgId, collection).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
-        emitWebhookEvent(orgId, "document.created", { collection }).catch(() => {});
       }
       return r;
     }
@@ -1767,7 +1778,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
-        emitWebhookEvent(orgId, "document.updated", { collection, id }).catch(() => {});
       }
       return r;
     }
@@ -1779,7 +1789,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
-        emitWebhookEvent(orgId, "document.deleted", { collection, id }).catch(() => {});
       }
       return r;
     }
@@ -1811,7 +1820,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
-        emitWebhookEvent(orgId, "document.updated", { collection, id, rollback: true }).catch(() => {});
       }
       return r;
     }
@@ -1822,7 +1830,6 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
-        emitWebhookEvent(orgId, "label.set", { collection, id }).catch(() => {});
       }
       return r;
     }
@@ -4867,6 +4874,20 @@ async function handleSetOrgSlug(req: Request, userId: string, sessionId: string 
 }
 
 // Resolve a slug to its orgId. Returns null if not found.
+// Event streams send a ping every 25 s; lift Bun's 10 s idle timeout for them.
+function keepOpen(req: Request): void {
+  try { server.timeout(req, 0); } catch {}
+}
+
+/** GET /api/v1/orgs/{slug}/_events — public changes only (rules for principal '*'). */
+async function handlePublicEvents(slug: string, req: Request, url: URL): Promise<Response> {
+  const orgId = await resolveSlugToOrgId(slug);
+  if (!orgId) return Response.json({ error: "Not found" }, { status: 404 });
+  keepOpen(req);
+  return openStream(req, url, orgId, async (resource): Promise<Access> => checkAccess(orgId, "", "*", resource, "read"),
+    { "Access-Control-Allow-Origin": "*" });
+}
+
 async function resolveSlugToOrgId(slug: string): Promise<string | null> {
   const rows = await sql<{ org_id: string }[]>`
     SELECT org_id FROM common.org_slugs WHERE slug = ${slug}
@@ -6016,6 +6037,49 @@ async function handleDeletePermission(permId: string, userId: string, sessionId:
 
 // ── Webhooks ─────────────────────────────────────────────────────────────────
 
+// Webhooks only go to public addresses: anyone who owns an org can register one, and
+// the server must not become a way to reach its own network (the database, other
+// containers, cloud metadata). Checked when a webhook is saved and again before each
+// delivery (DNS can change); redirects aren't followed. Self-hosters can allow
+// internal receivers by host name: WREN_WEBHOOK_ALLOW_HOSTS=n8n.internal,hooks.lan
+const WEBHOOK_ALLOW_HOSTS = new Set((process.env.WREN_WEBHOOK_ALLOW_HOSTS ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+
+function isPrivateAddress(ip: string): boolean {
+  const v4 = ip.startsWith("::ffff:") && isIP(ip.slice(7)) === 4 ? ip.slice(7) : ip;
+  if (isIP(v4) === 4) {
+    const [a, b] = v4.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19));
+  }
+  const x = ip.toLowerCase();
+  return x === "::" || x === "::1" || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || x.startsWith("ff");
+}
+
+/** Why a webhook may not be sent to this URL, or null if it may. */
+async function webhookTargetError(raw: string): Promise<string | null> {
+  let u: URL;
+  try { u = new URL(raw); } catch { return "Invalid URL"; }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "Webhook URL must use http or https";
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (WEBHOOK_ALLOW_HOSTS.has(host)) return null;
+  const addrs = isIP(host) ? [host] : (await lookup(host, { all: true }).catch(() => [])).map(a => a.address);
+  if (!addrs.length) return `Webhook host ${host} does not resolve`;
+  if (addrs.some(isPrivateAddress)) return "Webhook URL points at a private or local address";
+  return null;
+}
+
+// Orgs without an enabled webhook don't queue events. Cleared whenever a webhook is
+// created, changed or deleted, so a new webhook gets its first events.
+const webhookOrgCache = new Map<string, { at: number; has: boolean }>();
+async function orgHasWebhooks(orgId: string): Promise<boolean> {
+  const hit = webhookOrgCache.get(orgId);
+  if (hit && Date.now() - hit.at < 60_000) return hit.has;
+  const [row] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM common.webhooks WHERE org_id = ${orgId} AND enabled = true`.catch(() => [{ n: 1 }]);
+  webhookOrgCache.set(orgId, { at: Date.now(), has: row.n > 0 });
+  return row.n > 0;
+}
+
 function webhookBatchKey(orgId: string): string {
   return `${orgId}:${Math.floor(Date.now() / WEBHOOK_BATCH_WINDOW_MS)}`;
 }
@@ -6067,7 +6131,14 @@ async function deliverBatch(orgId: string, batchKey: string, events: { type: str
 
     // Retry with exponential backoff
     let succeeded = false;
-    for (let attempt = 1; attempt <= WEBHOOK_MAX_RETRIES; attempt++) {
+    const blocked = await webhookTargetError(wh.url);
+    if (blocked) {
+      await sql`
+        INSERT INTO common.webhook_deliveries (webhook_id, batch_key, event_count, attempt, error)
+        VALUES (${wh.id}, ${batchKey}, ${matched.length}, 1, ${"not sent: " + blocked})
+      `.catch(() => {});
+    }
+    for (let attempt = 1; attempt <= WEBHOOK_MAX_RETRIES && !blocked; attempt++) {
       try {
         const res = await fetch(wh.url, {
           method: "POST",
@@ -6077,6 +6148,7 @@ async function deliverBatch(orgId: string, batchKey: string, events: { type: str
             "X-Wren-Delivery": batchKey,
           },
           body,
+          redirect: "manual",
           signal: AbortSignal.timeout(10_000),
         });
 
@@ -6189,6 +6261,7 @@ async function handleListWebhooks(userId: string, sessionId: string | null, keyO
 }
 
 async function handleCreateWebhook(req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  webhookOrgCache.clear();
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
@@ -6204,8 +6277,9 @@ async function handleCreateWebhook(req: Request, userId: string, sessionId: stri
   const body = await req.json() as { url?: string; events?: string[] };
   if (!body.url) return Response.json({ error: "url is required" }, { status: 400 });
 
-  try { new URL(body.url); } catch {
-    return Response.json({ error: "Invalid URL" }, { status: 400 });
+  const urlError = await webhookTargetError(body.url);
+  if (urlError) {
+    return Response.json({ error: urlError }, { status: 400 });
   }
 
   const secret = randomHex(32);
@@ -6224,6 +6298,7 @@ async function handleCreateWebhook(req: Request, userId: string, sessionId: stri
 }
 
 async function handleUpdateWebhook(webhookId: string, req: Request, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  webhookOrgCache.clear();
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;
@@ -6233,7 +6308,8 @@ async function handleUpdateWebhook(webhookId: string, req: Request, userId: stri
   const sets: string[] = ["updated_at = NOW()"];
   const params: unknown[] = [];
   if (body.url !== undefined) {
-    try { new URL(body.url); } catch { return Response.json({ error: "Invalid URL" }, { status: 400 }); }
+    const urlError = await webhookTargetError(body.url);
+    if (urlError) return Response.json({ error: urlError }, { status: 400 });
     params.push(body.url); sets.push(`url = $${params.length}`);
   }
   if (body.events !== undefined) {
@@ -6254,6 +6330,7 @@ async function handleUpdateWebhook(webhookId: string, req: Request, userId: stri
 }
 
 async function handleDeleteWebhook(webhookId: string, userId: string, sessionId: string | null, keyOrgId?: string): Promise<Response> {
+  webhookOrgCache.clear();
   const orgId = await resolveUserOrgId(userId, sessionId, keyOrgId);
   const guard = await forbiddenIfNotAdminOrOwner(userId, orgId);
   if (guard) return guard;

@@ -34,6 +34,14 @@ DATABASE_URL=postgres://... bun run index.ts
 | `WREN_LANDING_VARIANTS` | `a,b,c,d,e` | Variants in the experiment. One value (e.g. `c`) turns it off. |
 | `WREN_OPERATORS` | none | Comma-separated emails that can see the results at `/stats/landing`. |
 
+## Live events and webhooks
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WREN_WEBHOOK_ALLOW_HOSTS` | none | Host names webhooks may reach although they resolve to private addresses (internal receivers) |
+| `WREN_EVENTS_MAX_STREAMS` / `WREN_EVENTS_MAX_STREAMS_PER_ORG` | `2000` / `200` | Open `/_events` streams per server / per org |
+| `WEBHOOK_BATCH_WINDOW_MS` | `5000` | Webhook batching window |
+
 ## Email
 
 WREN sends account confirmations, password-reset links and invites. The delivery method is configuration:
