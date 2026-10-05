@@ -2,7 +2,7 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
-## Unreleased
+## 0.8.0 — 2026-10-05
 
 ### Added
 - **Files are stored once per content.** Bytes move to `asset_blobs`, keyed by SHA-256; each version points at its blob, so history is unchanged but identical bytes take space once. Re-uploading a file whose bytes, name and type equal the current version returns `200` with `unchanged: true` and creates no version.
