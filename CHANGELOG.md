@@ -2,7 +2,7 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
-## Unreleased
+## 0.9.0 — 2026-10-05
 
 Gaps found while writing the case studies (tournament tracker, MAE stock tracker, data.tkd-scores.com, task tracker, AI-maintained sites, test fixtures).
 
