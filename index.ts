@@ -687,8 +687,9 @@ function isTrustedOrigin(origin: string | null, host: string | null): boolean {
 
 function corsHeaders(origin: string | null, host: string | null, pathname: string): Record<string, string> {
   const base = {
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Accept, Cookie, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, Cookie, Authorization, If-Match",
+    "Access-Control-Expose-Headers": "ETag",
   };
   const trusted = isTrustedOrigin(origin, host);
   // Public routes: always "*" regardless of Origin, so a CDN-cached response is valid
@@ -1377,7 +1378,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         const collection = rest[0];
         const id = rest[1];
         const subSeg = rest[2];
-        return handlePublicCollectionRequest(slug, collection, id, subSeg, url, req.headers.get("accept"), req);
+        return handlePublicCollectionRequest(slug, collection, id, subSeg, url, req.headers.get("accept"), req, rest[3]);
       }
       return Response.json({ error: "Not found" }, { status: 404 });
     }
@@ -1429,7 +1430,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const optionalUser = await requireSession(req); // null = unauthenticated
       if (sub === "llms.txt") return handleOrgLlmsTxt(id, url, optionalUser);
       if (sub === "_events" && !version && req.method === "GET") return handlePublicEvents(id, req, url);
-      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url, req.headers.get("accept"), req);
+      if (sub) return handlePublicCollectionRequest(id, sub, version, subsub, url, req.headers.get("accept"), req, segments[5]);
       return Response.json({ error: "Not found" }, { status: 404 });
     }
 
@@ -1691,7 +1692,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       reqAccess = req.method === "GET" ? "read" : "admin";
     } else if (id === "_schema" && sub === "validate") {
       reqAccess = "read";
-    } else if (id === "_schema" && req.method !== "GET") {
+    } else if (id === "_schema" && req.method !== "GET") { // PUT, PATCH, DELETE
       reqAccess = "admin";
     } else if (id === "by-key") {
       // Natural-key routes: GET is read, PUT/DELETE are write. They
@@ -1730,6 +1731,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (id === "_schema" && !sub) {
       if (req.method === "GET")    { const r = await handleGetSchema(schemaName, collection);    audit(colAr, colResource, true, r.status);  return r; }
       if (req.method === "PUT")    { const r = await handleSetSchema(schemaName, collection, req, user.userId); audit(colAr, colResource, false, r.status); return r; }
+      if (req.method === "PATCH")  { const r = await handlePatchSchema(schemaName, collection, req, user.userId); audit(colAr, colResource, false, r.status); return r; }
       if (req.method === "DELETE") { const r = await handleDeleteSchema(schemaName, collection); audit(colAr, colResource, false, r.status); return r; }
     }
 
@@ -1819,7 +1821,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         return res;
       }
       if (req.method === "DELETE") {
-        const { res, id: docId } = await handleDeleteByKey(schemaName, collection, keyValue);
+        const { res, id: docId } = await handleDeleteByKey(schemaName, collection, keyValue, expectedVersion(req));
         audit(colAr, colResource, false, res.status);
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
@@ -1881,7 +1883,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Route: DELETE /{collection}/{id}
     if (req.method === "DELETE" && id && !sub) {
-      const r = await handleDelete(schemaName, collection, id);
+      const r = await handleDelete(schemaName, collection, id, expectedVersion(req));
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
@@ -2867,8 +2869,9 @@ type AssetWrite = { id: string; version: number; created: boolean; unchanged: bo
  * The same bytes, name and type as the current version create no version. For a
  * collection with a natural key (e.g. "filename"), the document's key follows the file.
  */
-async function writeAsset(tx: Sql, collection: string, docId: string | null, buffer: Buffer, meta: AssetMeta, keyed: boolean, naturalKey: string | null, userId: string): Promise<AssetWrite | null> {
+async function writeAsset(tx: Sql, collection: string, docId: string | null, buffer: Buffer, meta: AssetMeta, keyed: boolean, naturalKey: string | null, userId: string, expect: Expect = null): Promise<AssetWrite | { mismatch: number } | null> {
   if (!docId) {
+    if (conditionFails(expect, 0)) return { mismatch: 0 };
     const [row] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
       INSERT INTO documents (collection, current_version, natural_key, created_by)
       VALUES (${collection}, 1, ${naturalKey}, ${userId})
@@ -2884,7 +2887,8 @@ async function writeAsset(tx: Sql, collection: string, docId: string | null, buf
     WHERE d.id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
     FOR UPDATE OF d
   `;
-  if (!cur) return null;
+  if (!cur) return expect === null || expect === "exists" ? null : { mismatch: 0 };
+  if (conditionFails(expect, cur.current_version)) return { mismatch: cur.current_version };
   // Re-running a sync or deploy with an unchanged file doesn't grow history
   if (cur.sha256 === meta.sha256 && cur.filename === meta.filename && cur.mime_type === meta.mimeType) {
     return { id: docId, version: cur.current_version, created: false, unchanged: true, created_at: cur.created_at, updated_at: cur.updated_at };
@@ -2909,9 +2913,35 @@ const assetJson = (collection: string, w: AssetWrite, meta: AssetMeta, naturalKe
 });
 
 async function uploadedFile(req: Request): Promise<File | Response> {
-  const form = await req.formData();
+  const contentType = req.headers.get("content-type") ?? "";
+  const body = Buffer.from(await req.arrayBuffer());
+  const form = await new Response(body, { headers: { "Content-Type": contentType } }).formData();
   const file = form.get("file");
-  return file instanceof File ? file : Response.json({ error: "Missing file field" }, { status: 400 });
+  if (!(file instanceof File)) return Response.json({ error: "Missing file field" }, { status: 400 });
+  // Bun's parser drops the part's own Content-Type and guesses from the file name
+  // instead ("notes" sent as text/plain comes back untyped), so read it ourselves.
+  // A generic octet-stream says nothing, so the guess from the name still wins then.
+  const declared = declaredPartType(body, contentType, "file");
+  return declared && declared !== "application/octet-stream" && declared !== file.type
+    ? new File([file], file.name, { type: declared })
+    : file;
+}
+
+/** The Content-Type header of the multipart part named `field`, or null. */
+function declaredPartType(body: Buffer, contentType: string, field: string): string | null {
+  const m = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+  if (!m) return null;
+  const delim = Buffer.from(`--${m[1] ?? m[2]}`);
+  for (let i = body.indexOf(delim); i !== -1; ) {
+    const headEnd = body.indexOf("\r\n\r\n", i);
+    if (headEnd === -1) return null;
+    const head = body.subarray(i + delim.length, headEnd).toString("latin1");
+    if (new RegExp(`^content-disposition:[^\\r\\n]*[;\\s]name="${field}"`, "im").test(head)) {
+      return /^content-type:[ \t]*([^\r\n]+)/im.exec(head)?.[1].trim().toLowerCase() || null;
+    }
+    i = body.indexOf(delim, headEnd);
+  }
+  return null;
 }
 
 const fileKeyConflict = (collection: string, key: string | null) => Response.json({
@@ -2926,7 +2956,7 @@ async function handleCreateAsset(schemaName: string, collection: string, req: Re
   const naturalKey = await extractNaturalKey(schemaName, collection, meta);
   try {
     const w = await withTenant(schemaName, tx => writeAsset(tx, collection, null, buffer, meta, true, naturalKey, userId));
-    return Response.json(assetJson(collection, w!, meta, naturalKey), { status: 201 });
+    return Response.json(assetJson(collection, w as AssetWrite, meta, naturalKey), { status: 201 });
   } catch (err) {
     if (isNaturalKeyConflict(err)) return fileKeyConflict(collection, naturalKey);
     throw err;
@@ -2940,8 +2970,9 @@ async function handleUpdateAsset(schemaName: string, collection: string, docId: 
   const keyed = (await getNaturalKeyField(schemaName, collection)) !== null;
   const naturalKey = await extractNaturalKey(schemaName, collection, meta);
   try {
-    const w = await withTenant(schemaName, tx => writeAsset(tx, collection, docId, buffer, meta, keyed, naturalKey, userId));
+    const w = await withTenant(schemaName, tx => writeAsset(tx, collection, docId, buffer, meta, keyed, naturalKey, userId, expectedVersion(req)));
     if (!w) return Response.json({ error: "Not found" }, { status: 404 });
+    if ("mismatch" in w) return versionMismatch(w.mismatch);
     return Response.json(assetJson(collection, w, meta, naturalKey));
   } catch (err) {
     if (isNaturalKeyConflict(err)) return fileKeyConflict(collection, naturalKey);
@@ -2976,9 +3007,11 @@ async function handleUpsertAssetByKey(schemaName: string, collection: string, ke
         SELECT id FROM documents WHERE collection = ${collection} AND natural_key = ${keyValue} AND deleted_at IS NULL
         FOR UPDATE
       `;
-      return writeAsset(tx, collection, existing?.id ?? null, buffer, meta, true, keyValue, userId);
+      return writeAsset(tx, collection, existing?.id ?? null, buffer, meta, true, keyValue, userId, expectedVersion(req));
     });
-    return { res: Response.json(assetJson(collection, w!, meta, keyValue), { status: w!.created ? 201 : 200 }), id: w!.id };
+    if (w && "mismatch" in w) return { res: versionMismatch(w.mismatch), id: null };
+    const ok = w as AssetWrite;
+    return { res: Response.json(assetJson(collection, ok, meta, keyValue), { status: ok.created ? 201 : 200 }), id: ok.id };
   } catch (err) {
     if (isNaturalKeyConflict(err)) return { res: fileKeyConflict(collection, keyValue), id: null };
     throw err;
@@ -3125,6 +3158,7 @@ async function handlePublicCollectionRequest(
   url: URL,
   accept?: string | null,
   req?: Request,
+  extra?: string, // the segment after a by-key value: "raw" downloads the file
 ): Promise<Response> {
   // Resolve org from slug
   const slugRows = await sql<{ org_id: string }[]>`
@@ -3209,6 +3243,13 @@ async function handlePublicCollectionRequest(
   if (id === "_materialized" && !sub && req?.method === "GET") {
     const r = await handleListMaterialized(schemaName, resolvedCollection);
     return withHeaders(r, PUBLIC_CACHE_HEADERS);
+  }
+
+  if (id === "by-key" && sub && extra === "raw") {
+    // A public file by its name (file collections with naturalKey "filename")
+    const doc = await resolveNaturalKey(schemaName, resolvedCollection, decodeURIComponent(sub));
+    if (!doc) return withHeaders(Response.json({ error: "Not found" }, { status: 404 }), { "Cache-Control": "no-store" });
+    return withHeaders(await handleGetAssetRaw(schemaName, resolvedCollection, doc.id, url, ar.labelFilter ?? undefined), PUBLIC_CACHE_HEADERS);
   }
 
   if (id === "by-key" && sub) {
@@ -3691,7 +3732,9 @@ async function handleGet(schemaName: string, collection: string, id: string, url
   });
 
   if (!row) return Response.json({ error: "Not found" }, { status: 404 });
-  return Response.json({ id: row.id, version: row.version, collection, data: row.data, createdAt: row.created_at, updatedAt: row.updated_at, labels: row.labels });
+  // The version as an ETag: send it back as If-Match to make the next write conditional
+  return Response.json({ id: row.id, version: row.version, collection, data: row.data, createdAt: row.created_at, updatedAt: row.updated_at, labels: row.labels },
+    { headers: { ETag: `"${row.version}"` } });
 }
 
 /**
@@ -3711,9 +3754,35 @@ async function sameAsCurrent(tx: Sql, id: string, currentVersion: number, data: 
 
 const forceWrite = (req: Request) => new URL(req.url).searchParams.get("force") === "true";
 
+/**
+ * Conditional writes: `If-Match: "<version>"` (as returned in a document's ETag) or
+ * `?ifVersion=<n>` makes a write apply only if the document is still at that version —
+ * so two clients that read-then-write the same document can't silently overwrite each
+ * other. `0` means "only if it doesn't exist yet" (create-only, for upserts by key);
+ * `If-Match: *` means "only if it exists". Returns null when the request has no
+ * condition.
+ */
+type Expect = number | "exists" | null;
+function expectedVersion(req: Request): Expect {
+  const q = new URL(req.url).searchParams.get("ifVersion");
+  const raw = (q ?? req.headers.get("if-match") ?? "").trim().replace(/^W\//, "").replace(/^"|"$/g, "");
+  if (!raw) return null;
+  if (raw === "*") return "exists";
+  return /^\d+$/.test(raw) ? parseInt(raw, 10) : null;
+}
+/** True when the condition fails for a document at `current` (0 = doesn't exist). */
+const conditionFails = (expect: Expect, current: number) =>
+  expect !== null && (expect === "exists" ? current === 0 : expect !== current);
+const versionMismatch = (current: number) => Response.json({
+  error: "Version mismatch",
+  details: current === 0 ? "The document doesn't exist (or no longer does)." : `The document is at version ${current} now; read it again and re-apply your change.`,
+  currentVersion: current,
+}, { status: 412 });
+
 async function handleUpdate(schemaName: string, collection: string, id: string, req: Request, userId: string): Promise<Response> {
   const data = await req.json();
   const force = forceWrite(req);
+  const expect = expectedVersion(req);
 
   const errors = await validateAgainstSchema(schemaName, collection, data);
   if (errors) return Response.json({ error: "Schema validation failed", details: errors }, { status: 422 });
@@ -3730,7 +3799,8 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
         WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
         FOR UPDATE
       `;
-      if (!doc) return null;
+      if (!doc) return expect === null || expect === "exists" ? null : { mismatch: 0 };
+      if (conditionFails(expect, doc.current_version)) return { mismatch: doc.current_version };
 
       // Same data as the current version: no new version (see sameAsCurrent). The
       // stored natural key still follows the data, e.g. after a naturalKey was added.
@@ -3757,6 +3827,7 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
     });
 
     if (!result) return Response.json({ error: "Not found" }, { status: 404 });
+    if ("mismatch" in result) return versionMismatch(result.mismatch);
     return Response.json({ id, version: result.version, collection, data, naturalKey, ...(result.unchanged ? { unchanged: true } : {}), updatedAt: result.updated_at });
   } catch (err) {
     if (isNaturalKeyConflict(err)) {
@@ -3769,17 +3840,21 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
   }
 }
 
-async function handleDelete(schemaName: string, collection: string, id: string): Promise<Response> {
-  const affected = await withTenant(schemaName, async tx => {
-    const rows = await tx<{ id: string }[]>`
-      UPDATE documents SET deleted_at = NOW()
+async function handleDelete(schemaName: string, collection: string, id: string, expect: Expect = null): Promise<Response> {
+  const outcome = await withTenant(schemaName, async tx => {
+    const [doc] = await tx<{ current_version: number }[]>`
+      SELECT current_version FROM documents
       WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
-      RETURNING id
+      FOR UPDATE
     `;
-    return rows.length;
+    if (!doc) return "missing" as const;
+    if (conditionFails(expect, doc.current_version)) return doc.current_version;
+    await tx`UPDATE documents SET deleted_at = NOW() WHERE id = ${id}`;
+    return "deleted" as const;
   });
 
-  if (!affected) return Response.json({ error: "Not found" }, { status: 404 });
+  if (outcome === "missing") return Response.json({ error: "Not found" }, { status: 404 });
+  if (typeof outcome === "number") return versionMismatch(outcome);
   return Response.json({ id, deleted: true });
 }
 
@@ -3883,6 +3958,7 @@ async function handleUpsertByKey(
     };
   }
 
+  const expect = expectedVersion(req);
   try {
     const result = await withTenant(schemaName, async tx => {
       // Lookup-and-lock an existing doc with this key.
@@ -3891,6 +3967,7 @@ async function handleUpsertByKey(
         WHERE collection = ${collection} AND natural_key = ${keyValue} AND deleted_at IS NULL
         FOR UPDATE
       `;
+      if (conditionFails(expect, existing?.current_version ?? 0)) return { mismatch: existing?.current_version ?? 0 };
 
       if (existing) {
         // Same data as the current version: nothing to write
@@ -3926,6 +4003,7 @@ async function handleUpsertByKey(
       return { id: inserted.id, version: 1, created: true, unchanged: false, created_at: inserted.created_at, updated_at: inserted.updated_at };
     });
 
+    if ("mismatch" in result) return { res: versionMismatch(result.mismatch), id: null };
     return {
       res: Response.json(
         {
@@ -3963,6 +4041,7 @@ async function handleDeleteByKey(
   schemaName: string,
   collection: string,
   keyValue: string,
+  expect: Expect = null,
 ): Promise<{ res: Response; id: string | null }> {
   const field = await getNaturalKeyField(schemaName, collection);
   if (!field) {
@@ -3976,7 +4055,7 @@ async function handleDeleteByKey(
   }
   const row = await resolveNaturalKey(schemaName, collection, keyValue);
   if (!row) return { res: Response.json({ error: "Not found" }, { status: 404 }), id: null };
-  const res = await handleDelete(schemaName, collection, row.id);
+  const res = await handleDelete(schemaName, collection, row.id, expect);
   return { res, id: row.id };
 }
 
@@ -4242,6 +4321,30 @@ async function handleGetSchema(schemaName: string, collection: string): Promise<
     indexes:        rows[0].indexes ?? [],
     updatedAt:      rows[0].updated_at,
   });
+}
+
+/**
+ * PATCH /{collection}/_schema — change only the fields sent ({naturalKey}, {listColumns},
+ * …); everything else stays as it is. `null` clears a field. PUT replaces the whole
+ * definition, so a script that PUTs its schema on every run would silently drop a
+ * naturalKey or index someone added later; PATCH doesn't.
+ */
+async function handlePatchSchema(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
+  const FIELDS = ["schema", "displayName", "collectionType", "listColumns", "naturalKey", "indexes"];
+  const body = await req.json() as Record<string, unknown>;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return Response.json({ error: "Send a JSON object with the fields to change" }, { status: 400 });
+  const unknown = Object.keys(body).filter(k => !FIELDS.includes(k));
+  if (unknown.length) return Response.json({ error: `Unknown field(s): ${unknown.join(", ")}. Allowed: ${FIELDS.join(", ")}` }, { status: 400 });
+  const current = await handleGetSchema(schemaName, collection);
+  const base: Record<string, unknown> = current.ok
+    ? await current.json() as Record<string, unknown>
+    : { schema: {}, displayName: null, collectionType: "json", listColumns: null, naturalKey: null, indexes: [] };
+  const merged: Record<string, unknown> = {};
+  for (const f of FIELDS) merged[f] = f in body ? body[f] : base[f];
+  if (merged.schema === null) merged.schema = {};
+  // Reuse PUT's validation and side effects (indexes, natural-key registration)
+  const put = new Request(req.url, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(merged) });
+  return handleSetSchema(schemaName, collection, put, userId);
 }
 
 // Index declaration types and helpers

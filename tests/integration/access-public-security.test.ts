@@ -145,7 +145,7 @@ describe("CORS", () => {
   it("preflights are 204 with the allowed methods and headers", async () => {
     const res = await preflight("/api/v1/me", foreign);
     expect(res.status).toBe(204);
-    expect(res.headers.get("access-control-allow-methods")).toBe("GET, POST, PUT, DELETE, OPTIONS");
+    expect(res.headers.get("access-control-allow-methods")).toBe("GET, POST, PUT, PATCH, DELETE, OPTIONS");
     expect(res.headers.get("access-control-allow-headers")).toContain("Authorization");
   });
 
