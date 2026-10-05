@@ -2,6 +2,13 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## 0.10.1 — 2026-10-05
+
+Content only, no server changes.
+
+### Added
+- **Case studies** under /guides: the tournament tracker, the MAE shop's stock counting, data.tkd-scores.com, a task tracker written by AI agents, websites maintained by AI agents, and WREN as a restorable test mock. Each covers the system as built, its workarounds, and how it would be built on WREN 0.10.
+
 ## 0.10.0 — 2026-10-05
 
 ### Added
