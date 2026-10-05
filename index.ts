@@ -5,6 +5,7 @@ import { join, extname } from "path";
 import { auth, sendMail, inviteMail, oAuthDiscoveryMetadata } from "auth";
 import { setupCommon, createTenant, listTenants, migrateAllTenants, sanitizeSchemaName } from "db/runner";
 import { startEvents, openStream, type Access } from "./events";
+import * as retention from "./retention";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import Ajv from "ajv";
@@ -221,6 +222,9 @@ const sql = postgres(process.env.DATABASE_URL ?? "postgres://wren:wren@localhost
 // Set up common schema and warm the known-tenant cache at startup
 await setupCommon(sql);
 await migrateAllTenants(sql);
+// Retention policies run hourly for every org that has one
+retention.scheduleRetention(sql, withTenant, sanitizeSchemaName);
+
 // Change feed: committed writes in any tenant → event streams and webhooks
 await startEvents(sql, async (orgId, change) => {
   if (!(await orgHasWebhooks(orgId))) return;
@@ -1441,7 +1445,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
     // While impersonating, the admin acts as the member on data only: no org
     // management, and nothing that would reveal the member's other orgs.
-    if (user.impersonator && ["keys", "permissions", "invites", "members", "groups", "webhooks", "org", "connected-apps"].includes(collection)) {
+    if (user.impersonator && ["keys", "permissions", "invites", "members", "groups", "webhooks", "org", "connected-apps", "retention"].includes(collection)) {
       return Response.json({ error: "Not available while impersonating. End impersonation first." }, { status: 403 });
     }
 
@@ -1528,6 +1532,16 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       if (req.method === "POST"   && !id)  return handleCreatePermission(req, user.userId, user.sessionId, user.keyOrgId);
       if (req.method === "PUT"    && id)   return handleUpdatePermission(id, req, user.userId, user.sessionId, user.keyOrgId);
       if (req.method === "DELETE" && id)   return handleDeletePermission(id, user.userId, user.sessionId, user.keyOrgId);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Retention policies — /api/v1/retention[/{collection|*}[/_preview] | /_apply]
+    if (collection === "retention") {
+      if (req.method === "GET"    && !id)                      return handleGetRetention(user);
+      if (req.method === "POST"   && id === "_apply" && !sub)  return handleApplyRetention(user);
+      if (req.method === "PUT"    && id && !sub)               return handleSetRetention(id, req, user);
+      if (req.method === "DELETE" && id && !sub)               return handleDeleteRetention(id, user);
+      if (req.method === "POST"   && id && sub === "_preview") return handlePreviewRetention(id, req, user);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
 
@@ -2731,33 +2745,40 @@ async function handleValidateSchema(schemaName: string, collection: string, req:
 
 // ── Binary asset helpers ─────────────────────────────────────────────────────
 
-async function insertAssetVersion(
-  schemaName: string,
-  docId: string,
-  version: number,
-  file: File,
-  userId: string,
-): Promise<{ _binary: true; filename: string; mimeType: string; size: number; sha256: string }> {
+type AssetMeta = { _binary: true; filename: string; mimeType: string; size: number; sha256: string };
+
+/** An uploaded file's bytes and the metadata stored as its version's data. */
+async function readUpload(file: File): Promise<{ buffer: Buffer; meta: AssetMeta }> {
   const buffer = Buffer.from(await file.arrayBuffer());
-  const meta = {
-    _binary:  true as const,
-    filename: file.name,
-    mimeType: file.type || "application/octet-stream",
-    size:     buffer.byteLength,
-    // Lets deploy tools detect same-size edits without downloading the bytes.
-    sha256:   new Bun.CryptoHasher("sha256").update(buffer).digest("hex"),
+  return {
+    buffer,
+    meta: {
+      _binary:  true,
+      filename: file.name,
+      mimeType: file.type || "application/octet-stream",
+      size:     buffer.byteLength,
+      // Identifies the bytes: deploy tools compare it to skip unchanged files, and
+      // storage is keyed by it, so identical files are stored once (asset_blobs).
+      sha256:   new Bun.CryptoHasher("sha256").update(buffer).digest("hex"),
+    },
   };
-  await withTenant(schemaName, async tx => {
-    await tx`
-      INSERT INTO versions (document_id, version, data, created_by)
-      VALUES (${docId}, ${version}, ${tx.json(meta)}, ${userId})
-    `;
-    await tx`
-      INSERT INTO asset_contents (document_id, version, data, mime_type, filename, size)
-      VALUES (${docId}, ${version}, ${buffer}, ${meta.mimeType}, ${meta.filename}, ${meta.size})
-    `;
-  });
-  return meta;
+}
+
+async function insertAssetVersion(tx: Sql, docId: string, version: number, buffer: Buffer, meta: AssetMeta, userId: string): Promise<void> {
+  await tx`
+    INSERT INTO asset_blobs (sha256, data, size) VALUES (${meta.sha256}, ${buffer}, ${meta.size})
+    -- Reusing an existing blob locks its row until this upload commits, so a retention
+    -- run can't remove it in between (its delete waits, then sees the new reference)
+    ON CONFLICT (sha256) DO UPDATE SET size = EXCLUDED.size
+  `;
+  await tx`
+    INSERT INTO versions (document_id, version, data, created_by)
+    VALUES (${docId}, ${version}, ${tx.json(meta)}, ${userId})
+  `;
+  await tx`
+    INSERT INTO asset_contents (document_id, version, sha256, mime_type, filename, size)
+    VALUES (${docId}, ${version}, ${meta.sha256}, ${meta.mimeType}, ${meta.filename}, ${meta.size})
+  `;
 }
 
 async function handleCreateAsset(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
@@ -2765,21 +2786,14 @@ async function handleCreateAsset(schemaName: string, collection: string, req: Re
   const file = form.get("file");
   if (!(file instanceof File)) return Response.json({ error: "Missing file field" }, { status: 400 });
 
-  const docId = await withTenant(schemaName, async tx => {
-    const [inserted] = await tx<{ id: string }[]>`
-      INSERT INTO documents (collection, current_version, created_by)
-      VALUES (${collection}, 1, ${userId})
-      RETURNING id
-    `;
-    return inserted.id;
-  });
-
-  const meta = await insertAssetVersion(schemaName, docId, 1, file, userId);
-
+  const { buffer, meta } = await readUpload(file);
   const doc = await withTenant(schemaName, async tx => {
     const [row] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
-      SELECT id, created_at, updated_at FROM documents WHERE id = ${docId}
+      INSERT INTO documents (collection, current_version, created_by)
+      VALUES (${collection}, 1, ${userId})
+      RETURNING id, created_at, updated_at
     `;
+    await insertAssetVersion(tx, row.id, 1, buffer, meta, userId);
     return row;
   });
 
@@ -2795,30 +2809,39 @@ async function handleUpdateAsset(schemaName: string, collection: string, docId: 
   const file = form.get("file");
   if (!(file instanceof File)) return Response.json({ error: "Missing file field" }, { status: 400 });
 
-  const existing = await withTenant(schemaName, async tx => {
-    const [row] = await tx<{ current_version: number }[]>`
-      SELECT current_version FROM documents WHERE id = ${docId} AND collection = ${collection} AND deleted_at IS NULL
+  const { buffer, meta } = await readUpload(file);
+  // One transaction, with the document row locked, so two uploads can't take the
+  // same version number.
+  const result = await withTenant(schemaName, async tx => {
+    const [cur] = await tx<{ current_version: number; created_at: Date; updated_at: Date; sha256: string | null; filename: string | null; mime_type: string | null }[]>`
+      SELECT d.current_version, d.created_at, d.updated_at, ac.sha256, ac.filename, ac.mime_type
+      FROM documents d
+      LEFT JOIN asset_contents ac ON ac.document_id = d.id AND ac.version = d.current_version
+      WHERE d.id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
+      FOR UPDATE OF d
     `;
-    return row;
-  });
-  if (!existing) return Response.json({ error: "Not found" }, { status: 404 });
-
-  const newVersion = existing.current_version + 1;
-  const meta = await insertAssetVersion(schemaName, docId, newVersion, file, userId);
-
-  const doc = await withTenant(schemaName, async tx => {
-    const [row] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
-      UPDATE documents SET current_version = ${newVersion}, updated_at = NOW()
+    if (!cur) return null;
+    // The same bytes, name and type as the current version: nothing changed, so no
+    // new version (re-running a sync or deploy doesn't grow history)
+    if (cur.sha256 === meta.sha256 && cur.filename === meta.filename && cur.mime_type === meta.mimeType) {
+      return { version: cur.current_version, created_at: cur.created_at, updated_at: cur.updated_at, unchanged: true };
+    }
+    const version = cur.current_version + 1;
+    await insertAssetVersion(tx, docId, version, buffer, meta, userId);
+    const [row] = await tx<{ created_at: Date; updated_at: Date }[]>`
+      UPDATE documents SET current_version = ${version}, updated_at = NOW()
       WHERE id = ${docId}
-      RETURNING id, created_at, updated_at
+      RETURNING created_at, updated_at
     `;
-    return row;
+    return { version, created_at: row.created_at, updated_at: row.updated_at, unchanged: false };
   });
+  if (!result) return Response.json({ error: "Not found" }, { status: 404 });
 
   return Response.json({
-    id: doc.id, version: newVersion, collection,
+    id: docId, version: result.version, collection,
     data: meta,
-    createdAt: doc.created_at, updatedAt: doc.updated_at,
+    ...(result.unchanged ? { unchanged: true } : {}),
+    createdAt: result.created_at, updatedAt: result.updated_at,
   });
 }
 
@@ -2831,8 +2854,9 @@ async function handleGetAssetRaw(schemaName: string, collection: string, docId: 
     // used to read raw bytes of a document in another.
     if (label) {
       return tx<{ data: Buffer; mime_type: string; filename: string }[]>`
-        SELECT ac.data, ac.mime_type, ac.filename
+        SELECT b.data, ac.mime_type, ac.filename
         FROM asset_contents ac
+        JOIN asset_blobs b ON b.sha256 = ac.sha256
         JOIN labels l ON l.document_id = ac.document_id AND l.version = ac.version AND l.label = ${label}
         JOIN documents d ON d.id = ac.document_id
         WHERE ac.document_id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
@@ -2840,16 +2864,18 @@ async function handleGetAssetRaw(schemaName: string, collection: string, docId: 
     }
     if (versionParam) {
       return tx<{ data: Buffer; mime_type: string; filename: string }[]>`
-        SELECT ac.data, ac.mime_type, ac.filename
+        SELECT b.data, ac.mime_type, ac.filename
         FROM asset_contents ac
+        JOIN asset_blobs b ON b.sha256 = ac.sha256
         JOIN documents d ON d.id = ac.document_id
         WHERE ac.document_id = ${docId} AND ac.version = ${parseInt(versionParam)}
           AND d.collection = ${collection} AND d.deleted_at IS NULL
       `;
     }
     return tx<{ data: Buffer; mime_type: string; filename: string }[]>`
-      SELECT ac.data, ac.mime_type, ac.filename
+      SELECT b.data, ac.mime_type, ac.filename
       FROM asset_contents ac
+      JOIN asset_blobs b ON b.sha256 = ac.sha256
       JOIN documents d ON d.id = ac.document_id AND d.current_version = ac.version
       WHERE ac.document_id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
     `;
@@ -6174,6 +6200,114 @@ async function handleDeletePermission(permId: string, userId: string, sessionId:
   `;
   if (!rows.length) return Response.json({ error: "Not found" }, { status: 404 });
   return Response.json({ id: permId, deleted: true });
+}
+
+// ── Retention policies ───────────────────────────────────────────────────────
+// "*" is the org default; any other name is a collection's own policy.
+
+async function retentionOrg(user: SessionUser): Promise<{ orgId: string; schemaName: string } | Response> {
+  const orgId = await resolveUserOrgId(user.userId, user.sessionId, user.keyOrgId);
+  const guard = await forbiddenIfNotAdminOrOwner(user.userId, orgId);
+  if (guard) return guard;
+  return { orgId, schemaName: await ensureTenant(orgId) };
+}
+
+const policyJson = (r: Parameters<typeof retention.fromRow>[0]) =>
+  ({ collection: r.collection, ...retention.fromRow(r), updatedAt: r.updated_at, updatedBy: r.updated_by });
+
+async function handleGetRetention(user: SessionUser): Promise<Response> {
+  const org = await retentionOrg(user);
+  if (org instanceof Response) return org;
+  const rows = await retention.orgPolicies(sql, org.orgId);
+  const runs = await sql<{ collection: string; versions_removed: number; bytes_freed: string; triggered_by: string | null; ran_at: Date }[]>`
+    SELECT collection, versions_removed, bytes_freed::text, triggered_by, ran_at FROM common.retention_runs
+    WHERE org_id = ${org.orgId} ORDER BY ran_at DESC LIMIT 20
+  `;
+  return Response.json({
+    default: rows.filter(r => r.collection === "*").map(policyJson)[0] ?? null,
+    collections: rows.filter(r => r.collection !== "*").map(policyJson),
+    runs: runs.map(r => ({ collection: r.collection, versionsRemoved: r.versions_removed, bytesFreed: Number(r.bytes_freed), triggeredBy: r.triggered_by, ranAt: r.ran_at })),
+  });
+}
+
+function retentionTarget(name: string): string | Response {
+  const target = decodeURIComponent(name);
+  if (target !== "*" && (target.startsWith("_") || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(target))) {
+    return Response.json({ error: "Use * for the org default, or a collection name" }, { status: 400 });
+  }
+  return target;
+}
+
+async function handleSetRetention(name: string, req: Request, user: SessionUser): Promise<Response> {
+  const org = await retentionOrg(user);
+  if (org instanceof Response) return org;
+  const target = retentionTarget(name);
+  if (target instanceof Response) return target;
+  const p = retention.parsePolicy(await req.json());
+  if (typeof p === "string") return Response.json({ error: p }, { status: 400 });
+  const [row] = await sql<Parameters<typeof retention.fromRow>[0][]>`
+    INSERT INTO common.retention_policies (org_id, collection, labeled_only, max_versions, max_age_days, after_label, updated_by, updated_at)
+    VALUES (${org.orgId}, ${target}, ${p.labeledOnly}, ${p.maxVersions}, ${p.maxAgeDays}, ${p.afterLabel}, ${user.userId}, NOW())
+    ON CONFLICT (org_id, collection) DO UPDATE SET
+      labeled_only = EXCLUDED.labeled_only, max_versions = EXCLUDED.max_versions, max_age_days = EXCLUDED.max_age_days,
+      after_label = EXCLUDED.after_label, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+    RETURNING collection, labeled_only, max_versions, max_age_days, after_label, updated_at, updated_by
+  `;
+  return Response.json(policyJson(row));
+}
+
+async function handleDeleteRetention(name: string, user: SessionUser): Promise<Response> {
+  const org = await retentionOrg(user);
+  if (org instanceof Response) return org;
+  const target = retentionTarget(name);
+  if (target instanceof Response) return target;
+  const rows = await sql`DELETE FROM common.retention_policies WHERE org_id = ${org.orgId} AND collection = ${target} RETURNING 1`;
+  if (!rows.length) return Response.json({ error: "No policy for that collection" }, { status: 404 });
+  return Response.json({ collection: target, deleted: true });
+}
+
+/** What a policy would remove: the saved one, or one in the body (nothing is changed). */
+async function handlePreviewRetention(name: string, req: Request, user: SessionUser): Promise<Response> {
+  const org = await retentionOrg(user);
+  if (org instanceof Response) return org;
+  const target = retentionTarget(name);
+  if (target instanceof Response) return target;
+  const text = await req.text();
+  let proposed: retention.Policy | null = null;
+  if (text.trim()) {
+    const p = retention.parsePolicy(JSON.parse(text));
+    if (typeof p === "string") return Response.json({ error: p }, { status: 400 });
+    proposed = p;
+  }
+  const effective = await retention.effectivePolicies(sql, withTenant, org.schemaName, org.orgId);
+  let targets: { collection: string; policy: retention.Policy }[];
+  if (target === "*") {
+    // The default applies to every collection without a policy of its own
+    const own = new Set((await retention.orgPolicies(sql, org.orgId)).map(r => r.collection).filter(c => c !== "*"));
+    const all = await withTenant(org.schemaName, tx => tx<{ collection: string }[]>`
+      SELECT DISTINCT collection FROM documents WHERE collection NOT LIKE '\\_%' ORDER BY collection
+    `);
+    const saved = effective.find(e => e.source === "default")?.policy ?? null;
+    const policy = proposed ?? saved;
+    targets = policy ? all.filter(c => !own.has(c.collection)).map(c => ({ collection: c.collection, policy })) : [];
+  } else {
+    const policy = proposed ?? effective.find(e => e.collection === target)?.policy ?? null;
+    targets = policy ? [{ collection: target, policy }] : [];
+  }
+  const plans: retention.Plan[] = [];
+  for (const t of targets) plans.push(await retention.preview(withTenant, org.schemaName, t.collection, t.policy));
+  const total = plans.reduce((a, p) => ({ versions: a.versions + p.versions, documents: a.documents + p.documents, bytes: a.bytes + p.bytes }), { versions: 0, documents: 0, bytes: 0 });
+  return Response.json({ collections: plans.filter(p => p.versions > 0), total });
+}
+
+async function handleApplyRetention(user: SessionUser): Promise<Response> {
+  const org = await retentionOrg(user);
+  if (org instanceof Response) return org;
+  const plans = await retention.applyOrg(sql, withTenant, org.schemaName, org.orgId, user.userId);
+  return Response.json({
+    collections: plans,
+    total: plans.reduce((a, p) => ({ versions: a.versions + p.versions, documents: a.documents + p.documents, bytes: a.bytes + p.bytes }), { versions: 0, documents: 0, bytes: 0 }),
+  });
 }
 
 // ── Webhooks ─────────────────────────────────────────────────────────────────

@@ -2,6 +2,18 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## Unreleased
+
+### Added
+- **Files are stored once per content.** Bytes move to `asset_blobs`, keyed by SHA-256; each version points at its blob, so history is unchanged but identical bytes take space once. Re-uploading a file whose bytes, name and type equal the current version returns `200` with `unchanged: true` and creates no version.
+- **Retention policies.** An org default and per-collection policies (`GET/PUT/DELETE /api/v1/retention[/{collection|*}]`, `POST …/_preview`, `POST /api/v1/retention/_apply`), applied hourly. Rules combine (a version goes if any says so): keep only labeled versions, keep the newest n, remove older than n days, remove older than a label's version. A document's current version and every labeled version are always kept. Blobs are deleted only when no version references them, enforced by a foreign key; runs are logged.
+
+### Fixed
+- Two concurrent uploads to the same file can no longer take the same version number (the document row is locked).
+
+### Upgrade notes
+- Migration tenant/014 rebuilds each org's file table around the shared blobs (on a copy of the production data: 23,274 file versions, 2.8 GB → 1.3 GB, every file byte-identical, about 20 s). Common/015 adds the policy and run tables. Nothing is removed until an admin sets a policy.
+
 ## 0.7.0 — 2026-10-05
 
 ### Removed
