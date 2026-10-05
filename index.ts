@@ -1637,6 +1637,32 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           }
         }
       }
+      else if (req.method === "POST" && treePath === "/_restore") {
+        // Restoring rewrites documents in every collection in the tree: need write on each
+        const cols = await withTenant(schemaName, tx => tx<{ collection: string }[]>`
+          SELECT DISTINCT d.collection FROM paths p JOIN documents d ON d.id = p.document_id
+          WHERE p.tree = ${treeName}
+        `);
+        const denied: string[] = [];
+        for (const { collection: col } of cols) {
+          if (!(await checkAccess(orgId, user.userId, principal, `collection:${col}`, "write")).allowed) denied.push(col);
+        }
+        if (denied.length) {
+          treeRes = Response.json({ error: "Restoring this tree needs write access to every collection in it", collections: denied }, { status: 403 });
+        } else {
+          const out = await restoreToLabel(schemaName, { tree: treeName }, req, user.userId);
+          if ("error" in out) treeRes = out.error;
+          else {
+            treeRes = Response.json({ tree: treeName, ...out.result });
+            const paths = await withTenant(schemaName, tx => tx<{ path: string }[]>`SELECT path FROM paths WHERE tree = ${treeName}`);
+            for (const p of paths) purgeForTreePath(orgId, treeName, p.path).catch(() => {});
+            for (const col of out.result.collections) {
+              purgeForCollection(orgId, col).catch(() => {});
+              refreshMaterializedForCollection(schemaName, col, user.userId).catch(() => {});
+            }
+          }
+        }
+      }
       else if (req.method === "PUT") {
         treeRes = await handleTreePut(schemaName, treeName, treePath, req, user.userId, orgId);
         if (treeRes.status < 400) {
@@ -1688,6 +1714,16 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       res = await withRefResolution(res, schemaName, url, colAr.labelFilter, resource => checkAccess(orgId, user.userId, principal, resource, "read"));
       audit(colAr, colResource, true, res.status);
       return filterResponse(res, colAr);
+    }
+
+    // Route: POST /{collection}/_restore {label, deleteUnlabeled?} — whole collection to a label
+    if (req.method === "POST" && id === "_restore" && !sub) {
+      const out = await restoreToLabel(schemaName, { collection }, req, user.userId);
+      if ("error" in out) { audit(colAr, colResource, false, out.error.status); return out.error; }
+      audit(colAr, colResource, false, 200);
+      purgeForCollection(orgId, collection).catch(() => {});
+      refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+      return Response.json(out.result);
     }
 
     // Schema routes: GET|PUT|DELETE /{collection}/_schema
@@ -1749,7 +1785,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     // otherwise reinvents.
     if (id === "by-key" && sub) {
       const keyValue = decodeURIComponent(sub);
-      if (req.method === "GET") {
+      if (req.method === "GET" && version !== "raw") {
         const effectiveLabel = colAr.labelFilter ?? url.searchParams.get("label") ?? undefined;
         const effectiveUrl = effectiveLabel
           ? (() => { const u = new URL(url); u.searchParams.set("label", effectiveLabel); return u; })()
@@ -1759,8 +1795,22 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         audit(colAr, colResource, true, r.status);
         return filterResponse(r, colAr);
       }
+      if (req.method === "GET" && version === "raw") {
+        // GET /{collection}/by-key/{name}/raw — the file's bytes
+        const [doc] = await withTenant(schemaName, tx => tx<{ id: string }[]>`
+          SELECT id FROM documents WHERE collection = ${collection} AND natural_key = ${keyValue} AND deleted_at IS NULL
+        `);
+        const r = doc
+          ? await handleGetAssetRaw(schemaName, collection, doc.id, url, colAr.labelFilter ?? undefined)
+          : Response.json({ error: "Not found" }, { status: 404 });
+        audit(colAr, colResource, true, r.status);
+        return r;
+      }
       if (req.method === "PUT") {
-        const { res, id: docId } = await handleUpsertByKey(schemaName, collection, keyValue, req, user.userId);
+        const multipart = (req.headers.get("content-type") ?? "").startsWith("multipart/form-data");
+        const { res, id: docId } = multipart
+          ? await handleUpsertAssetByKey(schemaName, collection, keyValue, req, user.userId)
+          : await handleUpsertByKey(schemaName, collection, keyValue, req, user.userId);
         audit(colAr, colResource, false, res.status);
         if (res.status < 400 && docId) {
           purgeForDocument(orgId, collection, docId).catch(() => {});
@@ -1879,6 +1929,26 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       audit(colAr, colResource, false, r.status);
       if (r.status < 400) {
         purgeForDocument(orgId, collection, id).catch(() => {});
+        refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
+      }
+      return r;
+    }
+
+    // Route: DELETE /{collection}/{id}/labels/{label}
+    if (req.method === "DELETE" && id && sub === "labels" && version) {
+      const r = await handleRemoveLabel(schemaName, collection, id, decodeURIComponent(version));
+      audit(colAr, colResource, false, r.status);
+      if (r.status < 400) purgeForDocument(orgId, collection, id).catch(() => {});
+      return r;
+    }
+
+    // Route: POST /{collection}/{id}/undelete
+    if (req.method === "POST" && id && sub === "undelete" && !version) {
+      const r = await handleUndelete(schemaName, collection, id);
+      audit(colAr, colResource, false, r.status);
+      if (r.status < 400) {
+        purgeForDocument(orgId, collection, id).catch(() => {});
+        purgeForCollection(orgId, collection).catch(() => {});
         refreshMaterializedForCollection(schemaName, collection, user.userId).catch(() => {});
       }
       return r;
@@ -2061,8 +2131,16 @@ function compileWhere(where: string): { sql: string; params: unknown[] } {
           // bind as text, then parse once (binding as jsonb would encode the string again)
           sqlParts.push(`${jsonSegments} @> ($${params.length}::text)::jsonb`);
         } else if ([">", ">=", "<", "<="].includes(op)) {
-          params.push(parseFloat(value) || value);
-          sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
+          // A number compares numerically; anything else compares as text, so ISO
+          // dates and times ("2026-10-05", "2026-10-05T09:30:00Z") range correctly.
+          const bare = value.replace(/^['"]|['"]$/g, "");
+          if (/^-?\d+(\.\d+)?$/.test(bare)) {
+            params.push(parseFloat(bare));
+            sqlParts.push(`(${jsonPath})::numeric ${sqlOp} $${params.length}`);
+          } else {
+            params.push(bare);
+            sqlParts.push(`${jsonPath} ${sqlOp} $${params.length}`);
+          }
         } else {
           const cleanValue = value.replace(/^['"]|['"]$/g, "");
           params.push(cleanValue);
@@ -2781,68 +2859,130 @@ async function insertAssetVersion(tx: Sql, docId: string, version: number, buffe
   `;
 }
 
-async function handleCreateAsset(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
-  const form = await req.formData();
-  const file = form.get("file");
-  if (!(file instanceof File)) return Response.json({ error: "Missing file field" }, { status: 400 });
+type AssetWrite = { id: string; version: number; created: boolean; unchanged: boolean; created_at: Date; updated_at: Date };
 
-  const { buffer, meta } = await readUpload(file);
-  const doc = await withTenant(schemaName, async tx => {
+/**
+ * Write a file into a document inside a transaction: a new document when docId is null,
+ * otherwise a new version of it (locked, so two uploads can't take the same number).
+ * The same bytes, name and type as the current version create no version. For a
+ * collection with a natural key (e.g. "filename"), the document's key follows the file.
+ */
+async function writeAsset(tx: Sql, collection: string, docId: string | null, buffer: Buffer, meta: AssetMeta, keyed: boolean, naturalKey: string | null, userId: string): Promise<AssetWrite | null> {
+  if (!docId) {
     const [row] = await tx<{ id: string; created_at: Date; updated_at: Date }[]>`
-      INSERT INTO documents (collection, current_version, created_by)
-      VALUES (${collection}, 1, ${userId})
+      INSERT INTO documents (collection, current_version, natural_key, created_by)
+      VALUES (${collection}, 1, ${naturalKey}, ${userId})
       RETURNING id, created_at, updated_at
     `;
     await insertAssetVersion(tx, row.id, 1, buffer, meta, userId);
-    return row;
-  });
+    return { id: row.id, version: 1, created: true, unchanged: false, created_at: row.created_at, updated_at: row.updated_at };
+  }
+  const [cur] = await tx<{ current_version: number; created_at: Date; updated_at: Date; sha256: string | null; filename: string | null; mime_type: string | null }[]>`
+    SELECT d.current_version, d.created_at, d.updated_at, ac.sha256, ac.filename, ac.mime_type
+    FROM documents d
+    LEFT JOIN asset_contents ac ON ac.document_id = d.id AND ac.version = d.current_version
+    WHERE d.id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
+    FOR UPDATE OF d
+  `;
+  if (!cur) return null;
+  // Re-running a sync or deploy with an unchanged file doesn't grow history
+  if (cur.sha256 === meta.sha256 && cur.filename === meta.filename && cur.mime_type === meta.mimeType) {
+    return { id: docId, version: cur.current_version, created: false, unchanged: true, created_at: cur.created_at, updated_at: cur.updated_at };
+  }
+  const version = cur.current_version + 1;
+  await insertAssetVersion(tx, docId, version, buffer, meta, userId);
+  const [row] = await tx<{ created_at: Date; updated_at: Date }[]>`
+    UPDATE documents SET current_version = ${version}, updated_at = NOW(),
+      natural_key = CASE WHEN ${keyed} THEN ${naturalKey} ELSE natural_key END
+    WHERE id = ${docId}
+    RETURNING created_at, updated_at
+  `;
+  return { id: docId, version, created: false, unchanged: false, created_at: row.created_at, updated_at: row.updated_at };
+}
 
-  return Response.json({
-    id: doc.id, version: 1, collection,
-    data: meta,
-    createdAt: doc.created_at, updatedAt: doc.updated_at,
-  }, { status: 201 });
+const assetJson = (collection: string, w: AssetWrite, meta: AssetMeta, naturalKey: string | null) => ({
+  id: w.id, version: w.version, collection,
+  data: meta,
+  ...(naturalKey ? { naturalKey } : {}),
+  ...(w.unchanged ? { unchanged: true } : {}),
+  createdAt: w.created_at, updatedAt: w.updated_at,
+});
+
+async function uploadedFile(req: Request): Promise<File | Response> {
+  const form = await req.formData();
+  const file = form.get("file");
+  return file instanceof File ? file : Response.json({ error: "Missing file field" }, { status: 400 });
+}
+
+const fileKeyConflict = (collection: string, key: string | null) => Response.json({
+  error: "Natural key conflict",
+  details: `Another file in '${collection}' is already named '${key}'. Replace it with PUT /api/v1/${collection}/by-key/${encodeURIComponent(key ?? "")}.`,
+}, { status: 409 });
+
+async function handleCreateAsset(schemaName: string, collection: string, req: Request, userId: string): Promise<Response> {
+  const file = await uploadedFile(req);
+  if (file instanceof Response) return file;
+  const { buffer, meta } = await readUpload(file);
+  const naturalKey = await extractNaturalKey(schemaName, collection, meta);
+  try {
+    const w = await withTenant(schemaName, tx => writeAsset(tx, collection, null, buffer, meta, true, naturalKey, userId));
+    return Response.json(assetJson(collection, w!, meta, naturalKey), { status: 201 });
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) return fileKeyConflict(collection, naturalKey);
+    throw err;
+  }
 }
 
 async function handleUpdateAsset(schemaName: string, collection: string, docId: string, req: Request, userId: string): Promise<Response> {
-  const form = await req.formData();
-  const file = form.get("file");
-  if (!(file instanceof File)) return Response.json({ error: "Missing file field" }, { status: 400 });
-
+  const file = await uploadedFile(req);
+  if (file instanceof Response) return file;
   const { buffer, meta } = await readUpload(file);
-  // One transaction, with the document row locked, so two uploads can't take the
-  // same version number.
-  const result = await withTenant(schemaName, async tx => {
-    const [cur] = await tx<{ current_version: number; created_at: Date; updated_at: Date; sha256: string | null; filename: string | null; mime_type: string | null }[]>`
-      SELECT d.current_version, d.created_at, d.updated_at, ac.sha256, ac.filename, ac.mime_type
-      FROM documents d
-      LEFT JOIN asset_contents ac ON ac.document_id = d.id AND ac.version = d.current_version
-      WHERE d.id = ${docId} AND d.collection = ${collection} AND d.deleted_at IS NULL
-      FOR UPDATE OF d
-    `;
-    if (!cur) return null;
-    // The same bytes, name and type as the current version: nothing changed, so no
-    // new version (re-running a sync or deploy doesn't grow history)
-    if (cur.sha256 === meta.sha256 && cur.filename === meta.filename && cur.mime_type === meta.mimeType) {
-      return { version: cur.current_version, created_at: cur.created_at, updated_at: cur.updated_at, unchanged: true };
-    }
-    const version = cur.current_version + 1;
-    await insertAssetVersion(tx, docId, version, buffer, meta, userId);
-    const [row] = await tx<{ created_at: Date; updated_at: Date }[]>`
-      UPDATE documents SET current_version = ${version}, updated_at = NOW()
-      WHERE id = ${docId}
-      RETURNING created_at, updated_at
-    `;
-    return { version, created_at: row.created_at, updated_at: row.updated_at, unchanged: false };
-  });
-  if (!result) return Response.json({ error: "Not found" }, { status: 404 });
+  const keyed = (await getNaturalKeyField(schemaName, collection)) !== null;
+  const naturalKey = await extractNaturalKey(schemaName, collection, meta);
+  try {
+    const w = await withTenant(schemaName, tx => writeAsset(tx, collection, docId, buffer, meta, keyed, naturalKey, userId));
+    if (!w) return Response.json({ error: "Not found" }, { status: 404 });
+    return Response.json(assetJson(collection, w, meta, naturalKey));
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) return fileKeyConflict(collection, naturalKey);
+    throw err;
+  }
+}
 
-  return Response.json({
-    id: docId, version: result.version, collection,
-    data: meta,
-    ...(result.unchanged ? { unchanged: true } : {}),
-    createdAt: result.created_at, updatedAt: result.updated_at,
-  });
+/**
+ * PUT /{collection}/by-key/{name} with a multipart file: create the file, or replace it
+ * if it changed. For file collections whose schema has naturalKey "filename"; the
+ * stored file is named by its key. Returns 201 when created.
+ */
+async function handleUpsertAssetByKey(schemaName: string, collection: string, keyValue: string, req: Request, userId: string): Promise<{ res: Response; id: string | null }> {
+  const field = await getNaturalKeyField(schemaName, collection);
+  if (field !== "filename") {
+    return { res: Response.json({
+      error: "No file key configured",
+      details: `Upload files by key with naturalKey "filename": PUT /api/v1/${collection}/_schema {"collectionType":"binary","naturalKey":"filename"}.`,
+    }, { status: 400 }), id: null };
+  }
+  const file = await uploadedFile(req);
+  if (file instanceof Response) return { res: file, id: null };
+  const { buffer, meta } = await readUpload(file);
+  // The stored file is named by its key, and its type follows that name (not whatever
+  // name the upload happened to carry), so re-sending an unchanged file is a no-op
+  meta.filename = keyValue;
+  const byName = Bun.file(keyValue).type;
+  if (byName && byName !== "application/octet-stream") meta.mimeType = byName;
+  try {
+    const w = await withTenant(schemaName, async tx => {
+      const [existing] = await tx<{ id: string }[]>`
+        SELECT id FROM documents WHERE collection = ${collection} AND natural_key = ${keyValue} AND deleted_at IS NULL
+        FOR UPDATE
+      `;
+      return writeAsset(tx, collection, existing?.id ?? null, buffer, meta, true, keyValue, userId);
+    });
+    return { res: Response.json(assetJson(collection, w!, meta, keyValue), { status: w!.created ? 201 : 200 }), id: w!.id };
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) return { res: fileKeyConflict(collection, keyValue), id: null };
+    throw err;
+  }
 }
 
 async function handleGetAssetRaw(schemaName: string, collection: string, docId: string, url: URL, labelFilter?: string): Promise<Response> {
@@ -3554,8 +3694,26 @@ async function handleGet(schemaName: string, collection: string, id: string, url
   return Response.json({ id: row.id, version: row.version, collection, data: row.data, createdAt: row.created_at, updatedAt: row.updated_at, labels: row.labels });
 }
 
+/**
+ * A write that changes nothing doesn't create a version: half of all updates in real
+ * deployments were byte-identical re-sends (sync scripts, deploys, agents). The JSON is
+ * compared by meaning (jsonb: key order and whitespace don't matter). `?force=true`
+ * writes a version anyway. Returns the document's updated_at when unchanged.
+ */
+async function sameAsCurrent(tx: Sql, id: string, currentVersion: number, data: unknown): Promise<{ updated_at: Date } | null> {
+  const [row] = await tx<{ same: boolean; updated_at: Date }[]>`
+    SELECT v.data = ${tx.json(data as Parameters<typeof tx.json>[0])}::jsonb AS same, d.updated_at
+    FROM versions v JOIN documents d ON d.id = v.document_id
+    WHERE v.document_id = ${id} AND v.version = ${currentVersion}
+  `;
+  return row?.same ? { updated_at: row.updated_at } : null;
+}
+
+const forceWrite = (req: Request) => new URL(req.url).searchParams.get("force") === "true";
+
 async function handleUpdate(schemaName: string, collection: string, id: string, req: Request, userId: string): Promise<Response> {
   const data = await req.json();
+  const force = forceWrite(req);
 
   const errors = await validateAgainstSchema(schemaName, collection, data);
   if (errors) return Response.json({ error: "Schema validation failed", details: errors }, { status: 422 });
@@ -3574,6 +3732,10 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
       `;
       if (!doc) return null;
 
+      // Same data as the current version: no new version (see sameAsCurrent)
+      const unchanged = !force && await sameAsCurrent(tx, id, doc.current_version, data);
+      if (unchanged) return { version: doc.current_version, updated_at: unchanged.updated_at, unchanged: true };
+
       const newVersion = doc.current_version + 1;
       await tx`
         INSERT INTO versions (document_id, version, data, created_by)
@@ -3587,11 +3749,11 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
         WHERE id = ${id}
         RETURNING updated_at
       `;
-      return { version: newVersion, updated_at: updated.updated_at };
+      return { version: newVersion, updated_at: updated.updated_at, unchanged: false };
     });
 
     if (!result) return Response.json({ error: "Not found" }, { status: 404 });
-    return Response.json({ id, version: result.version, collection, data, naturalKey, updatedAt: result.updated_at });
+    return Response.json({ id, version: result.version, collection, data, naturalKey, ...(result.unchanged ? { unchanged: true } : {}), updatedAt: result.updated_at });
   } catch (err) {
     if (isNaturalKeyConflict(err)) {
       return Response.json({
@@ -3727,6 +3889,12 @@ async function handleUpsertByKey(
       `;
 
       if (existing) {
+        // Same data as the current version: nothing to write
+        const unchanged = !forceWrite(req) && await sameAsCurrent(tx, existing.id, existing.current_version, payload);
+        if (unchanged) {
+          const [d] = await tx<{ created_at: Date }[]>`SELECT created_at FROM documents WHERE id = ${existing.id}`;
+          return { id: existing.id, version: existing.current_version, created: false, unchanged: true, created_at: d.created_at, updated_at: unchanged.updated_at };
+        }
         // Update path: write a new version against the existing doc.
         const newVersion = existing.current_version + 1;
         await tx`
@@ -3738,7 +3906,7 @@ async function handleUpsertByKey(
           WHERE id = ${existing.id}
           RETURNING updated_at, created_at
         `;
-        return { id: existing.id, version: newVersion, created: false, created_at: updated.created_at, updated_at: updated.updated_at };
+        return { id: existing.id, version: newVersion, created: false, unchanged: false, created_at: updated.created_at, updated_at: updated.updated_at };
       }
 
       // Insert path: create a fresh doc with this key.
@@ -3751,7 +3919,7 @@ async function handleUpsertByKey(
         INSERT INTO versions (document_id, version, data, created_by)
         VALUES (${inserted.id}, 1, ${tx.json(payload)}, ${userId})
       `;
-      return { id: inserted.id, version: 1, created: true, created_at: inserted.created_at, updated_at: inserted.updated_at };
+      return { id: inserted.id, version: 1, created: true, unchanged: false, created_at: inserted.created_at, updated_at: inserted.updated_at };
     });
 
     return {
@@ -3762,6 +3930,7 @@ async function handleUpsertByKey(
           collection,
           data: payload,
           naturalKey: keyValue,
+          ...(result.unchanged ? { unchanged: true } : {}),
           createdAt: result.created_at,
           updatedAt: result.updated_at,
         },
@@ -3851,36 +4020,155 @@ async function handleVersionGet(schemaName: string, collection: string, id: stri
   return Response.json({ id, collection, version, data: row.data, createdAt: row.created_at });
 }
 
+/**
+ * Make an older version's content the document's new current version: history moves
+ * forward (version n+1 = content of `targetVersion`). A file version keeps pointing at
+ * the same blob, and the natural key follows the restored data. Returns the new
+ * version, or null if the target version doesn't exist.
+ */
+async function restoreVersion(tx: Sql, collection: string, id: string, currentVersion: number, targetVersion: number, userId: string): Promise<number | null> {
+  const [target] = await tx<{ data: Record<string, unknown> }[]>`
+    SELECT data FROM versions WHERE document_id = ${id} AND version = ${targetVersion}
+  `;
+  if (!target) return null;
+  const [schema] = await tx<{ natural_key: string | null }[]>`
+    SELECT natural_key FROM collection_schemas WHERE collection = ${collection}
+  `;
+  const keyField = schema?.natural_key ?? null;
+  const keyValue = keyField && typeof target.data?.[keyField] === "string" ? (target.data[keyField] as string).trim() : null;
+  const version = currentVersion + 1;
+  await tx`
+    INSERT INTO versions (document_id, version, data, created_by)
+    VALUES (${id}, ${version}, ${tx.json(target.data)}, ${userId})
+  `;
+  await tx`
+    INSERT INTO asset_contents (document_id, version, sha256, mime_type, filename, size)
+    SELECT document_id, ${version}, sha256, mime_type, filename, size
+    FROM asset_contents WHERE document_id = ${id} AND version = ${targetVersion}
+  `;
+  await tx`
+    UPDATE documents SET current_version = ${version}, updated_at = NOW(),
+      natural_key = CASE WHEN ${keyField}::text IS NULL THEN natural_key ELSE ${keyValue} END
+    WHERE id = ${id}
+  `;
+  return version;
+}
+
 async function handleRollback(schemaName: string, collection: string, id: string, versionStr: string, userId: string): Promise<Response> {
   const targetVersion = parseInt(versionStr, 10);
   if (isNaN(targetVersion)) return Response.json({ error: "Invalid version" }, { status: 400 });
 
-  const result = await withTenant(schemaName, async tx => {
-    const [doc] = await tx<{ current_version: number }[]>`
-      SELECT current_version FROM documents
-      WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
-      FOR UPDATE
-    `;
-    if (!doc) return null;
+  try {
+    const result = await withTenant(schemaName, async tx => {
+      const [doc] = await tx<{ current_version: number }[]>`
+        SELECT current_version FROM documents
+        WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
+        FOR UPDATE
+      `;
+      if (!doc) return null;
+      const newVersion = await restoreVersion(tx, collection, id, doc.current_version, targetVersion, userId);
+      return newVersion === null ? null : { newVersion, rolledBackTo: targetVersion };
+    });
+    if (!result) return Response.json({ error: "Not found" }, { status: 404 });
+    return Response.json({ id, version: result.newVersion, rolledBackTo: result.rolledBackTo });
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) return Response.json({ error: "Natural key conflict", details: "Another document already has the natural key of the version you're rolling back to." }, { status: 409 });
+    throw err;
+  }
+}
 
-    const [targetRow] = await tx<{ data: unknown }[]>`
-      SELECT data FROM versions WHERE document_id = ${id} AND version = ${targetVersion}
-    `;
-    if (!targetRow) return null;
+/** POST /{collection}/{id}/undelete — bring back a deleted document as it was. */
+async function handleUndelete(schemaName: string, collection: string, id: string): Promise<Response> {
+  try {
+    const rows = await withTenant(schemaName, tx => tx<{ current_version: number }[]>`
+      UPDATE documents SET deleted_at = NULL, updated_at = NOW()
+      WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NOT NULL
+      RETURNING current_version
+    `);
+    if (!rows.length) return Response.json({ error: "No deleted document with that id in this collection" }, { status: 404 });
+    return Response.json({ id, undeleted: true, version: rows[0].current_version });
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) return Response.json({ error: "Natural key conflict", details: "Another document now has this document's natural key." }, { status: 409 });
+    throw err;
+  }
+}
 
-    const newVersion = doc.current_version + 1;
-    await tx`
-      INSERT INTO versions (document_id, version, data, created_by)
-      VALUES (${id}, ${newVersion}, ${tx.json(targetRow.data)}, ${userId})
-    `;
-    await tx`
-      UPDATE documents SET current_version = ${newVersion}, updated_at = NOW() WHERE id = ${id}
-    `;
-    return { newVersion, rolledBackTo: targetVersion };
-  });
+/** DELETE /{collection}/{id}/labels/{label} */
+async function handleRemoveLabel(schemaName: string, collection: string, id: string, label: string): Promise<Response> {
+  const rows = await withTenant(schemaName, tx => tx<{ version: number }[]>`
+    DELETE FROM labels l USING documents d
+    WHERE l.document_id = d.id AND d.id = ${id} AND d.collection = ${collection} AND d.deleted_at IS NULL
+      AND l.label = ${label}
+    RETURNING l.version
+  `);
+  if (!rows.length) return Response.json({ error: "No such label on this document" }, { status: 404 });
+  return Response.json({ id, label, removed: true, version: rows[0].version });
+}
 
-  if (!result) return Response.json({ error: "Not found" }, { status: 404 });
-  return Response.json({ id, version: result.newVersion, rolledBackTo: result.rolledBackTo });
+type RestoreScope = { collection: string } | { tree: string };
+
+/**
+ * Restore every document of a collection or tree to the version a label points at, in
+ * one transaction: changed documents get a new version with the labeled content,
+ * deleted ones come back, and with deleteUnlabeled documents without the label (made
+ * since) are deleted. Returns what happened, or a Response for errors.
+ */
+async function restoreToLabel(schemaName: string, scope: RestoreScope, req: Request, userId: string): Promise<{ result: { label: string; restored: number; undeleted: number; deleted: number; unchanged: number; collections: string[] } } | { error: Response }> {
+  const body = await req.json().catch(() => ({})) as { label?: unknown; deleteUnlabeled?: unknown };
+  const label = typeof body.label === "string" ? body.label.trim() : "";
+  if (!label) return { error: Response.json({ error: "label is required" }, { status: 400 }) };
+  const deleteUnlabeled = body.deleteUnlabeled === true;
+  const inScope = (tx: Sql) => "collection" in scope
+    ? tx`d.collection = ${scope.collection}`
+    : tx`d.id IN (SELECT document_id FROM paths WHERE tree = ${scope.tree} AND document_id IS NOT NULL)`;
+  try {
+    const result = await withTenant(schemaName, async tx => {
+      const docs = await tx<{ id: string; collection: string; current_version: number; deleted: boolean; label_version: number; same: boolean }[]>`
+        SELECT d.id, d.collection, d.current_version, d.deleted_at IS NOT NULL AS deleted, l.version AS label_version,
+               -- the current content already equals the labeled one (file metadata includes the hash)
+               (SELECT cv.data = lv.data FROM versions cv, versions lv
+                 WHERE cv.document_id = d.id AND cv.version = d.current_version
+                   AND lv.document_id = d.id AND lv.version = l.version) AS same
+        FROM documents d JOIN labels l ON l.document_id = d.id AND l.label = ${label}
+        WHERE ${inScope(tx)} AND d.collection NOT LIKE '\\_%'
+        ORDER BY d.id
+        FOR UPDATE OF d
+      `;
+      let restored = 0, undeleted = 0, unchanged = 0;
+      const touched = new Set<string>();
+      for (const d of docs) {
+        if (d.deleted) {
+          await tx`UPDATE documents SET deleted_at = NULL, updated_at = NOW() WHERE id = ${d.id}`;
+          undeleted++; touched.add(d.collection);
+        }
+        if (d.current_version !== d.label_version && !d.same) {
+          await restoreVersion(tx, d.collection, d.id, d.current_version, d.label_version, userId);
+          restored++; touched.add(d.collection);
+        } else if (!d.deleted) unchanged++;
+      }
+      let deleted = 0;
+      if (deleteUnlabeled) {
+        const gone = await tx<{ collection: string }[]>`
+          UPDATE documents d SET deleted_at = NOW()
+          WHERE ${inScope(tx)} AND d.collection NOT LIKE '\\_%' AND d.deleted_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.document_id = d.id AND l.label = ${label})
+          RETURNING d.collection
+        `;
+        deleted = gone.length;
+        gone.forEach(g => touched.add(g.collection));
+      }
+      return { label, restored, undeleted, deleted, unchanged, collections: [...touched].sort() };
+    });
+    if (result.restored + result.undeleted + result.unchanged === 0 && result.deleted === 0) {
+      return { error: Response.json({ error: `No document here has the label "${label}"` }, { status: 404 }) };
+    }
+    return { result };
+  } catch (err) {
+    if (isNaturalKeyConflict(err)) {
+      return { error: Response.json({ error: "Natural key conflict", details: "Restoring would give two live documents the same natural key; nothing was changed." }, { status: 409 }) };
+    }
+    throw err;
+  }
 }
 
 async function handleLabel(schemaName: string, collection: string, id: string, req: Request, userId: string): Promise<Response> {
@@ -4322,9 +4610,21 @@ async function handleListCollections(schemaName: string): Promise<Response> {
 }
 
 async function handleDiff(schemaName: string, collection: string, id: string, url: URL): Promise<Response> {
-  const v1 = parseInt(url.searchParams.get("v1") ?? "", 10);
-  const v2 = parseInt(url.searchParams.get("v2") ?? "", 10);
-  if (isNaN(v1) || isNaN(v2)) return Response.json({ error: "v1 and v2 are required" }, { status: 400 });
+  // v1/v2: a version number, or a label name (resolved to the version it points at)
+  const resolve = async (raw: string | null): Promise<number | null | "missing"> => {
+    if (!raw) return null;
+    if (/^\d+$/.test(raw)) return parseInt(raw, 10);
+    const [row] = await withTenant(schemaName, tx => tx<{ version: number }[]>`
+      SELECT l.version FROM labels l JOIN documents d ON d.id = l.document_id
+      WHERE l.document_id = ${id} AND d.collection = ${collection} AND l.label = ${raw}
+    `);
+    return row ? row.version : "missing";
+  };
+  const r1 = await resolve(url.searchParams.get("v1")), r2 = await resolve(url.searchParams.get("v2"));
+  if (r1 === null || r2 === null) return Response.json({ error: "v1 and v2 are required (a version number or a label)" }, { status: 400 });
+  if (r1 === "missing" || r2 === "missing") return Response.json({ error: "No such label on this document" }, { status: 404 });
+  const v1 = r1, v2 = r2;
+  const deep = url.searchParams.get("deep") === "true";
 
   const result = await withTenant(schemaName, async tx => {
     const rows = await tx<{ version: number; data: Record<string, unknown> }[]>`
@@ -4341,7 +4641,7 @@ async function handleDiff(schemaName: string, collection: string, id: string, ur
   });
 
   if (!result) return Response.json({ error: "Not found" }, { status: 404 });
-  return Response.json({ id, collection, v1, v2, diff: computeDiff(result.before, result.after) });
+  return Response.json({ id, collection, v1, v2, diff: computeDiff(result.before, result.after, deep) });
 }
 
 // -------------------------------------------------------
@@ -6707,18 +7007,39 @@ async function handleReplayWebhook(webhookId: string, req: Request, userId: stri
 
 type DiffEntry = { op: "add" | "remove" | "replace"; path: string; value?: unknown; oldValue?: unknown };
 
-function computeDiff(before: Record<string, unknown>, after: Record<string, unknown>): DiffEntry[] {
+/**
+ * Diff two documents as JSON-Pointer paths (RFC 6901). By default only top-level fields
+ * are compared (a changed nested object is one "replace"); with deep, nested objects
+ * and arrays are walked so each changed leaf is its own entry.
+ */
+function computeDiff(before: Record<string, unknown>, after: Record<string, unknown>, deep = false): DiffEntry[] {
   const diff: DiffEntry[] = [];
-  const allKeys = new Set([...Object.keys(before ?? {}), ...Object.keys(after ?? {})]);
-  for (const key of allKeys) {
-    const path = `/${key}`;
-    const had = Object.hasOwn(before ?? {}, key);
-    const has = Object.hasOwn(after ?? {}, key);
-    if (!had && has) diff.push({ op: "add", path, value: after[key] });
-    else if (had && !has) diff.push({ op: "remove", path, oldValue: before[key] });
-    else if (JSON.stringify(before[key]) !== JSON.stringify(after[key]))
-      diff.push({ op: "replace", path, value: after[key], oldValue: before[key] });
-  }
+  const esc = (k: string) => k.replace(/~/g, "~0").replace(/\//g, "~1");
+  const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  const walk = (a: unknown, b: unknown, path: string, depth: number) => {
+    if (deep || depth === 0) {
+      if (isObj(a) && isObj(b)) {
+        for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+          const p = `${path}/${esc(k)}`;
+          if (!Object.hasOwn(a, k)) diff.push({ op: "add", path: p, value: b[k] });
+          else if (!Object.hasOwn(b, k)) diff.push({ op: "remove", path: p, oldValue: a[k] });
+          else walk(a[k], b[k], p, depth + 1);
+        }
+        return;
+      }
+      if (deep && Array.isArray(a) && Array.isArray(b)) {
+        for (let i = 0; i < Math.max(a.length, b.length); i++) {
+          const p = `${path}/${i}`;
+          if (i >= a.length) diff.push({ op: "add", path: p, value: b[i] });
+          else if (i >= b.length) diff.push({ op: "remove", path: p, oldValue: a[i] });
+          else walk(a[i], b[i], p, depth + 1);
+        }
+        return;
+      }
+    }
+    if (JSON.stringify(a) !== JSON.stringify(b)) diff.push({ op: "replace", path, value: b, oldValue: a });
+  };
+  walk(before ?? {}, after ?? {}, "", 0);
   return diff;
 }
 
