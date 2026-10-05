@@ -2,7 +2,7 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
-## Unreleased
+## 0.10.0 — 2026-10-05
 
 ### Added
 - **Conditional writes.** `If-Match: "<version>"` (or `?ifVersion=<n>`) on `PUT` by id, `PUT …/by-key/{key}` (JSON or file) and `DELETE` applies the write only if the document is still at that version; otherwise `412` with `currentVersion`. `ifVersion=0` is create-only (re-running an import can't overwrite live data); `If-Match: *` requires the document to exist. Document reads return the version as `ETag`; CORS allows `If-Match` and exposes `ETag`. Found while reviewing the MAE stock tracker, where two devices moving the same item could lose one movement.

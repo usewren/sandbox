@@ -59,7 +59,7 @@ Links in emails use `BETTER_AUTH_URL`, so set it to the public `https://` addres
 
 ```bash
 docker pull reusr1/wren:latest
-# or pin a version: reusr1/wren:0.9.0
+# or pin a version: reusr1/wren:0.10.0
 # Platforms: linux/amd64, linux/arm64
 ```
 
@@ -67,7 +67,7 @@ Building it yourself (run from the folder that contains all the repos, since the
 
 ```bash
 docker build -f sandbox/Dockerfile --build-arg WREN_BUILD=$(git -C sandbox rev-parse --short HEAD) -t wren:local .
-curl -s localhost:4000/health   # → {"status":"ok","version":"0.9.0","build":"<commit>"}
+curl -s localhost:4000/health   # → {"status":"ok","version":"0.10.0","build":"<commit>"}
 ```
 
 Public links that WREN generates (`/api/v1/projects`, `llms.txt`, sitemap) use `WREN_URL`, falling back to `BETTER_AUTH_URL`. Set it to your public `https://` address when running behind a TLS-terminating proxy.
