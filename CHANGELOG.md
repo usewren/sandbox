@@ -2,7 +2,7 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
-## Unreleased
+## 0.7.0 — 2026-10-05
 
 ### Removed
 - **The old React admin UI (`/oldadmin`)** and the React `componentlibrary` it used. They are no longer built into the image; `/oldadmin` redirects to `/admin/`. The server, Admin UI and wren.js are plain JavaScript/TypeScript with no React.
@@ -39,6 +39,13 @@ All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 - Moving an existing label or path while impersonating records the impersonating admin.
 - Rules: a filter expression that doesn't compile is refused when the rule is saved (it used to turn every read into null). Invites: the address must be an email.
 - A request body that isn't valid JSON is a 400 everywhere (was a 500); assigning an unknown document to a tree path is a 404 (was a 500). Unexpected errors return a JSON 500 with CORS headers.
+
+### Upgrade notes
+- Migrations common/014 and tenant/013 run on start (change-notification triggers). No data changes.
+- **Webhooks:** payloads gain fields (`id` on every document event, `version`, `label`, `trees`, `key`); a rollback arrives as `document.updated` without the old `rollback` flag. Webhooks pointing at private or local addresses stop delivering (the delivery log says why); allow internal receivers with `WREN_WEBHOOK_ALLOW_HOSTS`.
+- **`$ref` with `?depth=`:** references into collections or trees the reader can't read now resolve to `{ "$ref": …, "$forbidden": true }` instead of the data.
+- **Label-filtered rules:** version history and diffs return 403 under them.
+- `/oldadmin` redirects to `/admin/`.
 
 ## 0.6.0 — 2026-10-04
 
