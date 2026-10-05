@@ -109,4 +109,28 @@ describe("public files by name", () => {
     }
     expect((await fetch(`${BASE_URL}/orgs/${owner.slug}/${col}/by-key/missing.svg/raw`)).status).toBe(404);
   });
+
+  it("a name without an extension keeps the type it was uploaded with", async () => {
+    const col = `noext${stamp}`;
+    await call("PUT", `/api/v1/${col}/_schema`, { ...H(), body: { collectionType: "binary", naturalKey: "filename" } });
+    // sent with the same file name as the key, as the clients do
+    const r = await upload("PUT", `/api/v1/${col}/by-key/notes`, "hello", "notes");
+    expect(r.status).toBe(201);
+    expect(r.json.data.mimeType).toStartWith("text/plain");
+    const raw = await fetch(`${BASE_URL}/api/v1/${col}/by-key/notes/raw`, { headers: { Cookie: owner.cookie } });
+    expect(raw.headers.get("content-type")).toStartWith("text/plain");
+  });
+
+  it("an upload keeps its declared type, not a guess from its name", async () => {
+    const col = `decl${stamp}`;
+    const form = new FormData();
+    form.append("file", new File(['{"a":1}'], "data.txt", { type: "application/json" }));
+    const r = await fetch(`${BASE_URL}/api/v1/${col}`, { method: "POST", headers: { Cookie: owner.cookie, Origin: BASE_URL }, body: form });
+    expect(((await r.json()) as any).data.mimeType).toStartWith("application/json");
+    // a generic octet-stream still falls back to the name
+    const blob = new FormData();
+    blob.append("file", new File(["<svg/>"], "logo.svg", { type: "application/octet-stream" }));
+    const b = await fetch(`${BASE_URL}/api/v1/${col}`, { method: "POST", headers: { Cookie: owner.cookie, Origin: BASE_URL }, body: blob });
+    expect(((await b.json()) as any).data.mimeType).toBe("image/svg+xml");
+  });
 });

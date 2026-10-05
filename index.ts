@@ -2913,9 +2913,35 @@ const assetJson = (collection: string, w: AssetWrite, meta: AssetMeta, naturalKe
 });
 
 async function uploadedFile(req: Request): Promise<File | Response> {
-  const form = await req.formData();
+  const contentType = req.headers.get("content-type") ?? "";
+  const body = Buffer.from(await req.arrayBuffer());
+  const form = await new Response(body, { headers: { "Content-Type": contentType } }).formData();
   const file = form.get("file");
-  return file instanceof File ? file : Response.json({ error: "Missing file field" }, { status: 400 });
+  if (!(file instanceof File)) return Response.json({ error: "Missing file field" }, { status: 400 });
+  // Bun's parser drops the part's own Content-Type and guesses from the file name
+  // instead ("notes" sent as text/plain comes back untyped), so read it ourselves.
+  // A generic octet-stream says nothing, so the guess from the name still wins then.
+  const declared = declaredPartType(body, contentType, "file");
+  return declared && declared !== "application/octet-stream" && declared !== file.type
+    ? new File([file], file.name, { type: declared })
+    : file;
+}
+
+/** The Content-Type header of the multipart part named `field`, or null. */
+function declaredPartType(body: Buffer, contentType: string, field: string): string | null {
+  const m = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+  if (!m) return null;
+  const delim = Buffer.from(`--${m[1] ?? m[2]}`);
+  for (let i = body.indexOf(delim); i !== -1; ) {
+    const headEnd = body.indexOf("\r\n\r\n", i);
+    if (headEnd === -1) return null;
+    const head = body.subarray(i + delim.length, headEnd).toString("latin1");
+    if (new RegExp(`^content-disposition:[^\\r\\n]*[;\\s]name="${field}"`, "im").test(head)) {
+      return /^content-type:[ \t]*([^\r\n]+)/im.exec(head)?.[1].trim().toLowerCase() || null;
+    }
+    i = body.indexOf(delim, headEnd);
+  }
+  return null;
 }
 
 const fileKeyConflict = (collection: string, key: string | null) => Response.json({

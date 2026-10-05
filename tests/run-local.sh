@@ -19,7 +19,7 @@ ROOT=$(pwd)
 case "$ROOT" in /[a-zA-Z]/*) ROOT="$(echo "$ROOT" | cut -c2 | tr a-z A-Z):$(echo "$ROOT" | cut -c3-)";; esac
 
 if [ -n "$REBUILD" ] || ! docker image inspect "$IMG" >/dev/null 2>&1; then
-  docker build -q -f sandbox/Dockerfile -t "$IMG" . >/dev/null
+  docker build -q -f sandbox/Dockerfile -t "$IMG" . >/dev/null || { echo "image build failed (run: docker build -f sandbox/Dockerfile .)" >&2; exit 1; }
 fi
 docker rm -fv "$NAME-db" >/dev/null 2>&1 || true
 docker network create "$NAME-net" >/dev/null 2>&1 || true

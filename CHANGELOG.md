@@ -9,6 +9,9 @@ All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 - **`PATCH /api/v1/{collection}/_schema`** changes only the fields sent (`null` clears one). Scripts that PUT their schema on every run no longer drop a `naturalKey` or index added since.
 - **Public files by name:** `GET /orgs/{slug}/{collection}/by-key/{name}/raw` (and under `/api/v1/orgs/…`) for public file collections keyed by filename.
 
+### Fixed
+- **Uploads keep the type they were sent with.** Bun's multipart parser ignores a part's `Content-Type` and guesses from the file name, so a file named `notes` sent as `text/plain` was stored as `application/octet-stream`, and `data.txt` sent as `application/json` as `text/plain`. The server now reads the part's declared type; a generic `application/octet-stream` still falls back to the guess from the name. Found by the Python client's tests.
+
 ## 0.9.0 — 2026-10-05
 
 Gaps found while writing the case studies (tournament tracker, MAE stock tracker, data.tkd-scores.com, task tracker, AI-maintained sites, test fixtures).
