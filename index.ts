@@ -23,7 +23,7 @@ const requestContext = new AsyncLocalStorage<RequestContext>();
 // Only Request objects created by the server itself can carry that identity.
 const internalRequests = new WeakSet<Request>();
 
-const WREN_VERSION = "0.6.0";
+const WREN_VERSION = "0.7.0";
 // Set at image build time: docker build --build-arg WREN_BUILD=$(git rev-parse --short HEAD) …
 const WREN_BUILD = process.env.WREN_BUILD?.trim() || "dev";
 
