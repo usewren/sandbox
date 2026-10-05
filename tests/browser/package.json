@@ -1,0 +1,13 @@
+{
+  "name": "wren-js-browser",
+  "private": true,
+  "type": "module",
+  "description": "Browser (end-to-end) tests for wren.js (web components), run in headless Chrome against a throwaway WREN server",
+  "scripts": {
+    "test": "node --test --test-concurrency=2 \"*.test.mjs\"",
+    "coverage": "node lib/coverage-report.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

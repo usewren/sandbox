@@ -23,6 +23,9 @@
  *     <template><div>{{name}} — {{startDate}}</div></template>
  *   </wren-materialized>
  *
+ *   Without a <template>, each item's data is shown as formatted JSON (<pre>).
+ *   The script can go anywhere on the page (before or after the components).
+ *
  * Configuration (on the <script> tag or on each component):
  *   data-base="https://wren.aemwip.com/api/v1/orgs/tkd"  — explicit API base (for custom domains)
  *   data-org="tkd"                                         — explicit org slug (auto-detected from URL if omitted)
@@ -134,6 +137,18 @@
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
+  /** Output for a component without <template>: the item's data as formatted JSON. */
+  function renderJson(data) {
+    return `<pre>${escHtml(JSON.stringify(data, null, 2))}</pre>`;
+  }
+
+  /** base64url of a string's UTF-8 bytes (btoa alone only takes Latin-1). */
+  function base64url(str) {
+    let bin = "";
+    for (const b of new TextEncoder().encode(str)) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
   // ── Fetch helper ───────────────────────────────────────────────────────────
 
   async function wrenFetch(url, opts = {}) {
@@ -165,6 +180,7 @@
     hideSlots(el);
     const slot = el.querySelector('[slot="error"]');
     if (slot) {
+      el._container.innerHTML = ""; // drop the default "Loading…"
       slot.style.display = "";
       slot.innerHTML = slot.innerHTML.replace("{{error}}", escHtml(err.message));
     } else {
@@ -174,6 +190,7 @@
 
   function showEmpty(el) {
     hideSlots(el);
+    el._container.innerHTML = ""; // drop the default "Loading…"
     const slot = el.querySelector('[slot="empty"]');
     if (slot) {
       slot.style.display = "";
@@ -184,6 +201,19 @@
 
   class WrenBase extends HTMLElement {
     connectedCallback() {
+      if (this._container) return; // already set up (e.g. the element was moved)
+      // When wren.js runs before the components (a plain <script> in <head> or above
+      // them), elements are upgraded as soon as the parser opens them, before their
+      // <template> and slots exist. Wait until the document is parsed in that case.
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => this._setup(), { once: true });
+      } else {
+        this._setup();
+      }
+    }
+
+    _setup() {
+      if (this._container) return;
       // Create a container for rendered output (preserves the <template> and slots)
       this._container = document.createElement("div");
       this._container.style.display = "contents"; // invisible wrapper
@@ -199,8 +229,9 @@
       requestAnimationFrame(() => this._load());
     }
 
+    // The <template> markup, or null without one (items then render as JSON)
     _getTemplate() {
-      return this._tmpl?.innerHTML ?? "{{.}}";
+      return this._tmpl?.innerHTML ?? null;
     }
 
     _renderItems(items) {
@@ -211,6 +242,7 @@
         return;
       }
       const html = items.map(item => {
+        if (tmpl == null) return renderJson(item.data ?? item);
         // Flatten: merge item.data into item for easy access, plus item.key for aggregates
         const flat = { ...item, ...item.data, ...item.key };
         return renderTemplate(tmpl, flat);
@@ -220,10 +252,13 @@
       // parent to avoid the browser moving <tr> elements out of the table.
       const parent = this.parentElement;
       if (parent && /^(TBODY|THEAD|TFOOT|TABLE|TR)$/i.test(parent.tagName)) {
-        // Insert rendered HTML into parent, replace this element
+        // Parse the rows in a <template> (which accepts <tr>/<td> anywhere), then insert
+        // them between a marker comment and this (hidden) element
         const marker = document.createComment("wren");
         parent.insertBefore(marker, this);
-        marker.insertAdjacentHTML("afterend", html);
+        const rows = document.createElement("template");
+        rows.innerHTML = html;
+        parent.insertBefore(rows.content, this);
         this.style.display = "none";
       } else {
         this._container.innerHTML = html;
@@ -284,7 +319,7 @@
   //   select     — comma-separated field names (simple queries)
   //   where      — filter expression (simple queries)
   //   q          — full query body as JSON string (complex queries, overrides select/where)
-  //   label      — version label
+  //   label      — version label (with q, it is added to the query body as "label")
   //   limit      — max results
   //
   // For aggregation, use the q attribute with a JSON body.
@@ -299,12 +334,18 @@
       let url;
 
       if (qAttr) {
-        // Complex query via ?q= (base64url-encoded JSON) — cacheable GET
-        const encoded = btoa(qAttr).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        const params = new URLSearchParams();
-        params.set("q", encoded);
+        // Complex query via ?q= (base64url-encoded UTF-8 JSON) — cacheable GET. The server
+        // reads the whole query from q, so the label attribute goes into the JSON.
+        let body = qAttr;
         const label = this.getAttribute("label");
-        if (label) params.set("label", label);
+        try {
+          if (label) body = JSON.stringify({ ...JSON.parse(qAttr), label });
+        } catch (err) {
+          showError(this, new Error(`Invalid q attribute: ${err.message}`));
+          return;
+        }
+        const params = new URLSearchParams();
+        params.set("q", base64url(body));
         url = `${base}/${collection}/_query?${params}`;
       } else {
         // Simple query via individual params
@@ -407,9 +448,10 @@
         const data = await wrenFetch(path);
         this._data = data;
 
+        hideSlots(this);
         const tmpl = this._getTemplate();
         const flat = { ...data, ...data.data };
-        this._container.innerHTML = renderTemplate(tmpl, flat);
+        this._container.innerHTML = tmpl == null ? renderJson(data.data ?? data) : renderTemplate(tmpl, flat);
 
         this.dispatchEvent(new CustomEvent("wren-load", { detail: data, bubbles: true }));
       } catch (err) {
