@@ -2,6 +2,25 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## Unreleased
+
+Gaps found while writing the case studies (tournament tracker, MAE stock tracker, data.tkd-scores.com, task tracker, AI-maintained sites, test fixtures).
+
+### Added
+- **Unchanged writes create no version.** A `PUT` (or upsert by key) whose JSON equals the current version — compared by meaning — returns `200` with the current version and `unchanged: true`. On real deployments about half of all updates were identical re-sends. `?force=true` writes a version anyway.
+- **Restore a collection or tree to a label** in one transaction: `POST /api/v1/{collection}/_restore` and `POST /api/v1/tree/{name}/_restore` with `{label, deleteUnlabeled?}`. Changed documents get the labeled content as a new version, deleted ones come back, and documents made since can be deleted. For resetting test fixtures and undoing bad imports or releases.
+- **Undelete:** `POST /api/v1/{collection}/{id}/undelete` (emits `document.undeleted`).
+- **Remove a label:** `DELETE /api/v1/{collection}/{id}/labels/{label}`.
+- **Deeper diffs:** `?deep=true` reports each changed nested field and array element; `v1`/`v2` accept label names.
+- **Setting a natural key registers keys for existing documents** (`keysRegistered` in the response), so by-key reads and upserts find them instead of creating duplicates. If two live documents would share a key, the schema change is refused with `409` listing the clashes. An unchanged write still updates a document's stored key.
+- **Files by name:** a file collection with `naturalKey: "filename"` supports `PUT …/by-key/{name}` (multipart: create, replace or unchanged), `GET …/by-key/{name}/raw`, and refuses a duplicate name with `409`.
+
+### Changed
+- Range filters (`>`, `>=`, `<`, `<=`) compare numbers numerically and anything else as text, so ISO dates filter correctly (they used to fail on non-numbers).
+
+### Fixed
+- Rolling back a file restored its metadata but not its bytes (the current version then had no file). A rollback now points the new version at the old version's blob, and the natural key follows the restored data.
+
 ## 0.8.0 — 2026-10-05
 
 ### Added
