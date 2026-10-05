@@ -35,7 +35,7 @@ hostpath() { case "$1" in /[a-zA-Z]/*) echo "$(echo "$1" | cut -c2 | tr a-z A-Z)
 
 cleanup() {
   [ -n "$KEEP" ] && { echo "Server kept running at $WREN_URL ($NAME-app, $NAME-db, $NAME-net)"; return; }
-  docker rm -f "$NAME-app" "$NAME-db" >/dev/null 2>&1 || true
+  docker rm -fv "$NAME-app" "$NAME-db" >/dev/null 2>&1 || true
   docker network rm "$NAME-net" >/dev/null 2>&1 || true
 }
 
@@ -47,7 +47,7 @@ if [ -z "$WREN_URL" ]; then
     docker build -q -f "$(hostpath "$SOURCES/sandbox/Dockerfile")" -t "$IMG" "$(hostpath "$SOURCES")" >/dev/null
   fi
   trap cleanup EXIT
-  docker rm -f "$NAME-app" "$NAME-db" >/dev/null 2>&1 || true
+  docker rm -fv "$NAME-app" "$NAME-db" >/dev/null 2>&1 || true
   docker network create "$NAME-net" >/dev/null 2>&1 || true
   docker run -d --rm --name "$NAME-db" --network "$NAME-net" \
     -e POSTGRES_USER=wren -e POSTGRES_PASSWORD=wren -e POSTGRES_DB=wren postgres:17-alpine >/dev/null

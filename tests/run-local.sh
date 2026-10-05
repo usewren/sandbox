@@ -21,7 +21,7 @@ case "$ROOT" in /[a-zA-Z]/*) ROOT="$(echo "$ROOT" | cut -c2 | tr a-z A-Z):$(echo
 if [ -n "$REBUILD" ] || ! docker image inspect "$IMG" >/dev/null 2>&1; then
   docker build -q -f sandbox/Dockerfile -t "$IMG" . >/dev/null
 fi
-docker rm -f "$NAME-db" >/dev/null 2>&1 || true
+docker rm -fv "$NAME-db" >/dev/null 2>&1 || true
 docker network create "$NAME-net" >/dev/null 2>&1 || true
 docker run -d --rm --name "$NAME-db" --network "$NAME-net" \
   -e POSTGRES_USER=wren -e POSTGRES_PASSWORD=wren -e POSTGRES_DB=wren postgres:17-alpine >/dev/null
@@ -38,6 +38,6 @@ docker run --rm --network "$NAME-net" \
   -e WEBHOOK_BATCH_WINDOW_MS=500 \
   -w /app "$IMG" sh -c "bun test --coverage --preload ./index.ts ${*:-tests/integration} 2>&1" || STATUS=$?
 
-docker rm -f "$NAME-db" >/dev/null 2>&1 || true
+docker rm -fv "$NAME-db" >/dev/null 2>&1 || true
 docker network rm "$NAME-net" >/dev/null 2>&1 || true
 exit ${STATUS:-0}
