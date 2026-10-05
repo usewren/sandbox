@@ -2,6 +2,13 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## Unreleased
+
+### Added
+- **Conditional writes.** `If-Match: "<version>"` (or `?ifVersion=<n>`) on `PUT` by id, `PUT …/by-key/{key}` (JSON or file) and `DELETE` applies the write only if the document is still at that version; otherwise `412` with `currentVersion`. `ifVersion=0` is create-only (re-running an import can't overwrite live data); `If-Match: *` requires the document to exist. Document reads return the version as `ETag`; CORS allows `If-Match` and exposes `ETag`. Found while reviewing the MAE stock tracker, where two devices moving the same item could lose one movement.
+- **`PATCH /api/v1/{collection}/_schema`** changes only the fields sent (`null` clears one). Scripts that PUT their schema on every run no longer drop a `naturalKey` or index added since.
+- **Public files by name:** `GET /orgs/{slug}/{collection}/by-key/{name}/raw` (and under `/api/v1/orgs/…`) for public file collections keyed by filename.
+
 ## 0.9.0 — 2026-10-05
 
 Gaps found while writing the case studies (tournament tracker, MAE stock tracker, data.tkd-scores.com, task tracker, AI-maintained sites, test fixtures).
