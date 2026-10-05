@@ -4,6 +4,9 @@ All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
 ## Unreleased
 
+### Removed
+- **The old React admin UI (`/oldadmin`)** and the React `componentlibrary` it used. They are no longer built into the image; `/oldadmin` redirects to `/admin/`. The server, Admin UI and wren.js are plain JavaScript/TypeScript with no React.
+
 ### Security
 - **`?depth=` could reveal private documents.** `$ref` resolution looked up referenced documents in any collection or tree of the org without an access check, so a public document referencing a private one showed the private data to anyone. References now follow the reader's own rules (including label filters); one they can't read resolves to `{ "$ref": "…", "$forbidden": true }`.
 - **Members could read every collection through `llms.txt`.** An org's `llms.txt` treated every member (and narrowed keys) like the owner. Each reader now sees only what their own rules allow; only the owner's own session sees everything, and a key from another org gets the public view.

@@ -264,3 +264,13 @@ describe("public org routes", () => {
     expect(result.result.data.items.map((i: any) => i.data)).toEqual([{ name: "Widget" }]);
   });
 });
+
+describe("the old React admin UI", () => {
+  it("is gone: /oldadmin redirects to /admin/", async () => {
+    for (const path of ["/oldadmin", "/oldadmin/", "/oldadmin/assets/app.js"]) {
+      const res = await fetch(`${BASE_URL}${path}`, { redirect: "manual" });
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/admin/");
+    }
+  });
+});

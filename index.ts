@@ -107,10 +107,6 @@ const ajv = new Ajv({ allErrors: true });
 const ADMIN_DIR = join(import.meta.dir, "public", "admin");
 const ADMIN_INDEX = join(ADMIN_DIR, "index.html");
 
-// Legacy React admin UI — built by `bun build` into public/oldadmin/
-const OLDADMIN_DIR = join(import.meta.dir, "public", "oldadmin");
-const OLDADMIN_INDEX = join(OLDADMIN_DIR, "index.html");
-
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js":   "application/javascript",
@@ -218,16 +214,6 @@ function serveAdminFile(filePath: string): Response | null {
 
 function serveAdminIndex(): Response {
   return new Response(Bun.file(ADMIN_INDEX), { headers: { "Content-Type": "text/html", ...NO_CACHE } });
-}
-
-function serveOldAdminFile(filePath: string): Response | null {
-  if (!existsSync(filePath)) return null;
-  const type = MIME[extname(filePath)] ?? "application/octet-stream";
-  return new Response(Bun.file(filePath), { headers: { "Content-Type": type } });
-}
-
-function serveOldAdminIndex(): Response {
-  return new Response(Bun.file(OLDADMIN_INDEX), { headers: { "Content-Type": "text/html" } });
 }
 
 const sql = postgres(process.env.DATABASE_URL ?? "postgres://wren:wren@localhost:5432/wren");
@@ -1241,13 +1227,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return res;
     }
 
-    // Legacy React admin UI — built static files with SPA fallback
+    // The old React admin UI is gone; send old bookmarks to the current one
     if (url.pathname === "/oldadmin" || url.pathname.startsWith("/oldadmin/")) {
-      const subPath = url.pathname.slice("/oldadmin".length);
-      const filePath = (!subPath || subPath === "/")
-        ? OLDADMIN_INDEX
-        : join(OLDADMIN_DIR, subPath);
-      return serveOldAdminFile(filePath) ?? serveOldAdminIndex();
+      return new Response(null, { status: 301, headers: { Location: "/admin/" } });
     }
 
     // Auth routes — handled by Better Auth
