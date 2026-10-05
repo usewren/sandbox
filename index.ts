@@ -3725,16 +3725,20 @@ async function handleUpdate(schemaName: string, collection: string, id: string, 
 
   try {
     const result = await withTenant(schemaName, async tx => {
-      const [doc] = await tx<{ id: string; current_version: number }[]>`
-        SELECT id, current_version FROM documents
+      const [doc] = await tx<{ id: string; current_version: number; natural_key: string | null }[]>`
+        SELECT id, current_version, natural_key FROM documents
         WHERE id = ${id} AND collection = ${collection} AND deleted_at IS NULL
         FOR UPDATE
       `;
       if (!doc) return null;
 
-      // Same data as the current version: no new version (see sameAsCurrent)
+      // Same data as the current version: no new version (see sameAsCurrent). The
+      // stored natural key still follows the data, e.g. after a naturalKey was added.
       const unchanged = !force && await sameAsCurrent(tx, id, doc.current_version, data);
-      if (unchanged) return { version: doc.current_version, updated_at: unchanged.updated_at, unchanged: true };
+      if (unchanged) {
+        if (doc.natural_key !== naturalKey) await tx`UPDATE documents SET natural_key = ${naturalKey} WHERE id = ${id}`;
+        return { version: doc.current_version, updated_at: unchanged.updated_at, unchanged: true };
+      }
 
       const newVersion = doc.current_version + 1;
       await tx`
@@ -4361,6 +4365,7 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
     } catch { /* collection doesn't exist yet */ }
   }
 
+  let keysRegistered = 0;
   await withTenant(schemaName, async tx => {
     await tx`
       INSERT INTO collection_schemas (collection, schema, display_name, collection_type, list_columns, natural_key, indexes, created_by)
@@ -4374,6 +4379,7 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
             indexes         = EXCLUDED.indexes,
             updated_at      = NOW()
     `;
+    if (naturalKey) keysRegistered = await registerNaturalKeys(tx, collection, naturalKey);
   });
 
   // Reconcile Postgres indexes outside the transaction (CREATE INDEX CONCURRENTLY can't run inside one)
@@ -4384,7 +4390,36 @@ async function handleSetSchema(schemaName: string, collection: string, req: Requ
   }
 
   naturalKeyCache.delete(`${schemaName}:${collection}`);
-  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns, naturalKey, indexes });
+  return Response.json({ collection, collectionType, schema: collectionType === "binary" ? null : schema, displayName, listColumns, naturalKey, indexes, ...(naturalKey ? { keysRegistered } : {}) });
+}
+
+/**
+ * When a collection gets a natural key, its existing documents get theirs from their
+ * current data, so by-key reads and upserts find them (instead of creating duplicates).
+ * If two live documents would share a key, nothing changes and the request is refused.
+ */
+async function registerNaturalKeys(tx: Sql, collection: string, field: string): Promise<number> {
+  const clashes = await tx<{ key: string; n: number }[]>`
+    SELECT btrim(v.data->>${field}) AS key, count(*)::int AS n
+    FROM documents d JOIN versions v ON v.document_id = d.id AND v.version = d.current_version
+    WHERE d.collection = ${collection} AND d.deleted_at IS NULL
+      AND jsonb_typeof(v.data->${field}) = 'string' AND btrim(v.data->>${field}) <> ''
+    GROUP BY 1 HAVING count(*) > 1 ORDER BY 1 LIMIT 20
+  `;
+  if (clashes.length) {
+    throw new HttpError(409, `Can't use '${field}' as the natural key: several documents share the same value (${clashes.map(c => `'${c.key}' ×${c.n}`).join(", ")}). Make them unique first; nothing was changed.`);
+  }
+  const updated = await tx`
+    UPDATE documents d
+    SET natural_key = CASE WHEN jsonb_typeof(v.data->${field}) = 'string' AND btrim(v.data->>${field}) <> ''
+                           THEN btrim(v.data->>${field}) END
+    FROM versions v
+    WHERE v.document_id = d.id AND v.version = d.current_version
+      AND d.collection = ${collection} AND d.deleted_at IS NULL
+      AND d.natural_key IS DISTINCT FROM
+          CASE WHEN jsonb_typeof(v.data->${field}) = 'string' AND btrim(v.data->>${field}) <> '' THEN btrim(v.data->>${field}) END
+  `;
+  return updated.count;
 }
 
 async function handleDeleteSchema(schemaName: string, collection: string): Promise<Response> {

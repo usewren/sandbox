@@ -12,6 +12,7 @@ Gaps found while writing the case studies (tournament tracker, MAE stock tracker
 - **Undelete:** `POST /api/v1/{collection}/{id}/undelete` (emits `document.undeleted`).
 - **Remove a label:** `DELETE /api/v1/{collection}/{id}/labels/{label}`.
 - **Deeper diffs:** `?deep=true` reports each changed nested field and array element; `v1`/`v2` accept label names.
+- **Setting a natural key registers keys for existing documents** (`keysRegistered` in the response), so by-key reads and upserts find them instead of creating duplicates. If two live documents would share a key, the schema change is refused with `409` listing the clashes. An unchanged write still updates a document's stored key.
 - **Files by name:** a file collection with `naturalKey: "filename"` supports `PUT …/by-key/{name}` (multipart: create, replace or unchanged), `GET …/by-key/{name}/raw`, and refuses a duplicate name with `409`.
 
 ### Changed

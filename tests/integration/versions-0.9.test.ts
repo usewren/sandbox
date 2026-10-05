@@ -194,3 +194,38 @@ describe("files by name", () => {
     expect(r.json.details).toContain('"naturalKey":"filename"');
   });
 });
+
+describe("natural keys on existing documents", () => {
+  it("setting naturalKey registers keys for documents that already exist", async () => {
+    const col = `latekey${stamp}`;
+    const a = (await call("POST", `/api/v1/${col}`, { ...H(), body: { slug: "alpha", n: 1 } })).json.id;
+    await call("POST", `/api/v1/${col}`, { ...H(), body: { slug: "beta", n: 2 } });
+    await call("POST", `/api/v1/${col}`, { ...H(), body: { n: 3 } }); // no key value: stays unkeyed
+    const r = await call("PUT", `/api/v1/${col}/_schema`, { ...H(), body: { naturalKey: "slug" } });
+    expect(r.json).toMatchObject({ naturalKey: "slug", keysRegistered: 2 });
+    expect((await call("GET", `/api/v1/${col}/by-key/alpha`, H())).json.id).toBe(a);
+    const up = await call("PUT", `/api/v1/${col}/by-key/alpha`, { ...H(), body: { slug: "alpha", n: 9 } });
+    expect(up.status).toBe(200); // updated, not a duplicate
+    expect(up.json.id).toBe(a);
+  });
+
+  it("refuses (and changes nothing) when existing documents share a value", async () => {
+    const col = `clash${stamp}`;
+    await call("POST", `/api/v1/${col}`, { ...H(), body: { slug: "same" } });
+    await call("POST", `/api/v1/${col}`, { ...H(), body: { slug: "same" } });
+    const r = await call("PUT", `/api/v1/${col}/_schema`, { ...H(), body: { naturalKey: "slug" } });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toContain("'same' ×2");
+    expect((await call("GET", `/api/v1/${col}/_schema`, H())).status).toBe(404);
+  });
+
+  it("an unchanged re-save still registers a missing key (migration scripts keep working)", async () => {
+    const col = `resave${stamp}`;
+    const id = (await call("POST", `/api/v1/${col}`, { ...H(), body: { slug: "s1" } })).json.id;
+    await call("PUT", `/api/v1/${col}/_schema`, { ...H(), body: { naturalKey: "slug" } });
+    await call("PUT", `/api/v1/${col}/${id}`, { ...H(), body: { slug: "s2" } }); // key moves with a real write
+    const again = await call("PUT", `/api/v1/${col}/${id}`, { ...H(), body: { slug: "s2" } });
+    expect(again.json).toMatchObject({ unchanged: true, naturalKey: "s2" });
+    expect((await call("GET", `/api/v1/${col}/by-key/s2`, H())).json.id).toBe(id);
+  });
+});
