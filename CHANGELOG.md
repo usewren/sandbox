@@ -2,6 +2,13 @@
 
 All notable changes to the WREN server (`reusr1/wren`). Dates are release dates.
 
+## 0.10.2 — 2026-10-06
+
+Content only, no server changes.
+
+### Added
+- **Guide: "I did this. Is there a better way?"** (/guides/better-ways): 28 workarounds from the case studies, each with why it hurts and the better way today. A condensed table is in llms-full.txt for AI agents.
+
 ## 0.10.1 — 2026-10-05
 
 Content only, no server changes.
